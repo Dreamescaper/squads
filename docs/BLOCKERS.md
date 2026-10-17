@@ -86,6 +86,40 @@ decide whether `squads-core` owns mate-name resolution (using its own store)
 rather than relying on the vendored global profile. Once that lands, extend the
 stub to serve `whoami` + roster + history and cover the branch offline.
 
+### B-007 — Local store keeps chat content unencrypted at rest (M3)
+
+`crates/squads-core`'s SQLite store (`data/store.sqlite`) is **plain
+`rusqlite`/`bundled`** — no encryption (ADR-011). Accounts, chats and messages
+are written in the clear, including display names, sender MRIs, raw message HTML
+and reaction reactor names. The file is protected only by filesystem/OS-account
+permissions (and WAL leaves `store.sqlite-wal`/`-shm` siblings with the same
+exposure).
+
+**Impact:** anyone with read access to the user's data directory can read cached
+Teams content. This is not acceptable for a general release and must be
+revisited (encryption at rest, e.g. SQLCipher, or an encrypted blob column).
+
+**Mitigation:** the storage layer is behind `squads_core::store::Store`, so an
+encrypted engine can replace it without touching callers. A future ADR must also
+settle the key source and plaintext→encrypted migration; see ADR-011.
+
+### U-001 — M3 store aspects not exercised offline
+
+- **Cross-account chat-id collision:** `messages` is keyed `(id, chat_id)` with
+  `profile` a non-key column, and `messages`/`messages_before` query by `chat_id`
+  only (per the M3 API). Two profiles that somehow share a chat id would see each
+  other's rows. In practice chat ids are account-unique, so this is untested and
+  assumed safe.
+- **Boundary paging:** `messages_before` compares the `timestamp` string with
+  `<`; messages that share the boundary timestamp are skipped. Wire timestamps
+  are millisecond-resolution in practice; the assumption is not exercised
+  against a live tenant.
+- **Crash/atomicity:** atomic writes for settings and transactional migrations
+  are tested for correctness, but an actual power-loss/`SIGKILL` mid-write cannot
+  be reproduced headlessly.
+- **Concurrency:** `Store` is asserted `Send + Sync` and exercised single-threaded;
+  real multi-threaded lock contention (UI + M4 realtime) is not benchmarked here.
+
 ## Deferred work
 
 ### D-001 — Third-party Teams app hosting (TeamsJS/web frames)

@@ -29,6 +29,9 @@ sha2.workspace = true
 url.workspace = true
 getrandom.workspace = true
 
+# M3 — local persistence (SQLite, bundled; see ADR-011)
+rusqlite.workspace = true
+
 [features]
 default = []
 # OS-keyring token storage. Off by default so the headless/CI build never needs

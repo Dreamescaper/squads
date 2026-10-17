@@ -9,7 +9,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started · ⛔ blocked (see [BLO
 | M0 | Workspace & scaffolding | ✅ | Workspace + 3 crates; vendored protocol core; docs. |
 | M1 | Authentication | ✅ | Device-code flow, five-token model, 0600 file store, testable `AuthTransport`. |
 | M2 | Protocol clients & session core | ✅ | `ApiClient` over the vendored `TeamsClient`; `tokens_to_config`; lazy `Session::api()`; token refresh; offline `list_chats`/`read_messages` tests. |
-| M3 | Local persistence & offline cache | ⬜ | |
+| M3 | Local persistence & offline cache | ✅ | UI-free `model`; bundled-SQLite `Store` (`user_version` migrations, idempotent upserts, per-chat paging); JSON `Settings` with atomic saves; `Session` owns the store. |
 | M4 | Realtime (Trouter) | ⬜ | |
 | M5 | Messaging | ⬜ | |
 | M6 | Teams & channels | ⬜ | |
@@ -155,3 +155,71 @@ new: 7 in `api`, 5 in `session`). `cargo test -p squads-protocol` still passes
 **Blockers.** B-005 (Skype exchange is not redirectable), B-006 (the
 mate-name resolution branch and its process-global mate cache are not
 exercised offline).
+
+---
+
+## M3 — Local persistence & offline cache
+
+**Goal.** Persist accounts, chats and messages in a local SQLite database with a
+versioned schema, behind a synchronous, offline-testable API; add a small JSON
+settings file; and hand the store to `Session` so the UI (M10) and realtime
+(M4) can read/write through one place.
+
+**Landed.** New modules in `crates/squads-core/src/`:
+
+- `model` — UI-facing domain types **decoupled from the protocol crate**:
+  `Chat`, `Message`, `Reaction`/`Reactor`, with `Chat::from_info` /
+  `From<&ChatInfo>` and `Message::from_info(chat_id, &MessageInfo)` /
+  `From<&MessageInfo>`. Two wire facts are documented rather than guessed:
+  `MessageInfo` has **no** edited flag (so `Message::edited` defaults `false` and
+  is set by `mark_edited`/`with_edited`), and it cannot know the signed-in user
+  (so `Message::is_own` is set by `mark_own(self_mri)`, tolerant of both a full
+  `8:orgid:<guid>` MRI and a bare OID). `Chat.unread`/`pinned` are local-only UI
+  flags, not persisted in v1. `Message`'s `Debug` deliberately prints `raw` only
+  as a length, so HTML bodies are not dumped into logs.
+- `store` — `Store`, a synchronous, `Send + Sync` (`Mutex<Connection>`)
+  `rusqlite` (bundled) handle. `Store::open(path)` / `Store::open_in_memory()`;
+  pragmas `journal_mode=WAL`, `foreign_keys=ON`, `busy_timeout=5s`,
+  `synchronous=NORMAL`; **versioned migrations** driven by `PRAGMA user_version`
+  (starts at v1, forward-only, applied in one transaction, every DDL statement
+  `IF NOT EXISTS` so re-running is safe); a database newer than this build errors
+  with `CoreError::StoreSchemaVersion`.
+  Schema v1: `accounts(profile PK, …)`, `chats(id, profile, …)` with
+  `PRIMARY KEY(id, profile)`, `messages(id, chat_id, …)` with
+  `PRIMARY KEY(id, chat_id)`, plus indexes on `messages(chat_id, timestamp)` and
+  `chats(profile, last_message_time)`. API: `upsert_chats`, `list_chats`,
+  `chat`, `upsert_messages`, `messages`, `messages_before`, `delete_chat`,
+  `put_account`, `get_account`, `counts`, `schema_version`. Upserts are
+  idempotent (same id = update) and `updated_at` only advances
+  (`MAX(existing, now)`); reactions are stored as a JSON column and a corrupt
+  blob degrades to "no reactions" rather than failing the read.
+- `settings` — `Settings { theme: Theme {System,Light,Dark}, window: {width,
+  height} }`, serde `#[serde(default)]`, loaded from
+  `AppDirs::settings_file()`, saved atomically (unique temp file + `rename`). A
+  missing file yields defaults; unknown/partial fields load.
+- `session` — `Session::new` now also opens the store from
+  `AppDirs::store_file()`; `Session::store()` / `Session::attach_store(Arc<Store>)`
+  expose/replace it, and `Session::with_token_store_and_db(..)` injects both
+  stores (tests use an in-memory DB). The token-store accessor was renamed
+  `store()` → `token_store()`.
+
+**Decisions.** ADR-005 promoted to accepted; **ADR-011** (plain bundled SQLite,
+not SQLCipher — encryption-at-rest is deferred and recorded as B-007);
+**ADR-012** (`Mutex<Connection>` concurrency model).
+
+**Tests.** `cargo test -p squads-core` — **85** offline unit tests (55 from
+M1/M2 + 30 new: 8 `model`, 14 `store`, 6 `settings`, 2 `session`).
+`cargo test -p squads-protocol` still passes **377**. New coverage includes:
+fresh DB reaches v1; reopen + version-reset are idempotent; a newer foreign
+`user_version` is a clear error; chat upsert idempotency + `last_message_time`
+ordering (NULLs last); message round-trip with reactions JSON + `reply_to` +
+`edited`; `messages_before` paging order; profile isolation; `updated_at`
+advances; `Store::open_in_memory()`; settings JSON round-trip, atomic replace and
+defaults for a missing file.
+
+**How to verify manually** (real tenant; not runnable here): after signing in,
+call `session.store().upsert_chats(profile, &chats)` from fetched data, then
+`list_chats(profile, n)` in a fresh process — it must return the cached rows with
+no network.
+
+**Blockers.** B-007 (chat/message content is stored **unencrypted at rest**).

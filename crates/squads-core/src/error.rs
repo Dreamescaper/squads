@@ -38,6 +38,24 @@ pub enum CoreError {
     /// The session is not ready to serve the request yet.
     #[error("session not ready: {0}")]
     NotReady(String),
+
+    /// The local SQLite store failed (open, migrate or query).
+    ///
+    /// Carries a short message only: `rusqlite`'s own error text (SQL + schema
+    /// detail, never row *values*), and never chat/message content.
+    #[error("store error: {0}")]
+    Store(String),
+
+    /// The on-disk database has a schema version this build cannot handle.
+    #[error(
+        "store schema version {found} is not supported by this build (supports up to {supported})"
+    )]
+    StoreSchemaVersion {
+        /// The `PRAGMA user_version` found in the database file.
+        found: i32,
+        /// The newest schema version this build knows how to migrate to.
+        supported: i32,
+    },
 }
 
 impl CoreError {
@@ -47,5 +65,13 @@ impl CoreError {
             path: path.into(),
             source,
         }
+    }
+}
+
+impl From<rusqlite::Error> for CoreError {
+    fn from(e: rusqlite::Error) -> Self {
+        // rusqlite error text carries SQL/schema detail, never parameter
+        // values, so it is safe (and useful) to keep the message.
+        CoreError::Store(e.to_string())
     }
 }

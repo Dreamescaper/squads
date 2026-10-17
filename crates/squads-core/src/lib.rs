@@ -10,11 +10,17 @@
 pub mod api;
 pub mod auth;
 pub mod error;
+pub mod model;
 pub mod paths;
 pub mod session;
+pub mod settings;
+pub mod store;
 
 pub use api::{ApiClient, tokens_to_config};
 pub use auth::{AuthDriver, AuthTransport, SignInProgress, TokenKind, TokenSet};
 pub use error::{CoreError, Result};
+pub use model::{Chat, Message, Reaction, Reactor};
 pub use paths::AppDirs;
 pub use session::{Session, SessionState};
+pub use settings::{Settings, Theme, WindowSettings};
+pub use store::{Account, Counts, Store};

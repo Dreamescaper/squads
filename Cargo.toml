@@ -48,6 +48,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "6"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+# Local offline store. `bundled` compiles SQLite's C source into the binary so
+# we do not depend on a system libsqlite3 (portable across Linux/macOS/Windows).
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # egui is immediate-mode: dependencies compiled in debug mode make layout and
 # text shaping noticeably laggy, so optimize them even in dev builds.

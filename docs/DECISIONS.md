@@ -112,7 +112,8 @@ can integrate them into either world.
 
 ## ADR-005 — Local-first SQLite store
 
-**Status:** proposed (M3)
+**Status:** accepted (M3) — see ADR-011/ADR-012 for the storage engine and
+concurrency refinements
 
 **Context.** Teams is chat-heavy; the UI must feel instant and work with stale/offline
 data. `zapfast` caches everything in SQLite.
@@ -294,5 +295,82 @@ changes, no behaviour change for `squads-cli`):
   `chatsvcagg_url`, `middle_tier_url`) plus the raw `region_gtms` blob. If a
   later milestone needs the resolved Graph/CSA URLs directly, that is a
   follow-up patch.
+
+---
+
+## ADR-011 — Plain bundled SQLite (`rusqlite`), not SQLCipher, for now
+
+**Status:** accepted (M3) — encryption-at-rest deferred, tracked as B-007
+
+**Context.** M3 needs a local, offline-first cache for accounts, chats and
+messages. ADR-005 already fixed the store on SQLite. The open question is
+whether to encrypt the database file. Chat content is sensitive personal data,
+so "encrypt at rest" is a real product consideration. The two obvious options
+are:
+
+- **`rusqlite` with the `bundled` feature** — SQLite compiled into the binary
+  (no system `libsqlite3`), plaintext file.
+- **`rusqlite` with `bundled-sqlcipher`** (or `sqlcipher`) — transparent
+  page-level encryption, keyed from somewhere (an OS keyring or a passphrase).
+
+Our auth token store already has an OS-keyring story only behind a default-off
+feature (ADR-008), because the headless/CI environment has no Secret Service. A
+database key has the same problem *plus* a bootstrapping problem: where does the
+key come from on first run, and how is it recovered if the keyring is absent?
+
+**Decision.** Use **plain `rusqlite` with `bundled`** for M3. Do **not** add
+SQLCipher yet. Keep the storage layer behind `squads_core::store::Store` so the
+engine is an implementation detail that can change without touching callers.
+
+**Consequences.**
+
+- Zero platform dependencies: the workspace builds and tests anywhere, fully
+  offline, with no key management.
+- **Chat and message content (including sender names, MRIs and raw HTML) is
+  stored unencrypted at rest**, protected only by the user's filesystem/OS
+  account permissions. This is recorded as **B-007** and *must* be revisited
+  before a general release.
+- A future encryption ADR would need to decide: the key source (OS keyring vs.
+  passphrase vs. a key derived from the OS account), the migration of an
+  existing plaintext file to an encrypted one (and the reverse on
+  downgrade), the interaction with WAL (SQLCipher encrypts WAL too), and how CI
+  tests the path without a keyring. Swapping `bundled` for `bundled-sqlcipher`
+  is a one-line dependency change but is *not* sufficient on its own.
+- `Store`'s public API is engine-agnostic, so the swap is contained to this
+  crate.
+
+---
+
+## ADR-012 — `Store` is `Send + Sync` via `Mutex<rusqlite::Connection>`
+
+**Status:** accepted (M3)
+
+**Context.** The M2/M4 core shares one store between the UI thread and the
+realtime task, so the handle must be `Send + Sync` and cheap to clone. `rusqlite`
+has no async API and `Connection` is `Send` but **not** `Sync`. Options
+considered:
+
+1. `Mutex<Connection>` behind an `Arc` — one serialized connection.
+2. An `r2d2`/hand-rolled pool of `Connection`s — many concurrent readers.
+3. Per-thread connections (thread-local), or an actor owning the connection.
+
+**Decision.** Ship option 1: `Store { conn: Mutex<Connection> }`, shared as
+`Arc<Store>`. All methods are synchronous and lock for the duration of one
+statement (or one transaction for a batch). Document the serialization in the
+module docs.
+
+**Consequences.**
+
+- `Store` is trivially `Send + Sync` (asserted by a unit test), so `Session` can
+  hold `Arc<Store>` and M4 can clone it freely.
+- **Access is serialized**: two threads never query concurrently. At M3's scale
+  (occasional batched writes, sub-millisecond reads) this is comfortably fast,
+  and it removes a whole class of "database is locked" bugs. `busy_timeout` +
+  WAL still protect against other processes touching the file.
+- If contention ever matters, the fix is a small reader pool (SQLite allows many
+  concurrent readers under WAL) — an internal change, since callers only see
+  `Arc<Store>`.
+- No async DB layer: a future async caller must not hold the lock across an
+  `.await`. That is a documented convention, not enforced by the type system.
 
 

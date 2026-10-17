@@ -4,14 +4,20 @@
 //! [`Session::restore`], [`Session::begin_sign_in`], [`Session::poll_sign_in`]
 //! and [`Session::sign_out`]. **M2** attaches the protocol client
 //! ([`Session::api`], built lazily from the token set) and token refresh
-//! ([`Session::ensure_fresh_tokens`]). The store (M3) and the realtime feed
-//! (M4) attach to this type in later milestones.
+//! ([`Session::ensure_fresh_tokens`]). **M3** attaches the local SQLite store
+//! ([`Session::store`] / [`Session::attach_store`]), opened from
+//! [`AppDirs::store_file`] by [`Session::new`]. The realtime feed attaches in
+//! M4.
 //!
 //! Network access only ever happens through the sign-in driver, a
 //! [`Session::ensure_fresh_tokens`] refresh, or a call on the [`ApiClient`]
 //! returned by [`Session::api`]; with a [`MemoryTokenStore`] and no sign-in, a
 //! `Session` — and building its `ApiClient` — is fully offline (as the tests
-//! demonstrate).
+//! demonstrate). The store is a local file and is opened offline too.
+//!
+//! The SQLite [`Store`] is shared as `Arc<Store>` because M4's realtime task and
+//! the UI thread will both need it; see the module docs in [`crate::store`] for
+//! why a `Mutex<Connection>` is acceptable at our scale.
 
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
@@ -22,6 +28,7 @@ use crate::auth::store::{DEFAULT_PROFILE, FileTokenStore, TokenStore};
 use crate::auth::tokens::TokenSet;
 use crate::error::{CoreError, Result};
 use crate::paths::AppDirs;
+use crate::store::Store;
 
 /// High-level state of the local client, independent of rendering.
 ///
@@ -76,7 +83,10 @@ pub struct Session {
     dirs: Arc<AppDirs>,
     state: SessionState,
     profile: String,
-    store: Arc<dyn TokenStore>,
+    token_store: Arc<dyn TokenStore>,
+    /// The local offline cache (M3). Opened at [`AppDirs::store_file`] and
+    /// shared via `Arc` so the M4 realtime task can write through it.
+    store: Arc<Store>,
     tokens: Option<TokenSet>,
     sign_in: Option<SignInTask>,
     /// Lazily-built protocol client (M2). Dropped whenever the token set
@@ -85,26 +95,44 @@ pub struct Session {
 }
 
 impl Session {
-    /// Create a session rooted at `dirs`, using the default profile and the
-    /// default [`FileTokenStore`]. Does not touch the network; the initial state
-    /// is [`SessionState::SignedOut`] until [`Session::restore`] or sign-in.
+    /// Create a session rooted at `dirs`, using the default profile, the default
+    /// [`FileTokenStore`] and the SQLite store at [`AppDirs::store_file`].
+    /// Does not touch the network; the initial state is
+    /// [`SessionState::SignedOut`] until [`Session::restore`] or sign-in.
     pub fn new(dirs: Arc<AppDirs>) -> Result<Self> {
         let store = Arc::new(FileTokenStore::new(&dirs));
         Self::with_store(dirs, DEFAULT_PROFILE, store)
     }
 
     /// Create a session with an explicit profile and token store (tests,
-    /// multi-account).
+    /// multi-account). The SQLite store is still opened from
+    /// [`AppDirs::store_file`]; use [`Session::attach_store`] to substitute one
+    /// (e.g. an in-memory database).
     pub fn with_store(
         dirs: Arc<AppDirs>,
         profile: impl Into<String>,
-        store: Arc<dyn TokenStore>,
+        token_store: Arc<dyn TokenStore>,
+    ) -> Result<Self> {
+        dirs.ensure()?;
+        let store = Arc::new(Store::open(dirs.store_file())?);
+        Self::with_token_store_and_db(dirs, profile, token_store, store)
+    }
+
+    /// Create a session with an explicit profile, token store **and** SQLite
+    /// store. Useful for tests that want an in-memory database via
+    /// [`Store::open_in_memory`].
+    pub fn with_token_store_and_db(
+        dirs: Arc<AppDirs>,
+        profile: impl Into<String>,
+        token_store: Arc<dyn TokenStore>,
+        store: Arc<Store>,
     ) -> Result<Self> {
         dirs.ensure()?;
         Ok(Self {
             dirs,
             state: SessionState::SignedOut,
             profile: profile.into(),
+            token_store,
             store,
             tokens: None,
             sign_in: None,
@@ -135,8 +163,21 @@ impl Session {
     }
 
     /// The token store backing this session.
-    pub fn store(&self) -> &Arc<dyn TokenStore> {
+    pub fn token_store(&self) -> &Arc<dyn TokenStore> {
+        &self.token_store
+    }
+
+    /// The local SQLite store backing this session (M3).
+    pub fn store(&self) -> &Arc<Store> {
         &self.store
+    }
+
+    /// Replace the local SQLite store.
+    ///
+    /// Used by tests (in-memory DB) and by a future multi-database setup; the
+    /// session takes ownership of the `Arc`, so callers keep sharing it.
+    pub fn attach_store(&mut self, store: Arc<Store>) {
+        self.store = store;
     }
 
     /// The current token set, if any has been loaded or minted.
@@ -195,7 +236,7 @@ impl Session {
         if !current.needs_refresh() {
             return Ok(false);
         }
-        let store = Arc::clone(&self.store);
+        let store = Arc::clone(&self.token_store);
         let refreshed = driver
             .refresh(&current, &self.profile, store.as_ref(), |_| {})
             .await?;
@@ -211,7 +252,7 @@ impl Session {
     pub fn restore(&mut self) -> Result<()> {
         // Any previously cached client was built from a different token set.
         self.api = None;
-        match self.store.load(&self.profile)? {
+        match self.token_store.load(&self.profile)? {
             Some(tokens) => {
                 tracing::info!(profile = %self.profile, "restored stored credentials");
                 self.tokens = Some(tokens);
@@ -261,7 +302,7 @@ impl Session {
         }
 
         let (tx, rx) = mpsc::channel::<SignInProgress>();
-        let store = Arc::clone(&self.store);
+        let store = Arc::clone(&self.token_store);
         let profile = self.profile.clone();
         let tx_progress = tx.clone();
 
@@ -336,7 +377,7 @@ impl Session {
         }
         self.tokens = None;
         self.api = None;
-        self.store.delete(&self.profile)?;
+        self.token_store.delete(&self.profile)?;
         self.state = SessionState::SignedOut;
         Ok(())
     }
@@ -381,6 +422,44 @@ mod tests {
         session.set_state(SessionState::Loading);
         assert_eq!(session.state().label(), "Loading…");
         assert!(!session.state().is_ready());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn session_owns_a_store_and_attach_store_overrides_it() {
+        let (tmp, dirs) = dirs();
+        let mut session = Session::new(dirs).expect("session");
+        assert_eq!(
+            session.store().schema_version().unwrap(),
+            crate::store::SCHEMA_VERSION
+        );
+
+        // An explicit in-memory store can be attached and is shared, not copied.
+        let mem = Arc::new(crate::store::Store::open_in_memory().expect("mem store"));
+        session.attach_store(Arc::clone(&mem));
+        session
+            .store()
+            .put_account(&crate::store::Account {
+                profile: "default".into(),
+                tenant: None,
+                personal: false,
+                display_name: None,
+                created_at: 1,
+            })
+            .unwrap();
+        assert_eq!(mem.get_account("default").unwrap().unwrap().created_at, 1);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn with_token_store_and_db_uses_the_given_database() {
+        let (tmp, dirs) = dirs();
+        let tokens = Arc::new(MemoryTokenStore::new());
+        let db = Arc::new(crate::store::Store::open_in_memory().unwrap());
+        let session = Session::with_token_store_and_db(dirs, "default", tokens, Arc::clone(&db))
+            .expect("session");
+        assert_eq!(session.store().schema_version().unwrap(), 1);
+        assert!(Arc::ptr_eq(session.store(), &db));
         std::fs::remove_dir_all(&tmp).ok();
     }
 

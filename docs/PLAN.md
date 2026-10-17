@@ -138,7 +138,7 @@ Documentation is updated continuously:
 - [x] M0 — Workspace & scaffolding
 - [x] M1 — Authentication
 - [x] M2 — Protocol clients & session core
-- [ ] M3 — Local persistence & offline cache
+- [x] M3 — Local persistence & offline cache
 - [ ] M4 — Realtime (Trouter)
 - [ ] M5 — Messaging
 - [ ] M6 — Teams & channels
