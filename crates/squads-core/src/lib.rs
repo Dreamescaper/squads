@@ -13,7 +13,9 @@ pub mod error;
 pub mod files;
 pub mod messaging;
 pub mod model;
+pub mod notifications;
 pub mod paths;
+pub mod presence;
 pub mod realtime;
 pub mod session;
 pub mod settings;
@@ -30,10 +32,21 @@ pub use model::{
     Channel, Chat, FileEntry, FileVersion, Message, Reaction, Reactor, SendState, SharedLink, Team,
     TeamMember, is_channel_conversation_id,
 };
+pub use notifications::{
+    ActivityItem, LogNotifier, Notification, NotificationContext, NotificationKind, Notifications,
+    Notifier, RecordingNotifier, UnreadSummary, route,
+};
 pub use paths::AppDirs;
+pub use presence::{
+    Activity, Availability, ContactPresence, GraphBackend, OwnPresence, Presence, PresenceBackend,
+    UnifiedBackend,
+};
 pub use realtime::{EventBus, RealtimeEvent, RealtimeService};
 pub use session::{Session, SessionState};
 pub use settings::{Settings, Theme, WindowSettings};
 pub use store::{Account, Counts, Store};
 pub use teams::Teams;
-pub use text::{html_escape, strip_html};
+pub use text::{Mention, html_escape, mentions, strip_html};
+
+#[cfg(feature = "desktop-notifications")]
+pub use notifications::DesktopNotifier;

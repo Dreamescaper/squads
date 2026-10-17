@@ -755,4 +755,121 @@ the split explicit:
   retry) so a retried upload is not posted twice.
 
 
+---
+
+## ADR-021 — Two presence backends, unified by default; and the unverified unified token/audience
+
+**Status:** accepted (M8)
+
+**Context.** Teams exposes presence through **two different services**, and M8
+must read and write it:
+
+- **Graph** — `GET /me/presence` and `POST
+  /me/presence/setUserPreferredPresence`, the vendored
+  `get_presence_data`/`set_presence`. These are **own-presence only** (no batch)
+  and, live, **403**: the Teams first-party OAuth token carries 35 delegated
+  scopes but *not* `Presence.Read*`/`Presence.ReadWrite` (the vendored crate
+  documents this itself).
+- **Unified** — `presence.teams.microsoft.com`, what the Teams web/native
+  clients use and what `better-teams` switched to: `POST
+  /v1/presence/getpresence/` (batch) and `PUT …/v1/me/forceavailability/` (set
+  own). The **token audience is not confirmed**: `better-teams` minted a token
+  for the `https://presence.teams.microsoft.com` resource, but we only hold the
+  M1 `spaces`/`skype`/`graph`/`ic3`/`recorder` tokens, and we cannot verify the
+  accepted header/audience without a live tenant.
+
+We also need to test all of this **offline**, which rules out hard-coding a base
+URL or an un-injectable HTTP client.
+
+**Decision.**
+
+1. Ship **both** backends behind one `PresenceBackend` enum (the brief allowed a
+   trait or an enum; an enum keeps `Session::presence()` a concrete type while
+   the two impls keep their own state):
+   - `GraphBackend` wraps the vendored Graph calls through the shared
+     `ApiClient` (two new wrappers, `ApiClient::get_presence` /
+     `set_user_preferred_presence`).
+   - `UnifiedBackend` uses `reqwest` against a **base URL parameter** (default
+     `https://presence.teams.microsoft.com`, overridable via
+     `region_gtms.presenceBase` or an explicit base) and takes the **token to
+     send** as a parameter.
+2. `Session::presence()` builds the **unified** backend by default (Graph 403s
+   live), reading `presenceBase` from `region_gtms` and sending the **skype**
+   token as a Bearer — this is a documented, **unverified** choice, not a fact.
+   `Session::graph_presence()` exposes the Graph backend for a suitably-scoped
+   token.
+3. All parsing is **pure and defensive**
+   (`Availability::from_wire`/`Activity::from_wire`,
+   `parse_unified_presence`/`parse_unified_own`): unknown values degrade to
+   `PresenceUnknown`/`Unknown`, unknown response wrappers and nested
+   `presence` objects are tolerated, entries without an MRI are dropped, and
+   nothing panics.
+4. **Schema v5** adds `chats.muted` (the local per-chat mute the router honours);
+   unread is **derived** from `messages` + `read_state`, so no new table.
+
+**Consequences.**
+
+- The presence service is fully testable offline: the Graph leg goes through the
+  existing stub, and the unified leg points its base URL at a local stub and
+  asserts the exact path/body/`Bearer` header — the best verification the
+  headless environment allows.
+- The **unified token/audience is unverified** (B-009): if the skype token is
+  the wrong one, only the token parameter changes (or a token-audience mint is
+  added in M1); the request/response shapes are pinned by the stub tests.
+- The unified request/response **shapes** are also unverified against the live
+  service (U-005); the mapping accepts several plausible wrappers to reduce the
+  blast radius when a real response is finally seen.
+- The `Presence` cache is **in-memory only** (presence is ephemeral); nothing is
+  persisted, so a restart starts from `PresenceUnknown` until the next fetch.
+- The `GraphBackend` is retained even though it 403s live, because it is the
+  vendored code path and needs no new token plumbing.
+
+---
+
+## ADR-022 — A `Notifier` trait, and desktop notifications behind a default-off feature
+
+**Status:** accepted (M8)
+
+**Context.** M8 needs to surface notifications (desktop toasts, and the unread
+badges the UI derives). Delivery is inherently platform-bound: on Linux,
+`notify-rust` talks to the freedesktop notification daemon over **DBus**, which
+this headless/CI environment does not have (no display, no session bus) —
+exactly the situation ADR-008 already faced for the OS keyring. Routing,
+however, must be deterministic and offline-testable.
+
+**Decision.**
+
+1. Split **routing** from **delivery**. `route(event, ctx) -> Option<Notification>`
+   is a pure function (own messages never notify; only new messages notify;
+   per-chat mute is honoured; mentions and replies-to-own are flagged), so the
+   rules are unit-tested with no I/O.
+2. Delivery goes through an object-safe `Notifier` trait
+   (`fn notify(&self, &Notification)`, `Send + Sync`) held as `Arc<dyn Notifier>`
+   on the `Session`. Ship `LogNotifier` (default) and `RecordingNotifier`
+   (tests).
+3. The `notify-rust`-backed `DesktopNotifier` is gated behind a **default-off**
+   `desktop-notifications` cargo feature; the default build never compiles
+   `notify-rust`, DBus or a notification daemon. (The brief allowed adding the
+   dependency only if it stays default-off and the default build needs none;
+   that holds.)
+4. **Quiet hours are not implemented.** Suppressing during a window needs a
+   clock and per-user settings the brief did not settle, and any clock in the
+   router would make it non-deterministic; recorded as B-010.
+
+**Consequences.**
+
+- The default `cargo build`/`cargo test` is unaffected by the feature: no DBus,
+  no notification daemon, no display.
+- The desktop path cannot be exercised here (B-010); `DesktopNotifier` compiles
+  under the feature and only fails at runtime with a `tracing` warning if the
+  daemon is absent.
+- A future settings screen can add quiet hours purely on top of the pure router
+  (pass the window into `NotificationContext`) without touching the notifier.
+- Reaction and missed-call notification kinds are present as **placeholders**
+  but unreachable: the M4 bus carries no reaction event (reactions arrive as
+  message edits) and filters call frames out entirely (B-008), so no producer
+  exists until those events do.
+
+
+
 

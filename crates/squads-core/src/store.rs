@@ -18,7 +18,7 @@
 //!
 //! ## Schema & migrations
 //!
-//! The schema version lives in `PRAGMA user_version`; this build knows **v3**.
+//! The schema version lives in `PRAGMA user_version`; this build knows **v5**.
 //! Migrations are forward-only and re-entrant: statements are `IF NOT EXISTS`
 //! (or guarded by a schema probe, for `ALTER TABLE`), so re-running is a no-op.
 //! A database whose `user_version` is **newer** than this build understands is
@@ -32,6 +32,9 @@
 //!   metadata cache). See ADR-017.
 //! * **v4** (M7) — `files`, the driveItem cache for the files browser (keyed
 //!   `(id, profile)`, with an optional owning `chat_id`). See ADR-019.
+//! * **v5** (M8) — `chats.muted`, the local per-chat notification mute (fed from
+//!   the server's `alerts` property); unread/activity are **derived** from
+//!   `messages` + `read_state`, so no new table is needed. See ADR-021.
 //!
 //! ## Who writes what
 //!
@@ -41,8 +44,10 @@
 //! [`Store::messages`] / [`Store::messages_before`]. M6's teams service caches
 //! team/channel/member metadata through [`Store::upsert_teams`],
 //! [`Store::upsert_channels`] and [`Store::upsert_team_members`]. M7's files
-//! service caches driveItems through [`Store::upsert_files`]. Nothing in this
-//! module talks to the network.
+//! service caches driveItems through [`Store::upsert_files`]. M8 derives unread
+//! counts from [`Store::unread_count`] / [`Store::unread_messages`] and persists
+//! the mute flag with [`Store::set_chat_muted`]. Nothing in this module talks to
+//! the network.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -62,7 +67,8 @@ use crate::model::{Channel, Chat, FileEntry, Message, Reaction, SendState, Team,
 ///   `read_state` table for our own read horizon.
 /// * **v3** (M6) — `teams`, `channels`, `team_members` for the teams service.
 /// * **v4** (M7) — `files`, the driveItem cache for the files service.
-pub const SCHEMA_VERSION: i32 = 4;
+/// * **v5** (M8) — `chats.muted`, the local per-chat notification mute.
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// Timeout for a busy database before `SQLITE_BUSY` is surfaced.
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -675,6 +681,114 @@ impl Store {
         Ok(message_id)
     }
 
+    // ----- mute + unread (M8) ---------------------------------------------
+
+    /// Set (or clear) the local **notification mute** for one chat (M8, schema
+    /// v5).
+    ///
+    /// A local mirror of the server's `alerts`/mute property: the UI toggles it
+    /// and reads it back, and it survives a restart. Returns whether a matching
+    /// `(id, profile)` chat row existed (mute cannot be set before the chat is
+    /// cached).
+    pub fn set_chat_muted(&self, profile: &str, chat_id: &str, muted: bool) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE chats SET muted = ?1 WHERE id = ?2 AND profile = ?3",
+            params![muted as i64, chat_id, profile],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Whether one cached chat is muted for this profile (unknown chat →
+    /// `false`).
+    pub fn is_chat_muted(&self, profile: &str, chat_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let muted = conn
+            .query_row(
+                "SELECT muted FROM chats WHERE id = ?1 AND profile = ?2",
+                params![chat_id, profile],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(muted.unwrap_or(0) != 0)
+    }
+
+    /// The ids of every muted chat for this profile (for building a
+    /// [`NotificationContext`](crate::notifications::NotificationContext)).
+    pub fn muted_chats(&self, profile: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT id FROM chats WHERE profile = ?1 AND muted != 0 ORDER BY id ASC")?;
+        let rows = stmt.query_map(params![profile], |row| row.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for id in rows {
+            ids.push(id?);
+        }
+        Ok(ids)
+    }
+
+    /// The timestamp of the message the chat was read up to, if the horizon
+    /// message is still cached (a horizon pointing at an evicted/deleted
+    /// message resolves to `None`).
+    fn horizon_timestamp(&self, profile: &str, chat_id: &str) -> Result<Option<String>> {
+        let Some(message_id) = self.read_state(profile, chat_id)? else {
+            return Ok(None);
+        };
+        Ok(self.message(chat_id, &message_id)?.map(|m| m.timestamp))
+    }
+
+    /// How many messages in `chat_id` are **newer than the stored read
+    /// horizon** (M8) — the number an unread badge shows.
+    ///
+    /// With no horizon every cached message counts as unread. The same applies
+    /// when the stored horizon message is no longer cached — we cannot resolve
+    /// its timestamp, so the whole chat reads as unread rather than the badge
+    /// silently dropping. Own messages are **not** excluded here: the caller/UI
+    /// filters on [`Message::is_own`](crate::model::Message::is_own), which is
+    /// unreliable for messages that only ever arrived over the raw wire (see
+    /// U-001).
+    pub fn unread_count(&self, profile: &str, chat_id: &str) -> Result<usize> {
+        let horizon = self.horizon_timestamp(profile, chat_id)?;
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE chat_id = ?1 AND (?2 IS NULL OR timestamp > ?2)",
+            params![chat_id, horizon],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// The messages in `chat_id` newer than the stored read horizon, **newest
+    /// first**, at most `limit` (M8 activity feed / unread preview).
+    ///
+    /// Like [`Store::unread_count`], no horizon means every message counts, and
+    /// own messages are not filtered.
+    pub fn unread_messages(
+        &self,
+        profile: &str,
+        chat_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let horizon = self.horizon_timestamp(profile, chat_id)?;
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, sender_mri, sender_name, timestamp, content,
+                    raw, reactions_json, reply_to, client_message_id, edited, is_own,
+                    send_state
+             FROM messages
+             WHERE chat_id = ?1 AND (?2 IS NULL OR timestamp > ?2)
+             ORDER BY timestamp DESC, id DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![chat_id, horizon, limit as i64], row_to_message)?;
+        let mut messages = Vec::new();
+        for message in rows {
+            messages.push(message?);
+        }
+        Ok(messages)
+    }
+
     // ----- teams, channels & members (M6) ----------------------------------
 
     /// Insert or update teams for `profile`, keyed by `(id, profile)`.
@@ -1054,6 +1168,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if current < 4 {
         migrate_v4(&tx)?;
     }
+    if current < 5 {
+        migrate_v5(&tx)?;
+    }
     // Record the version *after* the DDL inside the same transaction, so a
     // crash can never leave a version marker ahead of the schema.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1092,6 +1209,17 @@ fn migrate_v3(tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// re-entrant even if the version marker was reset.
 fn migrate_v4(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(MIGRATION_V4_TABLES)?;
+    Ok(())
+}
+
+/// Apply the v5 additions: the `chats.muted` local mute flag (M8).
+///
+/// Like the v2 `send_state` column, `ALTER TABLE … ADD COLUMN` has no
+/// `IF NOT EXISTS`, so the probe guards re-running after a version reset.
+fn migrate_v5(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    if !column_exists(tx, "chats", "muted")? {
+        tx.execute_batch("ALTER TABLE chats ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;")?;
+    }
     Ok(())
 }
 
@@ -2123,5 +2251,109 @@ mod tests {
             Some("att-1"),
             "attachment still kept"
         );
+    }
+
+    // ----- M8: mute + unread ------------------------------------------------
+
+    #[test]
+    fn v4_database_upgrades_to_v5_adding_the_mute_column() {
+        let path = temp_path("v4-to-v5");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            // Build a genuine v4 database: v1 DDL, v2 column + read_state, v3
+            // tables, v4 files table, version marker 4.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN send_state TEXT NOT NULL DEFAULT 'sent';",
+            )
+            .unwrap();
+            conn.execute_batch(MIGRATION_V2_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V3_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V4_TABLES).unwrap();
+            conn.execute(
+                "INSERT INTO chats (id, profile, name, is_group, updated_at)
+                 VALUES ('c1','default','One',0,1)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+        }
+
+        let store = Store::open(&path).expect("open the v4 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        // The column exists and the pre-existing chat defaults to not-muted.
+        {
+            let conn = store.lock();
+            assert!(column_exists(&conn, "chats", "muted").unwrap());
+        }
+        assert!(!store.is_chat_muted("default", "c1").unwrap());
+        assert!(store.set_chat_muted("default", "c1", true).unwrap());
+        assert!(store.is_chat_muted("default", "c1").unwrap());
+
+        // Reopening again is a clean no-op and the flag survives.
+        drop(store);
+        let store = Store::open(&path).expect("reopen v5 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert!(store.is_chat_muted("default", "c1").unwrap());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn chat_mute_round_trips_and_is_profile_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_chats(
+                "default",
+                &[chat("c1", "One", None), chat("c2", "Two", None)],
+            )
+            .unwrap();
+
+        assert!(!store.is_chat_muted("default", "c1").unwrap());
+        assert!(store.set_chat_muted("default", "c1", true).unwrap());
+        assert!(store.is_chat_muted("default", "c1").unwrap());
+        assert_eq!(
+            store.muted_chats("default").unwrap(),
+            vec!["c1".to_string()]
+        );
+
+        // Unmuting removes it from the list.
+        assert!(store.set_chat_muted("default", "c1", false).unwrap());
+        assert!(store.muted_chats("default").unwrap().is_empty());
+
+        // A chat that is not cached cannot be muted (the row does not exist);
+        // another profile is isolated.
+        assert!(!store.set_chat_muted("default", "missing", true).unwrap());
+        assert!(!store.is_chat_muted("default", "missing").unwrap());
+        assert!(!store.set_chat_muted("work", "c1", true).unwrap());
+        assert!(!store.is_chat_muted("work", "c1").unwrap());
+    }
+
+    #[test]
+    fn unread_counts_follow_the_read_horizon() {
+        let store = Store::open_in_memory().unwrap();
+        let msgs = vec![
+            message("m1", "c1", "2026-01-01T00:00:01Z"),
+            message("m2", "c1", "2026-01-01T00:00:02Z"),
+            message("m3", "c1", "2026-01-01T00:00:03Z"),
+        ];
+        store.upsert_messages("default", &msgs).unwrap();
+
+        // No horizon: everything is unread.
+        assert_eq!(store.unread_count("default", "c1").unwrap(), 3);
+        // Newest-first.
+        let unread = store.unread_messages("default", "c1", 10).unwrap();
+        assert_eq!(
+            unread.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m3", "m2", "m1"]
+        );
+
+        store.set_read_state("default", "c1", "m1").unwrap();
+        assert_eq!(store.unread_count("default", "c1").unwrap(), 2);
+        assert_eq!(store.unread_messages("default", "c1", 10).unwrap().len(), 2);
+
+        // A different chat is unaffected; another profile sees no horizon.
+        assert_eq!(store.unread_count("default", "c2").unwrap(), 0);
+        assert_eq!(store.unread_count("work", "c1").unwrap(), 3);
     }
 }

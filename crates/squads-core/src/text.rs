@@ -19,6 +19,13 @@
 //! `ost::api::chat::strip_html` closely enough to be indistinguishable on the
 //! wire shapes we handle.
 //!
+//! ## Mention extraction (M8)
+//!
+//! [`mentions`] is the third operation here: it pulls the `@`-mentions out of a
+//! raw body so the notification router (M8) can tell whether *we* were
+//! mentioned. It recognises Teams' `<at …>Name</at>` tags (with or without an
+//! MRI-carrying attribute) and plain-text `@name` tokens.
+//!
 //! ## What we do *not* do here
 //!
 //! Outgoing HTML is built by the vendored, **fenced-code-aware**
@@ -33,6 +40,13 @@
 //!   than those, and entities inside attribute values, are not decoded.
 //! * It does not insert a space *inside* a `<pre>` block: code preserves its own
 //!   whitespace, which is what we want.
+//! * [`mentions`] cannot recover the **display name** behind an index-only
+//!   `<at id="0">` tag's MRI — that mapping lives in the message's `mentions`
+//!   property array, which we do not parse here — and a plain `@name` token has
+//!   no MRI at all. It also does not attempt names containing spaces (Teams
+//!   encodes those as `<at>` tags).
+
+use serde::{Deserialize, Serialize};
 
 /// Block-level tags: a boundary here separates words, so it yields one space
 /// (pending, emitted only *between* two non-space characters). Inline tags
@@ -122,6 +136,218 @@ pub fn html_escape(text: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// One `@`-mention found in a raw message body (milestone **M8**).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mention {
+    /// The mentioned user's MRI (`8:orgid:<guid>`) when the body named one.
+    ///
+    /// Teams emits the MRI in a `<at mri="…">`/`<at id="8:orgid:…">` tag; an
+    /// index-only `<at id="0">` tag carries **no** MRI here (the index maps into
+    /// the message's `mentions` property, which we do not parse).
+    pub mri: Option<String>,
+    /// The mention's display text (the `<at>` inner text, or the `@name` token).
+    pub name: String,
+}
+
+/// Extract `@`-mentions from raw Teams message HTML (milestone **M8**).
+///
+/// Two shapes are recognised, in document order:
+///
+/// * Teams **mention tags** — `<at id="0">Bob Smith</at>` (an index id that
+///   yields no MRI) and `<at id="8:orgid:…">Bob</at>` / `<at mri="…">Bob</at>`
+///   (which carry the MRI). The tag's inner text, HTML-stripped, is the name.
+/// * plain-text **`@name`** tokens — a `@` at a word boundary followed by
+///   letters/digits/`._-` (unicode-aware). These carry no MRI.
+///
+/// Pure and total: malformed or unterminated tags are skipped, an email-like
+/// `a@b.c` is **not** a mention (the `@` is not at a word boundary), and the
+/// function never panics.
+pub fn mentions(raw: &str) -> Vec<Mention> {
+    let mut out = Vec::new();
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some((mention, next)) = parse_at_tag(raw, i) {
+                if !mention.name.is_empty() || mention.mri.is_some() {
+                    out.push(mention);
+                }
+                i = next;
+                continue;
+            }
+            // Skip a tag we do not model so an `@` inside an attribute value is
+            // never mistaken for a mention. A `<` that does not open a tag is
+            // advanced a single char so plain text after it still scans.
+            if opens_tag_name(bytes, i) {
+                match raw[i..].find('>') {
+                    Some(gt) => {
+                        i += gt + 1;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            i += 1;
+            continue;
+        }
+        let ch = raw[i..].chars().next().unwrap_or('\0');
+        if ch == '@' && at_word_boundary(raw, i) {
+            let (name, next) = scan_at_name(raw, i + 1);
+            if !name.is_empty() {
+                out.push(Mention { mri: None, name });
+                i = next;
+                continue;
+            }
+        }
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Parse a `<at …>Name</at>` tag starting at byte `start` (which must be `<`).
+///
+/// Returns the mention and the byte index just past the closing `</at>`, or
+/// `None` when this is not a well-formed mention tag.
+fn parse_at_tag(raw: &str, start: usize) -> Option<(Mention, usize)> {
+    let rest = raw.get(start..)?;
+    let mut chars = rest.chars();
+    if chars.next()? != '<' {
+        return None;
+    }
+    if !chars.next()?.eq_ignore_ascii_case(&'a') || !chars.next()?.eq_ignore_ascii_case(&'t') {
+        return None;
+    }
+    // The tag name must be delimited (`<at>`, `<at …>`, `<at/>`).
+    match chars.next() {
+        Some(c) if c == '>' || c == '/' || c.is_whitespace() => {}
+        _ => return None,
+    }
+    let open_end = start + rest.find('>')? + 1;
+    // Attributes live between "<at" and the closing '>'.
+    let attrs = raw.get(start + 3..open_end - 1)?;
+    let close = open_end + find_ci(raw.get(open_end..)?, "</at>")?;
+    let inner = raw.get(open_end..close)?;
+    let name = strip_html(inner).trim().to_string();
+    let mri = mention_mri(&parse_attrs(attrs));
+    Some((Mention { mri, name }, close + "</at>".len()))
+}
+
+/// Whether `bytes[i] == b'<'` opens a tag name (letter, `/` or `!`).
+fn opens_tag_name(bytes: &[u8], i: usize) -> bool {
+    matches!(bytes.get(i + 1), Some(b) if b.is_ascii_alphanumeric() || *b == b'/' || *b == b'!')
+}
+
+/// Whether the `@` at byte `i` starts a word (start of text, or preceded by a
+/// non-word character).
+fn at_word_boundary(raw: &str, i: usize) -> bool {
+    match raw.get(..i).and_then(|s| s.chars().next_back()) {
+        None => true,
+        Some(c) => !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '@')),
+    }
+}
+
+/// Consume a `@name` run starting at byte `start` (just past the `@`).
+///
+/// Returns the trimmed name and the byte index past the consumed run.
+fn scan_at_name(raw: &str, start: usize) -> (String, usize) {
+    let mut name = String::new();
+    let mut end = start;
+    for (off, ch) in raw.get(start..).unwrap_or("").char_indices() {
+        if ch.is_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            name.push(ch);
+            end = start + off + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let trimmed = name.trim_end_matches(['.', '_', '-']).to_string();
+    (trimmed, end)
+}
+
+/// The `(key, value)` attribute pairs of a tag's attribute string.
+fn parse_attrs(attrs: &str) -> Vec<(String, String)> {
+    let bytes = attrs.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let name_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+            i += 1;
+        }
+        if i == name_start {
+            i += 1;
+            continue;
+        }
+        let name = attrs[name_start..i].trim().to_ascii_lowercase();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut value = String::new();
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let quote = bytes[i];
+                i += 1;
+                let v_start = i;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                value = attrs[v_start..i].to_string();
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else {
+                let v_start = i;
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                value = attrs[v_start..i].to_string();
+            }
+        }
+        if !name.is_empty() {
+            out.push((name, value));
+        }
+    }
+    out
+}
+
+/// The MRI an `<at>` tag carries, if any.
+///
+/// Prefers an explicit `mri`/`userid`/`user` attribute; falls back to the `id`
+/// attribute **only when it is not a bare index** (a purely numeric id is the
+/// position in the message's `mentions` array, not an MRI).
+fn mention_mri(attrs: &[(String, String)]) -> Option<String> {
+    let value_of = |key: &str| {
+        attrs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.trim())
+            .filter(|v| !v.is_empty())
+    };
+    for key in ["mri", "userid", "user"] {
+        if let Some(v) = value_of(key) {
+            return Some(v.to_string());
+        }
+    }
+    if let Some(v) = value_of("id")
+        && !v.chars().all(|c| c.is_ascii_digit())
+    {
+        return Some(v.to_string());
+    }
+    None
+}
+
+/// Case-insensitive substring search (ASCII folding preserves byte offsets).
+fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
+    haystack.to_ascii_lowercase().find(needle)
+}
+
 /// Decode the small set of named/numeric entities Teams emits for text content.
 fn decode_entities(text: &str) -> String {
     if !text.contains('&') {
@@ -205,5 +431,107 @@ mod tests {
         assert_eq!(html_escape("<b>&\"'"), "&lt;b&gt;&amp;&quot;&#39;");
         // Already-escaped input is not double decoded.
         assert_eq!(html_escape("&amp;"), "&amp;amp;");
+    }
+
+    // ----- M8: mention extraction -------------------------------------------
+
+    fn named(name: &str, mri: Option<&str>) -> Mention {
+        Mention {
+            mri: mri.map(str::to_string),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn at_tag_without_mri_yields_name_only() {
+        let raw = r#"<p>Hi <at id="0">Bob Smith</at> and <at id="1">Carol</at></p>"#;
+        assert_eq!(
+            mentions(raw),
+            vec![named("Bob Smith", None), named("Carol", None)]
+        );
+    }
+
+    #[test]
+    fn at_tag_carrying_an_mri_or_userid_keeps_it() {
+        // The vendored parser's own shape puts the MRI in `id`.
+        assert_eq!(
+            mentions(r#"<at id="8:orgid:aaaa">Bob</at>"#),
+            vec![named("Bob", Some("8:orgid:aaaa"))]
+        );
+        // `mri` and `userId` attributes are also honoured.
+        assert_eq!(
+            mentions(r#"<at mri="8:orgid:bbbb">Carol Jones</at>"#),
+            vec![named("Carol Jones", Some("8:orgid:bbbb"))]
+        );
+        assert_eq!(
+            mentions(r#"<at id="0" userId="8:orgid:cccc">Dan</at>"#),
+            vec![named("Dan", Some("8:orgid:cccc"))]
+        );
+    }
+
+    #[test]
+    fn at_tag_decodes_entities_in_the_name() {
+        assert_eq!(
+            mentions(r#"<at id="0">A &amp; B</at>"#),
+            vec![named("A & B", None)]
+        );
+    }
+
+    #[test]
+    fn plain_at_name_tokens_are_found_at_word_boundaries() {
+        assert_eq!(
+            mentions("<p>hey @Bob and @Carol_Jones, plus @a-b.c!</p>"),
+            vec![
+                named("Bob", None),
+                named("Carol_Jones", None),
+                named("a-b.c", None),
+            ]
+        );
+        // A leading `@` at the very start of the body counts.
+        assert_eq!(mentions("@Bob hello"), vec![named("Bob", None)]);
+        // Trailing punctuation is not part of the name.
+        assert_eq!(mentions("hi @Bob."), vec![named("Bob", None)]);
+    }
+
+    #[test]
+    fn email_like_at_is_not_a_mention() {
+        assert!(mentions("mail me at bob@contoso.com").is_empty());
+        assert!(mentions("a@b").is_empty());
+    }
+
+    #[test]
+    fn mention_tags_and_at_names_are_ordered_and_not_double_counted() {
+        let raw = r#"<p><at id="0">Bob</at> sees @Carol and <at mri="8:x">Eve</at></p>"#;
+        assert_eq!(
+            mentions(raw),
+            vec![
+                named("Bob", None),
+                named("Carol", None),
+                named("Eve", Some("8:x")),
+            ]
+        );
+    }
+
+    #[test]
+    fn mention_detection_never_panics_on_odd_input() {
+        for raw in [
+            "<at id=\"0\">Unclosed",
+            "<at",
+            "<<at id='0'>x</at>",
+            "<attachment id=\"x\"></attachment>",
+            "plain text with no mentions",
+            "@",
+            "@@",
+            "<at mri=\"8:x\"></at>",
+        ] {
+            let _ = mentions(raw);
+        }
+        // `<attachment …>` is not a mention tag.
+        assert!(mentions(r#"<attachment id="a"></attachment>"#).is_empty());
+        // A tag with an MRI but no inner text still surfaces (the MRI is useful).
+        assert_eq!(
+            mentions(r#"<at mri="8:x"></at>"#),
+            vec![named("", Some("8:x"))]
+        );
     }
 }

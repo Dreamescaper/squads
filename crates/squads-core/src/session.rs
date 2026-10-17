@@ -33,7 +33,9 @@ use crate::auth::tokens::TokenSet;
 use crate::error::{CoreError, Result};
 use crate::files::Files;
 use crate::messaging::Messaging;
+use crate::notifications::{LogNotifier, Notifications, Notifier};
 use crate::paths::AppDirs;
+use crate::presence::{Presence, presence_base_from_region};
 use crate::realtime::{RealtimeEvent, RealtimeService};
 use crate::store::Store;
 use crate::teams::Teams;
@@ -104,6 +106,9 @@ pub struct Session {
     /// The running realtime (Trouter) feed (M4), if [`Session::start_realtime`]
     /// has been called.
     realtime: Option<RealtimeService>,
+    /// Where M8 notifications are delivered. Defaults to a [`LogNotifier`];
+    /// replace it with [`Session::set_notifier`].
+    notifier: Arc<dyn Notifier>,
 }
 
 impl Session {
@@ -150,6 +155,7 @@ impl Session {
             sign_in: None,
             api: None,
             realtime: None,
+            notifier: Arc::new(LogNotifier),
         })
     }
 
@@ -272,6 +278,59 @@ impl Session {
             Arc::clone(&self.store),
             client,
         ))
+    }
+
+    /// The M8 presence service for this session.
+    ///
+    /// Uses the **unified** backend (the default: the Graph presence endpoints
+    /// 403 with the Teams first-party token — see [`crate::presence`]). The base
+    /// URL comes from `region_gtms.presenceBase` when present, else the unified
+    /// default; the token sent is the **skype** token, a documented, unverified
+    /// choice (the unified audience/header is not confirmed — `docs/BLOCKERS.md`).
+    ///
+    /// Requires a token set ([`CoreError::NotSignedIn`] otherwise); building is
+    /// offline.
+    pub fn presence(&mut self) -> Result<Presence> {
+        let client = self.api_arc()?;
+        let base = presence_base_from_region(client.region_gtms());
+        let token = self
+            .tokens
+            .as_ref()
+            .map(|tokens| tokens.skype_token().to_string())
+            .unwrap_or_default();
+        Ok(Presence::unified(self.profile.clone(), base, token))
+    }
+
+    /// The M8 presence service using the **Graph** backend.
+    ///
+    /// Live this 403s (the token lacks `Presence.Read*`); it is exposed for a
+    /// suitably-scoped token and for symmetry with [`Session::presence`].
+    pub fn graph_presence(&mut self) -> Result<Presence> {
+        let client = self.api_arc()?;
+        Ok(Presence::graph(self.profile.clone(), client))
+    }
+
+    /// The M8 notifications service (unread derivation + notification
+    /// delivery), sharing the session's [`Store`] and notifier. Needs no
+    /// tokens; building is offline.
+    pub fn notifications(&self) -> Notifications {
+        Notifications::new(
+            self.profile.clone(),
+            Arc::clone(&self.store),
+            Arc::clone(&self.notifier),
+        )
+    }
+
+    /// The notifier notifications are delivered through (default
+    /// [`LogNotifier`]).
+    pub fn notifier(&self) -> &Arc<dyn Notifier> {
+        &self.notifier
+    }
+
+    /// Replace the notifier (e.g. a desktop notifier or a recording one in
+    /// tests).
+    pub fn set_notifier(&mut self, notifier: Arc<dyn Notifier>) {
+        self.notifier = notifier;
     }
 
     /// Start the realtime (Trouter) feed for the current token set (M4).
@@ -991,6 +1050,82 @@ mod tests {
         // No tokens: must not spawn the connection loop.
         let err = session.start_realtime().unwrap_err();
         assert!(matches!(err, CoreError::NotSignedIn), "got {err:?}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ----- M8: presence & notifications --------------------------------------
+
+    #[test]
+    fn presence_requires_tokens_and_uses_the_region_base_and_skype_token() {
+        let (tmp, dirs_a) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs_a, "default", store).expect("session");
+        let err = session.presence().unwrap_err();
+        assert!(matches!(err, CoreError::NotSignedIn), "got {err:?}");
+
+        let (tmp2, dirs_b) = dirs();
+        let mut set = sample_set();
+        set.skype = StoredToken::with_expiry("skype-token", 4_000_000_000);
+        set.region_gtms = serde_json::json!({ "presenceBase": "http://127.0.0.1:9" });
+        let store2 = Arc::new(MemoryTokenStore::new());
+        store2.save("work", &set).unwrap();
+        let mut session = Session::with_store(dirs_b, "work", store2).expect("session");
+        session.restore().expect("restore");
+
+        let presence = session.presence().expect("presence");
+        assert_eq!(presence.profile(), "work");
+        assert_eq!(presence.backend().kind(), "unified");
+        match presence.backend() {
+            crate::presence::PresenceBackend::Unified(unified) => {
+                assert_eq!(unified.base(), "http://127.0.0.1:9");
+            }
+            other => panic!("expected the unified backend, got {}", other.kind()),
+        }
+        // The Graph backend builds too.
+        let graph = session.graph_presence().expect("graph presence");
+        assert_eq!(graph.backend().kind(), "graph");
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp2).ok();
+    }
+
+    #[test]
+    fn notifications_use_the_configured_notifier() {
+        let (tmp, dirs) = dirs();
+        let mut session = Session::with_store(dirs, "default", Arc::new(MemoryTokenStore::new()))
+            .expect("session");
+        let recorder = Arc::new(crate::notifications::RecordingNotifier::new());
+        session.set_notifier(recorder.clone());
+
+        let notifications = session.notifications();
+        assert_eq!(notifications.profile(), session.profile());
+        assert!(Arc::ptr_eq(notifications.store(), session.store()));
+
+        let ctx = crate::notifications::NotificationContext::new().with_self_mri("8:orgid:self");
+        let event = RealtimeEvent::NewMessage {
+            chat_id: "c1".into(),
+            message: crate::model::Message {
+                id: "m1".into(),
+                chat_id: "c1".into(),
+                sender_mri: "8:orgid:other".into(),
+                sender_name: "Alice".into(),
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                content: "hi".into(),
+                raw: "<p>hi</p>".into(),
+                reactions: Vec::new(),
+                reply_to: None,
+                client_message_id: None,
+                edited: false,
+                is_own: false,
+                send_state: crate::model::SendState::Sent,
+            },
+        };
+        let delivered = notifications.notify_event(&event, &ctx).expect("delivered");
+        assert_eq!(
+            delivered.kind,
+            crate::notifications::NotificationKind::NewMessage
+        );
+        assert_eq!(recorder.len(), 1);
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

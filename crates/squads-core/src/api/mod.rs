@@ -70,6 +70,9 @@ pub use ost::api::{ChannelInfo, TeamCreateResult, TeamInfo, TeamMemberInfo};
 /// [`crate::model::SharedLink`].
 pub use ost::api::{FileVersion, SharedFile, UploadProgress};
 
+/// Protocol type surfaced by the M8 Graph presence call.
+pub use ost::api::PresenceInfo;
+
 use crate::auth::tokens::{StoredToken, TokenSet};
 use crate::error::Result;
 use crate::model::SharedLink;
@@ -850,6 +853,57 @@ impl ApiClient {
             .instrument(span)
             .await?;
         tracing::debug!(call, "deleted file");
+        Ok(())
+    }
+
+    // ----- M8: presence (Graph) -------------------------------------------
+
+    /// `GET /me/presence` — the signed-in user's own presence.
+    ///
+    /// **Live this 403s**: the Teams first-party token does not carry the
+    /// `Presence.Read*` scopes, which is why [`Presence`](crate::Presence)
+    /// defaults to the unified backend (see [`crate::presence`]). The wrapper is
+    /// kept for a suitably-scoped token and for the offline stub tests.
+    pub async fn get_presence(&self) -> Result<PresenceInfo> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.get_presence", call);
+        let info = ost::api::get_presence_data(&self.client)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "read own presence");
+        Ok(info)
+    }
+
+    /// `POST /me/presence/setUserPreferredPresence` — set own presence.
+    ///
+    /// `expiration_duration` is an ISO-8601 duration (`PT1H`); the body shape
+    /// matches the vendored `set_presence` helper (which builds its own client,
+    /// so we reproduce the body and post through this client).
+    pub async fn set_user_preferred_presence(
+        &self,
+        availability: &str,
+        activity: &str,
+        expiration_duration: &str,
+    ) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.set_user_preferred_presence",
+            call
+        );
+        let body = serde_json::json!({
+            "sessionId": "squads-core",
+            "availability": availability,
+            "activity": activity,
+            "expirationDuration": expiration_duration,
+        });
+        self.client
+            .graph_post("/me/presence/setUserPreferredPresence", &body)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "set own presence");
         Ok(())
     }
 }

@@ -32,11 +32,18 @@ getrandom.workspace = true
 # M3 — local persistence (SQLite, bundled; see ADR-011)
 rusqlite.workspace = true
 
+# M8 — desktop notifications (default-off; see ADR-022). Optional so the
+# headless/CI build never needs DBus or a notification daemon.
+notify-rust = { version = "4.18", optional = true }
+
 [features]
 default = []
 # OS-keyring token storage. Off by default so the headless/CI build never needs
 # a keyring backend (see `auth::store::KeyringTokenStore` TODO).
 keyring = []
+# Desktop notifications via `notify-rust`. Off by default: the headless build
+# has no DBus/notification daemon (ADR-022).
+desktop-notifications = ["dep:notify-rust"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

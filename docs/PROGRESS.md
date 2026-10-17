@@ -14,7 +14,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started · ⛔ blocked (see [BLO
 | M5 | Messaging | ✅ | `api` chat wrappers (page/send/reply/edit/delete/react/receipts); offline-first `Messaging` (open/load_older, optimistic `SendState` send + idempotent retry); shared `text` module; schema **v2** (`send_state`, `read_state`); `Session::messaging()`. |
 | M6 | Teams & channels | ✅ | `api` teams wrappers (list teams/members, thread reply, channel/team writes); `model::{Team,Channel,TeamMember}`; schema **v3** (`teams`,`channels`,`team_members`); offline-first `Teams` (metadata cache, channel history via `Messaging`, optimistic channel post + thread reply); `Session::teams()`. |
 | M7 | Files | ✅ | Graph files wrappers + `FileEntry`/`FileVersion`/`SharedLink` model; schema **v4** (`files`); offline-first `Files` (chat/folder/recents list, coarse download progress, upload simple-PUT vs resumable, links, versions, manage); `Session::files()`. |
-| M8 | Presence & notifications | ⬜ | |
+| M8 | Presence & notifications | ✅ | Two presence backends (Graph + unified `presence.teams.microsoft.com`) behind one `Presence`; `text::mentions`; pure notification routing + `Notifier` (desktop behind a default-off feature); schema **v5** (`chats.muted`) + unread/activity derivation; `Session::presence()`/`notifications()`. |
 | M9 | Audio/video calls | ⬜ | |
 | M10 | egui UI | ⬜ | |
 | M11 | Polish & packaging | ⬜ | |
@@ -594,4 +594,109 @@ chat-service file post's `reference` shape and the attachment-GUID-from-eTag
 bubble match; the resumable-session fragment size/`202` semantics; and the
 chat-vs-channel upload routing). B-007 (file names/URLs/senders join chat
 content in the unencrypted store).
+
+---
+
+## M8 — Presence & notifications
+
+**Goal.** Turn the M2 client/Graph surface and the M3 store into (a) a
+transport-injectable presence service spanning Teams' two presence services and
+(b) a notification router plus unread/activity derivation — all testable offline
+against local TCP stubs.
+
+**Landed.**
+
+- `text` (M5 module, extended) — `mentions(raw) -> Vec<Mention { mri, name }>`
+  (M8). Recognises Teams `<at …>Name</at>` tags (index-only, `id="8:…"`,
+  `mri="…"` and `userId="…"` attributes; inner text HTML-stripped) **and**
+  plain-text `@name` tokens at a word boundary. Pure and total: malformed tags
+  are skipped, an email-like `a@b.c` is not a mention, and it never panics.
+- `presence` (new) — the M8 presence service:
+  - Types: `Availability` (the real wire strings — `Available`, `AvailableIdle`,
+    `Busy`, `BusyIdle`, `DoNotDisturb`, `BeRightBack`, `Away`, `Offline`; an
+    `is_available()` helper; unknown → `PresenceUnknown`), `Activity` (`InACall`,
+    `Presenting`, `OffWork`, …; unknown → `Unknown`), `ContactPresence { mri,
+    availability, activity, status_message }`, `OwnPresence`.
+  - A `PresenceBackend` enum of two impls: **`GraphBackend`** (wraps the
+    vendored `get_presence_data`/`set_presence` through a new
+    `ApiClient::get_presence` / `set_user_preferred_presence` — `GET
+    /me/presence`, `POST /me/presence/setUserPreferredPresence`) and
+    **`UnifiedBackend`** (reqwest against `presence.teams.microsoft.com`:
+    `POST {base}/v1/presence/getpresence/` with `{"ids":[…]}` and
+    `PUT {base}/v1/me/forceavailability/`). The unified base is **overridable**
+    (`region_gtms.presenceBase` or an explicit base) and it takes the **token to
+    send** as a parameter (Bearer) — see ADR-021/B-009.
+  - `Presence` service (mirrors `Teams`/`Files`): `get(ids)` (batch; Graph has
+    no batch, so it returns empty and `own()` is the Graph read), `own()`,
+    `set(availability, activity)`, with in-memory caching
+    (`cached`/`cached_all`/`cached_own`).
+  - Pure, defensive mapping: `Availability::from_wire` / `Activity::from_wire`
+    (case/`_`/`-` tolerant, unknown → sentinel),
+    `OwnPresence::from_graph(&PresenceInfo)`, `parse_unified_presence` /
+    `parse_unified_own` (top-level array, `value`/`presence`/`presences`/`result`
+    wrappers, or a single entry; availability/activity flat **or** nested under
+    `presence`; status message as a string or `{message|text}`; entries without
+    an MRI are dropped; never panics).
+- `notifications` (new) — routing + unread/activity:
+  - `Notification { kind, chat_id, title, body, mention }` and `NotificationKind`
+    (`NewMessage`, `Mention`, `Reply`, plus `Reaction`/`MissedCall`
+    placeholders — no reaction/call realtime event exists yet, B-008).
+  - `Notifier` trait (`Send + Sync`) with `LogNotifier` (default),
+    `RecordingNotifier` (tests) and a `notify-rust`-backed `DesktopNotifier`
+    behind the **default-off** `desktop-notifications` cargo feature (ADR-022).
+  - Pure `route(event, ctx)`: only a `NewMessage` from someone else in a
+    non-muted chat notifies; a message that mentions us (by MRI or display name,
+    via `text::mentions`) is `Mention`, a reply to one of our own messages is
+    `Reply`, else `NewMessage`. Edits, deletes, typing, read-state, thread
+    updates, resyncs and unknowns return `None`.
+  - `Notifications` service: `notify_event` (route + deliver), `unread_summaries`,
+    `unread_total` and `activity(ctx, limit)` derived from the store.
+- `store` — **schema v5**. `chats.muted` (guarded `ALTER TABLE`; existing rows
+  default 0) persists the local per-chat mute, with `set_chat_muted` /
+  `is_chat_muted` / `muted_chats`. Unread is **derived**, not stored:
+  `unread_count(profile, chat)` and `unread_messages(profile, chat, limit)`
+  (newest-first) count messages newer than the `read_state` horizon.
+  `SCHEMA_VERSION = 5`; the v4→v5 migration is forward-only and re-entrant.
+- `session` — `Session::presence()` (unified, base from
+  `region_gtms.presenceBase`, skype token), `Session::graph_presence()`,
+  `Session::notifications()` (store + notifier), `Session::notifier()` /
+  `Session::set_notifier()`.
+
+**Decisions.** **ADR-021** (two presence backends, unified by default, and the
+unverified unified token/audience — defaults to the skype token). **ADR-022**
+(the `Notifier` trait and desktop notifications behind a default-off feature).
+
+**Tests.** `cargo test -p squads-core` — **230** offline unit tests (191 from
+M1–M7 + 39 new: 7 `text` mentions, 15 `presence`, 12 `notifications`, 3 `store`,
+2 `session`). `cargo test -p squads-protocol` still passes **377**. New coverage
+includes: `Availability`/`Activity` wire mapping incl. unknowns and aliases; the
+unified mapping fixtures (array/wrapper/nested, unknown values, status-message
+shapes, entries without an MRI); the **unified backend against a local stub**
+asserting the path (`POST /v1/presence/getpresence/`, `PUT
+/v1/me/forceavailability/`), the `{"ids":[…]}` / availability+activity bodies and
+the `authorization: Bearer skype-token` header; the **Graph backend through the
+existing stub** (`GET /me/presence` with the Graph token) and the
+`setUserPreferredPresence` body; mention detection (`<at>` with/without an MRI,
+`@name`, entities, email rejection, malformed tags); the routing rules (own →
+None, muted → None incl. a muted mention → None, mention → `Mention`, reply-to-own
+→ `Reply`, ordinary → `NewMessage`, every non-new-message event → None); unread
+derivation from `read_state` (no horizon → all unread, horizon → the remainder,
+newest-first, profile isolation); and the **v4→v5 upgrade** (a hand-built v4
+database gains `chats.muted`, defaults to unmuted, and round-trips through a
+reopen).
+
+**How to verify manually** (real tenant; not runnable here): sign in, build
+`session.presence()` and `get(&[mri])`/`own()` for a colleague and yourself;
+`set(Availability::Busy, None)` and confirm the tenant shows Busy. Subscribe to
+`session.subscribe()`, feed `notify_event`, and confirm a colleague's message
+notifies, your own does not, and a muted chat stays silent. `unread_summaries()`
+after `Messaging::mark_read` drops the badge.
+
+**Blockers.** **B-009** (the unified presence token audience/Bearer choice is
+**unverified**; the Graph presence routes 403 live with the Teams first-party
+token). **B-010** (desktop notifications cannot be exercised headlessly; quiet
+hours are not implemented). **U-005** (live presence acceptance, the unified
+request/response shapes, and the mute/reaction/call-event derivations are
+unverified).
+
 

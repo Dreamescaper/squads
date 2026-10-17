@@ -292,6 +292,82 @@ contained; the deterministic stub tests pin the exact paths/bodies/headers
 (including the `Content-Range` fragments and the `u!<base64url-nopad>` share
 id) so a regression is caught; streaming download/upload is a future follow-up.
 
+### B-009 — Unified presence token/audience is unverified (M8)
+
+The Graph presence routes (`GET /me/presence`, `POST
+/me/presence/setUserPreferredPresence`) **403 live**: the Teams first-party
+token does not carry the `Presence.Read*` scopes. M8 therefore defaults to
+Teams' **unified** presence service (`presence.teams.microsoft.com`), but its
+**token audience is not confirmed**: `better-teams` minted a token for the
+`https://presence.teams.microsoft.com` resource, whereas we only hold the M1
+`spaces`/`skype`/`graph`/`ic3`/`recorder` tokens. The unified backend sends the
+**skype** token as a Bearer header — a documented, **unverified** choice.
+
+**Impact:** presence read/write may be rejected (401/403) against a live tenant
+until the correct audience/header is confirmed. The unified request/response
+**shapes** are likewise unverified (see U-005).
+
+**Mitigation:** the token is a parameter of `UnifiedBackend` (and
+`Session::presence`); if the skype token is wrong, only that choice (or a
+token-audience mint in M1) changes, not the call sites. The stub tests pin the
+paths/bodies/headers.
+
+### B-010 — Desktop notifications and quiet hours (M8)
+
+Desktop notifications go through `notify-rust`, which needs a freedesktop
+notification daemon over DBus. This environment has no display and no session
+bus, so the path cannot be exercised here — the same constraint as the OS
+keyring (ADR-008). The notifier is behind the **default-off**
+`desktop-notifications` cargo feature; the default build never compiles
+`notify-rust`.
+
+**Impact:** notification delivery is verified only by the `Notifier` seam
+(`RecordingNotifier`/`LogNotifier`); the real toast cannot be observed here.
+**Quiet hours are not implemented** (no clock in the router, no settled
+settings), so notifications fire at all hours.
+
+**Mitigation:** routing is a pure, tested function and delivery is one trait
+method; a settings screen can add quiet hours by threading a window through
+`NotificationContext` without touching the notifier.
+
+### U-005 — M8 presence/notification aspects not exercised offline
+
+M8's presence calls are checked against local TCP stubs (method/path/body/auth)
+and its routing/unread logic is pure. The following cannot be exercised here
+(B-002 — no live tenant):
+
+- **Live presence acceptance.** Whether the unified service accepts the skype
+  token (B-009), whether `getpresence` returns the shapes we parse, whether
+  `forceavailability` needs a different body/expiration, and whether a batch
+  read of arbitrary MRIs is permitted are all unproven. The mapping tolerates
+  several wrappers/keys to soften a mismatch.
+- **Reply detection** relies on `Message::reply_to` (the vendored
+  `split_reply_quote`) and a caller-supplied set of our own message ids; the
+  realtime `NewMessage` for a reply may not always carry the parent link in the
+  same shape.
+- **Mention detection** is heuristic: an index-only `<at id="0">` tag yields no
+  MRI (we do not parse the message's `mentions` property array), and a plain
+  `@name` token is matched by display name only. A message that mentions us
+  solely through an index-only tag + the `mentions` array would be missed.
+- **Read-horizon edge cases.** `unread_count`/`unread_messages` compare
+  timestamps against the horizon message's timestamp; a horizon message that is
+  no longer cached reads the whole chat as unread (documented), and messages
+  sharing a timestamp boundary may be miscounted (millisecond resolution in
+  practice).
+- **Reaction / missed-call notifications** are placeholders: the M4 bus carries
+  no reaction event and filters call frames out (B-008), so no producer exists
+  yet.
+- **Mute** is a local flag (schema v5); syncing it with the server's `alerts`
+  property (`set_chat_muted_with_client`) is not wired, so a mute set in another
+  client is not observed here.
+
+**Impact:** presence correctness and the mention/reply/unread derivations are
+assumed from stubs + pure logic, not proven against Teams.
+
+**Mitigation:** keep the transport-injectable service and pure router; the
+deterministic stub tests pin the request shapes so a regression is caught; the
+unwired reaction/call producers are M9/UI follow-ups.
+
 ## Deferred work
 
 ### D-001 — Third-party Teams app hosting (TeamsJS/web frames)
