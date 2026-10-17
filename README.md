@@ -3,7 +3,7 @@
 An alternative, cross-platform **Microsoft Teams** client built with **Rust** and
 [**egui**](https://github.com/emilk/egui) (immediate-mode, event-driven, glow/OpenGL).
 
-> Status: the planned milestones (**M0–M11**) are implemented. The workspace
+> Status: the planned milestones (**M0–M12**) are implemented. The workspace
 > builds and tests **offline, with default features**; the network paths need a
 > live tenant and the UI needs a display, neither of which exist in the build
 > environment. See [`docs/STATUS.md`](docs/STATUS.md) for the one-screen state and
@@ -48,6 +48,7 @@ crates/
 | Chat | Offline-first store + paging, optimistic send, edit/delete/reply/react/receipts | Server acceptance of the write shapes (U-002) | — |
 | Realtime | Trouter wrap, typed event bus, write-through | Live push; call frames are filtered upstream (B-008) | — |
 | Teams/channels | Metadata cache, channel history, thread replies, middle-tier writes | Write acceptance; channel reactions/receipts (U-003) | — |
+| Calendar | Graph `calendarView` agenda + week view, schedule/cancel, offline `meetings` cache, join hand-off to calls | Live Graph calendar acceptance; join-by-id is a browser fallback (U-007) | — |
 | Files | Graph list/upload/download/links/versions, coarse progress | Real SharePoint/OneDrive acceptance (U-004) | Streaming I/O |
 | Presence | Two backends, unified by default; pure mapping | Unified token audience/shapes (B-009/U-005) | Quiet hours (B-010) |
 | Notifications | Pure routing, unread/activity, settings switches | Desktop toasts (need DBus, B-010) | Quiet hours |
@@ -79,7 +80,8 @@ and for AppImage/Flatpak/macOS/Windows packaging notes.
 
 `Ctrl/Cmd+K` quick chat switcher · `Ctrl/Cmd+F` search in conversation · `Esc`
 close overlays / clear search · `Ctrl/Cmd+,` settings · `Ctrl/Cmd+Shift+M`
-mute (placeholder) · `j`/`k` or `↓`/`↑` chat navigation · `Ctrl/Cmd+Enter` send.
+mute (placeholder) · `Ctrl/Cmd+1`…`5` jump to Chats / Calendar / Teams / Files /
+Calls · `j`/`k` or `↓`/`↑` chat navigation · `Ctrl/Cmd+Enter` send.
 
 ## Configuration & data
 

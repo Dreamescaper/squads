@@ -42,6 +42,10 @@ pub enum Shortcut {
     PrevChat,
     /// Send the current draft (`Ctrl/Cmd+Enter`).
     Send,
+    /// Jump to a numbered page (`Ctrl/Cmd+1`…`Ctrl/Cmd+5`). The app maps the
+    /// slot to a [`crate::app::Page`] (1 = Chats, 2 = Calendar, 3 = Teams,
+    /// 4 = Files, 5 = Calls).
+    PageSlot(u8),
 }
 
 impl Shortcut {
@@ -56,6 +60,12 @@ impl Shortcut {
             Shortcut::NextChat => "next_chat",
             Shortcut::PrevChat => "prev_chat",
             Shortcut::Send => "send",
+            Shortcut::PageSlot(1) => "page_1",
+            Shortcut::PageSlot(2) => "page_2",
+            Shortcut::PageSlot(3) => "page_3",
+            Shortcut::PageSlot(4) => "page_4",
+            Shortcut::PageSlot(5) => "page_5",
+            Shortcut::PageSlot(_) => "page",
         }
     }
 
@@ -83,6 +93,12 @@ pub fn resolve(key: Key, modifiers: Modifiers) -> Option<Shortcut> {
         Key::Enter if cmd => Some(Shortcut::Send),
         Key::K if cmd => Some(Shortcut::QuickSwitcher),
         Key::F if cmd => Some(Shortcut::SearchInChat),
+        // Page slots: Ctrl/Cmd+1…5 (see `PageSlot`).
+        Key::Num1 if cmd => Some(Shortcut::PageSlot(1)),
+        Key::Num2 if cmd => Some(Shortcut::PageSlot(2)),
+        Key::Num3 if cmd => Some(Shortcut::PageSlot(3)),
+        Key::Num4 if cmd => Some(Shortcut::PageSlot(4)),
+        Key::Num5 if cmd => Some(Shortcut::PageSlot(5)),
         // Plain navigation.
         Key::J | Key::ArrowDown if !cmd => Some(Shortcut::NextChat),
         Key::K | Key::ArrowUp if !cmd => Some(Shortcut::PrevChat),
@@ -160,5 +176,19 @@ mod tests {
         assert_eq!(Shortcut::QuickSwitcher.label(), "quick_switcher");
         assert!(Shortcut::ToggleMute.is_placeholder());
         assert!(!Shortcut::Send.is_placeholder());
+    }
+
+    #[test]
+    fn command_digit_maps_to_page_slots() {
+        assert_eq!(resolve(Key::Num1, cmd()), Some(Shortcut::PageSlot(1)));
+        assert_eq!(resolve(Key::Num2, cmd()), Some(Shortcut::PageSlot(2)));
+        assert_eq!(resolve(Key::Num5, cmd()), Some(Shortcut::PageSlot(5)));
+        // The slots are not placeholders and carry a stable label.
+        assert_eq!(Shortcut::PageSlot(2).label(), "page_2");
+        assert!(!Shortcut::PageSlot(2).is_placeholder());
+        // A plain digit is unbound (no hijacking of text editing), and digits
+        // beyond the bound range are unbound too.
+        assert_eq!(resolve(Key::Num2, Modifiers::NONE), None);
+        assert_eq!(resolve(Key::Num9, cmd()), None);
     }
 }

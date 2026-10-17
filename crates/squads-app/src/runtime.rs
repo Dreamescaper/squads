@@ -25,7 +25,8 @@ use std::sync::Mutex;
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use squads_core::model::{CallLogEntry, Chat, FileEntry, Message, Team};
+use squads_core::api::JoinTarget;
+use squads_core::model::{CallLogEntry, Chat, FileEntry, Meeting, Message, Team};
 use squads_core::{CallState, Channel, ContactPresence, RealtimeEvent, SignInProgress};
 
 /// Everything the backend can tell the UI about.
@@ -69,6 +70,15 @@ pub enum AppEvent {
         /// The files to display (and cache).
         files: Vec<FileEntry>,
     },
+    /// The upcoming meetings, fetched from the calendar service (M12).
+    MeetingsLoaded(Vec<Meeting>),
+    /// A join string resolved to a target (M12). The app hands a `thread`
+    /// target off to the call path; other kinds are shown to the user.
+    JoinResolved(JoinTarget),
+    /// A meeting was scheduled (M12); the created event is already cached.
+    MeetingScheduled(Meeting),
+    /// A meeting was cancelled (M12); the event id is already dropped.
+    MeetingCancelled(String),
     /// Batch presence for a set of contacts. No producer is wired yet (the M11
     /// presence panel will emit it); the variant is part of the event vocabulary.
     #[allow(dead_code)]
@@ -96,6 +106,10 @@ impl AppEvent {
             AppEvent::TeamsLoaded(_) => "teams_loaded",
             AppEvent::ChannelsLoaded { .. } => "channels_loaded",
             AppEvent::FilesLoaded { .. } => "files_loaded",
+            AppEvent::MeetingsLoaded(_) => "meetings_loaded",
+            AppEvent::JoinResolved(_) => "join_resolved",
+            AppEvent::MeetingScheduled(_) => "meeting_scheduled",
+            AppEvent::MeetingCancelled(_) => "meeting_cancelled",
             AppEvent::PresenceUpdated(_) => "presence_updated",
             AppEvent::Realtime(_) => "realtime",
             AppEvent::CallState(_) => "call_state",

@@ -113,6 +113,19 @@ Each milestone is an independent work item for the implementation loop: **implem
   `packaging/` assets; `.github/workflows/ci.yml`; release `strip`; and the
   docs final pass (`STATUS.md`, README matrix, index). See `PROGRESS.md` (M11).
 
+### M12 — Calendar
+- Graph `calendarView` agenda + explicit week view; schedule (`POST
+  /me/calendar/events`) and cancel (`DELETE`); offline-first `Calendar` service
+  with a schema-v7 `meetings` cache; join-target resolution and the pure lobby
+  helper; the join hand-off to the existing call path; a **Calendar** tab.
+- **Exit:** calendar calls tested offline against stubs (paths/params/bodies +
+  store effects); join classification and lobby transitions unit-tested;
+  headless `egui_kittest` calendar test.
+- **Landed:** `model::Meeting`, schema **v7** (`meetings`), `Calendar` +
+  `Session::calendar()`, Graph `api` wrappers, the `Page::Calendar` tab (nav
+  entry + `Ctrl/Cmd+2`) and `views/calendar.rs`, join hand-off to `CallService`.
+  See `PROGRESS.md` (M12) and ADR-033.
+
 ## 4. Working agreement (the loop)
 
 For each milestone: implement (via subagent where useful) → review the diff → run
@@ -152,3 +165,4 @@ Documentation is updated continuously:
 - [x] M9 — Audio/video calls
 - [x] M10 — egui UI
 - [x] M11 — Polish & packaging
+- [x] M12 — Calendar

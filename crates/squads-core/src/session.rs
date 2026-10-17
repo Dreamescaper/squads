@@ -31,6 +31,7 @@ use crate::api::ApiClient;
 use crate::auth::flow::{AuthDriver, AuthTransport, HttpTransport, SignInProgress};
 use crate::auth::store::{DEFAULT_PROFILE, FileTokenStore, TokenStore};
 use crate::auth::tokens::TokenSet;
+use crate::calendar::Calendar;
 use crate::calls::{CallCredentials, CallEndpoints, CallIdentity, CallService, CallSignaller};
 use crate::error::{CoreError, Result};
 use crate::files::Files;
@@ -276,6 +277,22 @@ impl Session {
     pub fn files(&mut self) -> Result<Files> {
         let client = self.api_arc()?;
         Ok(Files::new(
+            self.profile.clone(),
+            Arc::clone(&self.store),
+            client,
+        ))
+    }
+
+    /// The M12 calendar service for this session.
+    ///
+    /// Shares the session's [`Store`] and protocol client (the same
+    /// `Arc<ApiClient>` [`Session::messaging`] hands out). Requires a token set
+    /// ([`CoreError::NotSignedIn`] otherwise); building is offline. The returned
+    /// [`Calendar`] is stateless beyond the shared store, so callers may build a
+    /// fresh handle whenever they like.
+    pub fn calendar(&mut self) -> Result<Calendar> {
+        let client = self.api_arc()?;
+        Ok(Calendar::new(
             self.profile.clone(),
             Arc::clone(&self.store),
             client,
@@ -1042,6 +1059,34 @@ mod tests {
         assert!(Arc::ptr_eq(files.store(), session.store()));
         assert_eq!(
             files.client().request_count(),
+            0,
+            "building the service is offline"
+        );
+        assert!(session.has_api());
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp2).ok();
+    }
+
+    #[test]
+    fn calendar_requires_tokens_and_shares_the_store_and_client() {
+        let (tmp, dirs_a) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs_a, "default", store).expect("session");
+        // No tokens yet: building the service must fail cleanly, no network.
+        let err = session.calendar().unwrap_err();
+        assert!(matches!(err, CoreError::NotSignedIn), "got {err:?}");
+
+        let (tmp2, dirs2) = dirs();
+        let store2 = Arc::new(MemoryTokenStore::new());
+        store2.save("work", &sample_set()).unwrap();
+        let mut session = Session::with_store(dirs2, "work", store2).expect("session");
+        session.restore().expect("restore");
+
+        let calendar = session.calendar().expect("calendar");
+        assert_eq!(calendar.profile(), "work");
+        assert!(Arc::ptr_eq(calendar.store(), session.store()));
+        assert_eq!(
+            calendar.client().request_count(),
             0,
             "building the service is offline"
         );

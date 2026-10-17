@@ -10,6 +10,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod calendar;
 pub mod calls;
 pub mod error;
 pub mod files;
@@ -27,6 +28,7 @@ pub mod text;
 
 pub use api::{ApiClient, tokens_to_config};
 pub use auth::{AuthDriver, AuthTransport, SignInProgress, TokenKind, TokenSet};
+pub use calendar::{Calendar, Lobby, lobby_step};
 pub use calls::{
     AcceptedCall, CallCredentials, CallEndpoints, CallIdentity, CallMachine, CallRecorder,
     CallRecording, CallService, CallSignaller, CallState, EndReason, IncomingCall, LoopbackMedia,
@@ -36,8 +38,9 @@ pub use error::{CoreError, Result};
 pub use files::Files;
 pub use messaging::{HistoryPage, Messaging};
 pub use model::{
-    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, FileEntry, FileVersion, Message,
-    Reaction, Reactor, SendState, SharedLink, Team, TeamMember, is_channel_conversation_id,
+    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, FileEntry, FileVersion, Meeting,
+    Message, Reaction, Reactor, SendState, SharedLink, Team, TeamMember,
+    is_channel_conversation_id,
 };
 pub use notifications::{
     ActivityItem, LogNotifier, Notification, NotificationContext, NotificationKind, Notifications,

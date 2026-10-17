@@ -18,6 +18,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started · ⛔ blocked (see [BLO
 | M9 | Audio/video calls | ✅ | `calls` layer: UI `CallState` machine + `CallDirection`; injectable epconv `CallSignaller` (create→join-SDP→invite, accept→media-answer, end); SDP/SRTP/RTP offline tests; `MediaSession` seam with `LoopbackMedia` (runs `macav::call_dry_run`), real audio behind default-off `audio`/`video-capture`; `on_notification` incoming calls (B-008 noted); recording wrappers; schema **v6** `call_log`; `Session::calls()`. |
 | M10 | egui UI | ✅ | App shell (nav rail + list + timeline + composer + info), login/teams/files/calls/settings screens, tokio runtime bridge + Action pattern, virtualized timeline, headless `egui_kittest` tests. |
 | M11 | Polish & packaging | ✅ | Pure `shortcuts` mapping + app dispatch; expanded forward-compatible `Settings` (accent, font scale, compact, notifications, download dir) + settings screen; light/dark + accents; `docs/PACKAGING.md` + `packaging/`; CI workflow; release `strip`; docs final pass (`STATUS.md`). |
+| M12 | Calendar | ✅ | Graph `calendarView` agenda/week + schedule/cancel wrappers; offline-first `Calendar` service; schema **v7** (`meetings`); join-target resolution + lobby helper; join hand-off to `CallService`; **Calendar** page + `Ctrl/Cmd+2`. |
 
 ---
 
@@ -1007,3 +1008,115 @@ GitHub Release with all of them attached. Builds use `--locked --release` with
 (AppImage/Flatpak/MSI) and real signing/notarization remain manual — see
 `PACKAGING.md` §6 and B-013. Cutting a release: `git tag v0.1.0 && git push
 origin v0.1.0`.
+
+---
+
+## M12 — Calendar
+
+**Goal.** Turn the vendored Graph calendar lanes into the calendar tab the M10
+shell drives: an offline-first agenda of upcoming meetings, an explicit week
+view, scheduling and cancelling, and a join flow that hands a native thread
+target to the existing call path — all testable **offline** against local TCP
+stubs, with no tenant, network or display.
+
+**Landed.**
+
+- `model` — [`Meeting`](../crates/squads-core/src/model.rs), an owned,
+  protocol-independent mirror of the vendored `MeetingInfo`
+  (`Meeting::from_info` / `From<&MeetingInfo>`). Two **wire facts** are
+  documented rather than guessed: `start`/`end` are the Graph `dateTime` values
+  **verbatim** (no timezone suffix; the projection drops `timeZone`), and the
+  projection carries only `id`/`subject`/`start`/`end`/`join_url`/`organizer`/
+  `organizer_email`/`is_organizer`/`is_online`. The five fields the brief lists
+  but the vendored projection does **not** carry — `all_day`,
+  `join_meeting_id`, `passcode`, `web_link`, `location` — are modeled for
+  forward-compatibility and default `false`/`None` from the wire. `Debug` is
+  redacting (never prints the join URL, which can embed a passcode).
+  `Meeting::is_joinable` classifies the join URL via the vendored
+  `parse_join_url`.
+- `store` — **schema v7**. A `meetings` table keyed `(id, profile)` with the
+  idempotent `upsert_meetings`, the start-ordered/filtered
+  `upcoming_meetings(profile, from_secs, limit)` (the `from_secs` boundary is
+  rendered to ISO-8601 and compared as text against the wire `start`),
+  `meeting(id, profile)` and `delete_meeting`. `SCHEMA_VERSION = 7`; the v6→v7
+  migration is `CREATE TABLE/INDEX IF NOT EXISTS` (re-entrant) and the "newer
+  version is a hard error" behaviour is unchanged.
+- `api` (M2 module, extended) — typed, instrumented Graph wrappers in the
+  existing `ApiClient` style (redacting `Debug`, request counter, `tracing`
+  spans): `list_upcoming_meetings` (7-day `calendarView`), `list_week_meetings`
+  (explicit window; `days` validated `1..=31` pre-network), `schedule_meeting`
+  (`POST /me/calendar/events`, online), `cancel_meeting`
+  (`DELETE /me/calendar/events/{id}`) and `resolve_join_meeting_id`
+  (`GET /me/onlineMeetings`). The protocol calendar types and pure helpers are
+  re-exported (`MeetingInfo`, `JoinTarget`, `JoinIdResolve`, `ResolvedJoinId`,
+  `LobbyState`, `LobbyEvent`, `calendar_view_path`, `calweek_view_path`,
+  `parse_calendar_view`, `parse_join_url`, `normalize_join_meeting_id`,
+  `validate_schedule`, `schedule_event_body`, `parse_created_event`,
+  `lobby_next`).
+- `calendar` (new) — the offline-first service `Calendar { profile,
+  Arc<Store>, Arc<ApiClient> }`: `cached_upcoming` (local-only), `upcoming`
+  (fetch + upsert + return the cached upcoming set), `week(start_secs, days,
+  limit)` (fetch + cache + return wire order), `schedule(subject, start, end,
+  time_zone)` (validate first, then POST + cache), `cancel(event_id)` (DELETE +
+  drop the cache), `resolve_join(target_or_url, passcode)` and the pure
+  `lobby_step` / `Lobby` holder wrapping the vendored `lobby_next`.
+  `resolve_join` classifies a pasted link purely (`thread`/`url`/`unknown`); a
+  typed **numeric** meeting id is attempted through Graph and — because the
+  Teams first-party token is not granted `OnlineMeetings.Read` and the vendored
+  `graph_get` refuses `/me/onlineMeetings` before any request — falls back to
+  the browser `/meet/<id>?p=` link (kind `meeting-id`).
+- `session` — `Session::calendar()` mirrors `Session::messaging()` /
+  `Session::teams()`: shares the session's store and `Arc<ApiClient>`, offline
+  to build, `NotSignedIn` without tokens.
+- `crates/squads-app` — a **Calendar** page: `Page::Calendar` (inserted after
+  Chats), a nav-rail entry, the `Ctrl/Cmd+2` page slot (`Ctrl/Cmd+1`…`5` map to
+  the pages; Settings keeps `Ctrl/Cmd+,`), the `RefreshCalendar` /
+  `RefreshCalendarWeek` / `JoinMeeting` / `ScheduleMeeting` / `CancelMeeting`
+  actions wired through the existing dispatch/`apply_actions` pipeline, and the
+  `AppEvent::MeetingsLoaded` / `JoinResolved` / `MeetingScheduled` /
+  `MeetingCancelled` bridge events. `views/calendar.rs` renders the agenda
+  (subject, time, organizer, online flag) with a **Join** and **Cancel** button
+  per meeting, a week-view toggle, a free-form join box, a **New meeting** form
+  (subject / start / end / timezone) and empty/loading states; a `thread` join
+  target is handed off to `CallService::place`, any other target is shown.
+
+**Decisions.** **ADR-033** (calendar service, schema v7 `meetings`, and the join
+hand-off to calls).
+
+**Tests.** `cargo test -p squads-core` — **302** (285 from M1–M11 + **17** new: 4
+`model`, 3 `store`, 9 `calendar`, 1 `session`). `cargo test -p squads-app` —
+**21** (18 from M10/M11 + **3** new: 2 headless `egui_kittest` calendar tests,
+1 `shortcuts` page-slot test). `cargo test -p squads-protocol` still passes
+**377**. `cargo build --workspace` (default features) succeeds and
+`cargo fmt -p squads-core -p squads-app -- --check` is clean. New coverage
+includes: the `Meeting` conversion (carried fields + the five honest defaults +
+redacting `Debug` + JSON round-trip); `upcoming` against a local stub (the exact
+`GET /me/calendar/calendarView?…` path/params/`$select`, parsed fields, cached
++ start-ordered); the week window (`startDateTime`/`endDateTime`, `days`
+`1..=31` rejected pre-network); the schedule request shape
+(`POST /me/calendar/events` with the `isOnlineMeeting`/`teamsForBusiness` body,
+validation rejected pre-network); the cancel `DELETE` shape; join-target
+resolution (pasted `meetup-join` thread link, bare thread id, other `https`,
+garbage, and the numeric-id browser fallback); the lobby transitions; the
+**v6→v7 upgrade** (a hand-built v6 database gains `meetings`, round-trips and
+survives a reopen) plus meeting ordering/filtering/profile isolation; and the
+headless calendar page (seeded meetings render, Join/Cancel queue the expected
+actions, the join box queues a join).
+
+**How to verify manually** (real tenant; not runnable here): sign in, build
+`session.calendar()`, `upcoming(25)` and confirm the next week's meetings appear
+with their join links (and that `cached_upcoming` returns them in a fresh
+process with no network); switch to the **Week** view; `schedule("Sync", …)`
+and confirm the event is created (with a Teams join URL) and appears; `cancel`
+it and confirm the tenant agrees; paste a `teams.microsoft.com/l/meetup-join/…`
+link into the join box and confirm the call path dials the thread, and paste a
+numeric meeting id and confirm the browser `/meet/<id>` fallback is shown.
+
+**Blockers.** **U-007** (live Graph calendar acceptance — the `calendarView`
+read, the `POST /me/calendar/events` create/`DELETE` shapes, and the numeric
+join-id lookup — is unverified; the join-by-id lookup is **unavailable** with
+the Teams sign-in because `OnlineMeetings.Read` is not granted, so it always
+falls back to the browser link). **B-008** (the lobby state machine is pure and
+tested, but no realtime producer drives it: call frames are filtered out of the
+M4 bus). B-007 (meeting subjects/organizer names join chat content in the
+unencrypted store).

@@ -1,20 +1,20 @@
 # Project status — one screen
 
-> Snapshot for the **M11 (Polish & packaging)** milestone. The detailed
-> per-milestone history is in [`PROGRESS.md`](PROGRESS.md); constraints are in
+> Snapshot for the **M12 (Calendar)** milestone. The detailed per-milestone
+> history is in [`PROGRESS.md`](PROGRESS.md); constraints are in
 > [`BLOCKERS.md`](BLOCKERS.md).
 
 ## Where the project is
 
-All twelve planned milestones (**M0–M11**) are implemented. The workspace
+All thirteen planned milestones (**M0–M12**) are implemented. The workspace
 builds device- and network-free with default features, and the test suite passes
 offline:
 
 | Crate | Role | Tests |
 |---|---|---|
 | `squads-protocol` (vendored `ost`, lib `ost`) | protocol core (auth, api, trouter, calling) | 377 (unchanged) |
-| `squads-core` | session, store, settings, realtime, services | 285 |
-| `squads-app` (`squads` binary) | egui UI | 18 |
+| `squads-core` | session, store, settings, realtime, services | 302 |
+| `squads-app` (`squads` binary) | egui UI | 21 |
 
 `cargo build --workspace` and `cargo build --workspace --release` both succeed.
 
@@ -26,17 +26,19 @@ and real signing/notarization are still manual (B-013, `PACKAGING.md` §6).
 
 **What works (verified here, offline):** workspace + CI config; the full auth
 token model and device-code flow; the session/client facade and region routing;
-the SQLite store with migrations v1→v6; realtime decode/fan-out/write-through;
+the SQLite store with migrations v1→v7; realtime decode/fan-out/write-through;
 messaging (optimistic sends, paging, edit/delete/react/receipts); teams &
 channels; files (Graph list/upload/download/links/versions); presence and
 notification routing; call signalling/media primitives/loopback/call log; the
+calendar agenda/week view, scheduling/cancelling and the join hand-off; the
 egui shell and every screen; M11 keyboard shortcuts, expanded settings, light
 theme + accents, and headless UI tests.
 
 **What is unverified (needs a live tenant / devices / a display):** every
-network write shape (U-002…U-006), the unified presence token audience (B-009),
-desktop notifications and quiet hours (B-010), real call media (B-011), and the
-UI's actual pixels (B-012). See [`BLOCKERS.md`](BLOCKERS.md).
+network write shape (U-002…U-006), the calendar's live Graph acceptance and the
+browser-only join-by-id fallback (U-007), the unified presence token audience
+(B-009), desktop notifications and quiet hours (B-010), real call media (B-011),
+and the UI's actual pixels (B-012). See [`BLOCKERS.md`](BLOCKERS.md).
 
 **Deferred:** encryption at rest (B-007), the realtime call-frame producer
 (B-008), the attachment picker UI (B-012), the browser PKCE loopback listener
@@ -78,6 +80,7 @@ Newest last; full text in [`DECISIONS.md`](DECISIONS.md).
 - **ADR-030** — Settings forward-compatibility: container-level serde defaults.
 - **ADR-031** — CI scope (our crates only) and the release profile.
 - **ADR-032** — Cross-platform release artifacts on native runners.
+- **ADR-033** — Calendar service, schema-v7 `meetings`, and the join hand-off to calls.
 
 ## Open blockers (summary)
 
@@ -90,7 +93,8 @@ unencrypted), **B-008** (call frames filtered from the hub; global hub;
 reconnect token staleness), **B-009** (unified presence token unverified),
 **B-010** (desktop notifications / quiet hours), **B-011** (live calls + real
 media), **B-012** (UI verified by wiring, not pixels; attachment picker stub),
-and unverified aspects **U-001…U-006**.
+and unverified aspects **U-001…U-007** (U-007: live calendar acceptance and the
+browser-only join-by-id fallback).
 
 ## How to verify by hand
 
@@ -99,8 +103,8 @@ and unverified aspects **U-001…U-006**.
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --workspace                 # default features, no device/network
-cargo test -p squads-core               # 285
-cargo test -p squads-app                # 18 (headless egui_kittest)
+cargo test -p squads-core               # 302
+cargo test -p squads-app                # 21 (headless egui_kittest)
 cargo test -p squads-protocol           # 377
 cargo fmt -p squads-core -p squads-app -- --check
 cargo clippy -p squads-core -p squads-app --all-targets
@@ -113,7 +117,8 @@ cargo build --workspace --release
 2. Sign in (device code) and confirm the shell, chat list and timeline render.
 3. Exercise the M11 shortcuts: `Ctrl/Cmd+K` (quick switcher), `Ctrl/Cmd+F`
    (in-conversation search), `Esc` (close/clear), `Ctrl/Cmd+,` (settings),
-   `Ctrl/Cmd+Shift+M` (mute placeholder), `j`/`k` (chat navigation),
+   `Ctrl/Cmd+Shift+M` (mute placeholder), `Ctrl/Cmd+1`…`5` (jump to Chats /
+   Calendar / Teams / Files / Calls), `j`/`k` (chat navigation),
    `Ctrl/Cmd+Enter` (send).
 4. In **Settings**, switch the theme to Light and pick an accent; toggle compact
    mode and the notification switches; set a download folder. Restart and confirm

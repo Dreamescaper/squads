@@ -73,6 +73,19 @@ pub use ost::api::{FileVersion, SharedFile, UploadProgress};
 /// Protocol type surfaced by the M8 Graph presence call.
 pub use ost::api::PresenceInfo;
 
+/// Protocol types surfaced by the M12 calendar calls, re-exported so the UI and
+/// `calendar` do not reach into the vendored crate. The **pure** helpers
+/// ([`parse_join_url`], [`normalize_join_meeting_id`], [`calendar_view_path`],
+/// [`calweek_view_path`], [`parse_calendar_view`], [`validate_schedule`],
+/// [`schedule_event_body`], [`parse_created_event`], [`lobby_next`]) are
+/// re-exported too, so callers can pin their shapes without a network.
+pub use ost::api::{
+    JoinIdResolve, JoinTarget, LobbyEvent, LobbyState, MeetingInfo, ResolvedJoinId,
+    calendar_view_path, calweek_view_path, lobby_next, normalize_join_meeting_id,
+    parse_calendar_view, parse_created_event, parse_join_url, schedule_event_body,
+    validate_schedule,
+};
+
 use crate::auth::tokens::{StoredToken, TokenSet};
 use crate::error::Result;
 use crate::model::SharedLink;
@@ -905,6 +918,114 @@ impl ApiClient {
             .await?;
         tracing::debug!(call, "set own presence");
         Ok(())
+    }
+
+    // ----- M12: calendar (Graph) ------------------------------------------
+
+    /// Fetch the signed-in user's upcoming meetings (Graph `calendarView` over
+    /// the next 7 days, soonest first). Each event carries its Teams join URL
+    /// when it has one.
+    pub async fn list_upcoming_meetings(&self, limit: usize) -> Result<Vec<MeetingInfo>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.list_upcoming_meetings",
+            limit,
+            call
+        );
+        let meetings = ost::api::list_upcoming_meetings_data(&self.client, limit)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = meetings.len(), call, "listed upcoming meetings");
+        Ok(meetings)
+    }
+
+    /// Fetch the meetings in the explicit window `[start_secs, start_secs+days]`
+    /// (Graph `calendarView`; `days` must be `1..=31`, checked before any
+    /// network), soonest first. Backs the calendar **week view**.
+    pub async fn list_week_meetings(
+        &self,
+        start_secs: u64,
+        days: u64,
+        limit: usize,
+    ) -> Result<Vec<MeetingInfo>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.list_week_meetings",
+            days,
+            limit,
+            call
+        );
+        let meetings = ost::api::list_week_meetings_data(&self.client, start_secs, days, limit)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = meetings.len(), call, "listed week meetings");
+        Ok(meetings)
+    }
+
+    /// Schedule a meeting (`POST /me/calendar/events`). `online` requests a
+    /// Teams meeting (`isOnlineMeeting` + `teamsForBusiness`), so Graph
+    /// provisions the join URL. Inputs are validated by the vendored call
+    /// before any network.
+    pub async fn schedule_meeting(
+        &self,
+        subject: &str,
+        start: &str,
+        end: &str,
+        time_zone: &str,
+        online: bool,
+    ) -> Result<MeetingInfo> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.schedule_meeting",
+            online,
+            call
+        );
+        let meeting =
+            ost::api::schedule_meeting_data(&self.client, subject, start, end, time_zone, online)
+                .instrument(span)
+                .await?;
+        tracing::debug!(call, "scheduled meeting");
+        Ok(meeting)
+    }
+
+    /// Cancel one meeting (`DELETE /me/calendar/events/{id}`; Graph answers
+    /// `204`, no body). A malformed id is rejected before any network.
+    pub async fn cancel_meeting(&self, event_id: &str) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.cancel_meeting", call);
+        ost::api::cancel_meeting_data(&self.client, event_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "cancelled meeting");
+        Ok(())
+    }
+
+    /// Resolve a typed numeric meeting id + passcode to its join URL via Graph
+    /// (`OnlineMeetings.Read`). A malformed id is rejected before any network.
+    pub async fn resolve_join_meeting_id(
+        &self,
+        meeting_id: &str,
+        passcode: &str,
+    ) -> Result<JoinIdResolve> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.resolve_join_meeting_id",
+            call
+        );
+        let resolved = ost::api::resolve_join_meeting_id_data(&self.client, meeting_id, passcode)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "resolved join meeting id");
+        Ok(resolved)
     }
 }
 

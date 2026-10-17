@@ -33,8 +33,9 @@
 use serde::{Deserialize, Serialize};
 
 use ost::api::{
-    ChannelInfo, ChatInfo, FileVersion as WireFileVersion, MessageInfo, ReactionCount,
-    Reactor as WireReactor, SharedFile as WireSharedFile, TeamInfo, TeamMemberInfo,
+    ChannelInfo, ChatInfo, FileVersion as WireFileVersion, MeetingInfo as WireMeetingInfo,
+    MessageInfo, ReactionCount, Reactor as WireReactor, SharedFile as WireSharedFile, TeamInfo,
+    TeamMemberInfo,
 };
 
 /// Delivery state of a message we authored (milestone **M5**).
@@ -581,6 +582,126 @@ impl CallLogEntry {
         self.duration_secs = Some(ended_at.saturating_sub(self.started_at).max(0) as u64);
         self.outcome = outcome;
         self
+    }
+}
+
+// ----- calendar (M12) -----------------------------------------------------
+
+/// One calendar meeting (milestone **M12**).
+///
+/// Owned mirror of the vendored `ost::api::MeetingInfo` (a Graph `calendarView`
+/// event), so the store and the UI never touch the wire projection. The two
+/// **wire facts** to orient on (verified against
+/// `crates/squads-protocol/src/api/calendar.rs`, not guessed):
+///
+/// 1. `start`/`end` are the Graph `dateTime` values **verbatim**
+///    (`YYYY-MM-DDTHH:MM:SS.fffffff`, no timezone suffix); the event's `timeZone`
+///    is dropped by the vendored projection. They sort lexicographically, which
+///    is what the store orders and filters on.
+/// 2. The projection carries only `id`, `subject`, `start`, `end`, `join_url`,
+///    `organizer`, `organizer_email`, `is_organizer` and `is_online`.
+///    [`all_day`](Meeting::all_day), [`join_meeting_id`](Meeting::join_meeting_id),
+///    [`passcode`](Meeting::passcode), [`web_link`](Meeting::web_link) and
+///    [`location`](Meeting::location) are modeled for forward-compatibility but
+///    are **not** populated by [`Meeting::from_info`] (they default to
+///    `false`/`None`) until the vendored `$select`/projection carries them.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Meeting {
+    /// Graph event id (the DELETE target for a cancel).
+    pub id: String,
+    /// Subject (`"(no subject)"` when the event had a blank one).
+    pub subject: String,
+    /// `start.dateTime` verbatim (`YYYY-MM-DDTHH:MM:SS.fffffff`), when set.
+    pub start: Option<String>,
+    /// `end.dateTime` verbatim, when set.
+    pub end: Option<String>,
+    /// Whether the event is an all-day event. **Not carried** by the vendored
+    /// projection today (see the type docs); always `false` from the wire.
+    pub all_day: bool,
+    /// Organizer display name, when set.
+    pub organizer: Option<String>,
+    /// Organizer SMTP address (`organizer.emailAddress.address`), when set.
+    pub organizer_email: Option<String>,
+    /// Graph `isOrganizer`: the signed-in user organizes this event.
+    pub is_organizer: bool,
+    /// Teams join URL (`onlineMeeting.joinUrl`), when the event has one.
+    pub join_url: Option<String>,
+    /// Numeric meeting id. **Not carried** by the vendored projection today
+    /// (see the type docs); always `None` from the wire.
+    pub join_meeting_id: Option<String>,
+    /// Meeting passcode. **Not carried** by the vendored projection today;
+    /// always `None` from the wire.
+    pub passcode: Option<String>,
+    /// Graph `webLink` (open-in-browser deep link). **Not carried** by the
+    /// vendored projection today (the field is selected but dropped when
+    /// mapping); always `None` from the wire.
+    pub web_link: Option<String>,
+    /// Free-form event location. **Not carried** by the vendored projection
+    /// today; always `None` from the wire.
+    pub location: Option<String>,
+    /// True when Graph flags the event as an online meeting.
+    pub is_online: bool,
+}
+
+impl Meeting {
+    /// Build a domain [`Meeting`] from a protocol `MeetingInfo`.
+    ///
+    /// The five fields the vendored projection does not carry default to
+    /// `false`/`None` (see the type docs).
+    pub fn from_info(info: &WireMeetingInfo) -> Self {
+        Meeting {
+            id: info.id.clone(),
+            subject: info.subject.clone(),
+            start: info.start.clone(),
+            end: info.end.clone(),
+            all_day: false,
+            organizer: info.organizer.clone(),
+            organizer_email: info.organizer_email.clone(),
+            is_organizer: info.is_organizer,
+            join_url: info.join_url.clone(),
+            join_meeting_id: None,
+            passcode: None,
+            web_link: None,
+            location: None,
+            is_online: info.is_online,
+        }
+    }
+
+    /// Whether the meeting can be joined by a direct call leg (its join URL
+    /// resolves to a native thread id).
+    ///
+    /// Delegates to the vendored [`ost::api::parse_join_url`], so a
+    /// `teams.microsoft.com/l/meetup-join/19:…@thread…` link is joinable while
+    /// a bare `https://` link (or no link at all) is not.
+    pub fn is_joinable(&self) -> bool {
+        self.join_url
+            .as_deref()
+            .map(|url| ost::api::parse_join_url(url).kind == "thread")
+            .unwrap_or(false)
+    }
+}
+
+impl From<&WireMeetingInfo> for Meeting {
+    fn from(info: &WireMeetingInfo) -> Self {
+        Meeting::from_info(info)
+    }
+}
+
+/// Redacting `Debug`: prints identity, subject and timing, but not the join URL
+/// or passcode (a join URL can embed a passcode — it must not land in logs).
+impl std::fmt::Debug for Meeting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Meeting")
+            .field("id", &self.id)
+            .field("subject", &self.subject)
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("all_day", &self.all_day)
+            .field("organizer", &self.organizer)
+            .field("is_organizer", &self.is_organizer)
+            .field("has_join_url", &self.join_url.is_some())
+            .field("is_online", &self.is_online)
+            .finish()
     }
 }
 
@@ -1142,5 +1263,80 @@ mod tests {
         let back: CallLogEntry =
             serde_json::from_str(&serde_json::to_string(&done).unwrap()).unwrap();
         assert_eq!(back, done);
+    }
+
+    // ----- M12: calendar meetings -------------------------------------------
+
+    fn meeting_info() -> WireMeetingInfo {
+        WireMeetingInfo {
+            id: "E1".into(),
+            subject: "Standup".into(),
+            start: Some("2026-09-24T09:00:00.0000000".into()),
+            end: Some("2026-09-24T09:15:00.0000000".into()),
+            join_url: Some(
+                "https://teams.microsoft.com/l/meetup-join/19%3ameeting_x%40thread.v2/0".into(),
+            ),
+            organizer: Some("Doe, Jane".into()),
+            organizer_email: Some("jane@contoso.com".into()),
+            is_organizer: false,
+            is_online: true,
+        }
+    }
+
+    #[test]
+    fn meeting_converts_from_protocol_info_and_defaults_uncarried_fields() {
+        let meeting = Meeting::from_info(&meeting_info());
+        assert_eq!(meeting.id, "E1");
+        assert_eq!(meeting.subject, "Standup");
+        assert_eq!(
+            meeting.start.as_deref(),
+            Some("2026-09-24T09:00:00.0000000")
+        );
+        assert_eq!(meeting.end.as_deref(), Some("2026-09-24T09:15:00.0000000"));
+        assert_eq!(meeting.organizer.as_deref(), Some("Doe, Jane"));
+        assert_eq!(meeting.organizer_email.as_deref(), Some("jane@contoso.com"));
+        assert!(!meeting.is_organizer);
+        assert!(meeting.is_online);
+        assert!(meeting.join_url.is_some());
+        // The `From` impl delegates to `from_info`.
+        assert_eq!(Meeting::from(&meeting_info()), meeting);
+        // Fields the vendored projection does not carry default honestly.
+        assert!(!meeting.all_day);
+        assert!(meeting.join_meeting_id.is_none());
+        assert!(meeting.passcode.is_none());
+        assert!(meeting.web_link.is_none());
+        assert!(meeting.location.is_none());
+    }
+
+    #[test]
+    fn meeting_is_joinable_when_the_link_names_a_thread() {
+        assert!(Meeting::from_info(&meeting_info()).is_joinable());
+
+        let mut bare = meeting_info();
+        bare.join_url = Some("https://example.com/x".into());
+        assert!(!Meeting::from_info(&bare).is_joinable());
+
+        let mut none = meeting_info();
+        none.join_url = None;
+        assert!(!Meeting::from_info(&none).is_joinable());
+    }
+
+    #[test]
+    fn meeting_debug_redacts_the_join_url() {
+        let dbg = format!("{:?}", Meeting::from_info(&meeting_info()));
+        assert!(dbg.contains("Standup"));
+        assert!(dbg.contains("has_join_url"));
+        assert!(
+            !dbg.contains("meetup-join"),
+            "the join URL must not be printed: {dbg}"
+        );
+    }
+
+    #[test]
+    fn meeting_round_trips_through_json() {
+        let meeting = Meeting::from_info(&meeting_info());
+        let back: Meeting =
+            serde_json::from_str(&serde_json::to_string(&meeting).unwrap()).unwrap();
+        assert_eq!(back, meeting);
     }
 }

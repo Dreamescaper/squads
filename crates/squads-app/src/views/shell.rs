@@ -55,6 +55,7 @@ pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
             views::chat_list::show(app, ui);
             views::conversation::show(app, ui);
         }
+        Page::Calendar => views::calendar::show(app, ui),
         Page::Teams => views::teams::show(app, ui),
         Page::Files => {
             views::chat_list::show(app, ui);

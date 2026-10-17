@@ -37,6 +37,8 @@
 //!   `messages` + `read_state`, so no new table is needed. See ADR-021.
 //! * **v6** (M9) — `call_log`, the local call-history table (Teams exposes no
 //!   call-history API through the reverse-engineered surfaces). See ADR-025.
+//! * **v7** (M12) — `meetings`, the Graph `calendarView` cache for the calendar
+//!   agenda/week views (keyed `(id, profile)`). See ADR-033.
 //!
 //! ## Who writes what
 //!
@@ -49,8 +51,10 @@
 //! service caches driveItems through [`Store::upsert_files`]. M8 derives unread
 //! counts from [`Store::unread_count`] / [`Store::unread_messages`] and persists
 //! the mute flag with [`Store::set_chat_muted`]. M9 records local call history
-//! through [`Store::upsert_call_log`] / [`Store::call_log`]. Nothing in this
-//! module talks to the network.
+//! through [`Store::upsert_call_log`] / [`Store::call_log`]. M12's calendar
+//! service caches meetings through [`Store::upsert_meetings`] and reads them
+//! with [`Store::upcoming_meetings`]. Nothing in this module talks to the
+//! network.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -62,7 +66,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::tokens::now_unix;
 use crate::error::{CoreError, Result};
 use crate::model::{
-    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, FileEntry, Message, Reaction,
+    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, FileEntry, Meeting, Message, Reaction,
     SendState, Team, TeamMember,
 };
 
@@ -75,7 +79,8 @@ use crate::model::{
 /// * **v4** (M7) — `files`, the driveItem cache for the files service.
 /// * **v5** (M8) — `chats.muted`, the local per-chat notification mute.
 /// * **v6** (M9) — `call_log`, the local call-history table.
-pub const SCHEMA_VERSION: i32 = 6;
+/// * **v7** (M12) — `meetings`, the Graph `calendarView` cache.
+pub const SCHEMA_VERSION: i32 = 7;
 
 /// Timeout for a busy database before `SQLITE_BUSY` is surfaced.
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -242,6 +247,40 @@ CREATE TABLE IF NOT EXISTS call_log (
 
 CREATE INDEX IF NOT EXISTS idx_call_log_thread
     ON call_log (profile, thread_id, started_at);
+"#;
+
+/// v7 schema: the Graph `calendarView` meeting cache (M12). Plain
+/// `CREATE TABLE/INDEX IF NOT EXISTS`, so the migration is re-entrant.
+///
+/// Keyed `(id, profile)` (the store's convention). `start`/`end` are the Graph
+/// `dateTime` strings **verbatim** (`YYYY-MM-DDTHH:MM:SS.fffffff`), so ordering
+/// and the `from_secs` filter are lexicographic text comparisons; `start_secs`
+/// is *not* stored (the wire carries no timezone). The five columns the vendored
+/// projection does not carry (`all_day`, `join_meeting_id`, `passcode`,
+/// `web_link`, `location`) exist for forward-compatibility and default empty.
+const MIGRATION_V7_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS meetings (
+    id              TEXT NOT NULL,
+    profile         TEXT NOT NULL,
+    subject         TEXT NOT NULL DEFAULT '(no subject)',
+    start           TEXT,
+    end             TEXT,
+    all_day         INTEGER NOT NULL DEFAULT 0,
+    organizer       TEXT,
+    organizer_email TEXT,
+    is_organizer    INTEGER NOT NULL DEFAULT 0,
+    join_url        TEXT,
+    join_meeting_id TEXT,
+    passcode        TEXT,
+    web_link        TEXT,
+    location        TEXT,
+    is_online       INTEGER NOT NULL DEFAULT 0,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (id, profile)
+);
+
+CREATE INDEX IF NOT EXISTS idx_meetings_start
+    ON meetings (profile, start);
 "#;
 
 /// One local account record.
@@ -1249,6 +1288,126 @@ impl Store {
         Ok(entries)
     }
 
+    // ----- calendar meetings (M12) ----------------------------------------
+
+    /// Insert or update cached meetings for `profile`, keyed `(id, profile)`.
+    ///
+    /// Idempotent: the same event id updates the row in place and `updated_at`
+    /// only advances. Every carried field is overwritten (a re-fetch of the same
+    /// event is authoritative); the five uncarried columns round-trip whatever
+    /// was stored. Returns the number of meetings written.
+    pub fn upsert_meetings(&self, profile: &str, meetings: &[Meeting]) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now_unix() as i64;
+        let mut written = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO meetings
+                    (id, profile, subject, start, end, all_day, organizer,
+                     organizer_email, is_organizer, join_url, join_meeting_id,
+                     passcode, web_link, location, is_online, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 ON CONFLICT(id, profile) DO UPDATE SET
+                    subject = excluded.subject,
+                    start = excluded.start,
+                    end = excluded.end,
+                    all_day = excluded.all_day,
+                    organizer = excluded.organizer,
+                    organizer_email = excluded.organizer_email,
+                    is_organizer = excluded.is_organizer,
+                    join_url = excluded.join_url,
+                    join_meeting_id = excluded.join_meeting_id,
+                    passcode = excluded.passcode,
+                    web_link = excluded.web_link,
+                    location = excluded.location,
+                    is_online = excluded.is_online,
+                    updated_at = MAX(meetings.updated_at, excluded.updated_at)",
+            )?;
+            for meeting in meetings {
+                stmt.execute(params![
+                    meeting.id,
+                    profile,
+                    meeting.subject,
+                    meeting.start,
+                    meeting.end,
+                    meeting.all_day as i64,
+                    meeting.organizer,
+                    meeting.organizer_email,
+                    meeting.is_organizer as i64,
+                    meeting.join_url,
+                    meeting.join_meeting_id,
+                    meeting.passcode,
+                    meeting.web_link,
+                    meeting.location,
+                    meeting.is_online as i64,
+                    now
+                ])?;
+                written += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// The cached meetings for `profile` starting at or after `from_secs`,
+    /// soonest first, at most `limit`.
+    ///
+    /// `from_secs` is rendered to a UTC ISO-8601 string and compared as text
+    /// against the stored Graph `start` value (the wire carries no timezone; see
+    /// the v7 note). Meetings with no `start` are not "upcoming" and are
+    /// excluded. Pass `0` to list every cached meeting that has a start.
+    pub fn upcoming_meetings(
+        &self,
+        profile: &str,
+        from_secs: i64,
+        limit: usize,
+    ) -> Result<Vec<Meeting>> {
+        let from = iso8601_from_unix(from_secs);
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, subject, start, end, all_day, organizer, organizer_email,
+                    is_organizer, join_url, join_meeting_id, passcode, web_link,
+                    location, is_online
+             FROM meetings
+             WHERE profile = ?1 AND start IS NOT NULL AND start >= ?2
+             ORDER BY start ASC, id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![profile, from, limit as i64], row_to_meeting)?;
+        let mut meetings = Vec::new();
+        for meeting in rows {
+            meetings.push(meeting?);
+        }
+        Ok(meetings)
+    }
+
+    /// Fetch one cached meeting by id within `profile`, or `None`.
+    pub fn meeting(&self, id: &str, profile: &str) -> Result<Option<Meeting>> {
+        let conn = self.lock();
+        let meeting = conn
+            .query_row(
+                "SELECT id, subject, start, end, all_day, organizer, organizer_email,
+                        is_organizer, join_url, join_meeting_id, passcode, web_link,
+                        location, is_online
+                 FROM meetings WHERE id = ?1 AND profile = ?2",
+                params![id, profile],
+                row_to_meeting,
+            )
+            .optional()?;
+        Ok(meeting)
+    }
+
+    /// Delete one cached meeting (M12 `cancel`). Returns whether a row existed.
+    pub fn delete_meeting(&self, profile: &str, id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let removed = conn.execute(
+            "DELETE FROM meetings WHERE id = ?1 AND profile = ?2",
+            params![id, profile],
+        )?;
+        Ok(removed > 0)
+    }
+
     /// Shared message query: rows come back newest-first; reverse for display.
     fn messages_query(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Message>> {
         let conn = self.lock();
@@ -1323,6 +1482,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if current < 6 {
         migrate_v6(&tx)?;
     }
+    if current < 7 {
+        migrate_v7(&tx)?;
+    }
     // Record the version *after* the DDL inside the same transaction, so a
     // crash can never leave a version marker ahead of the schema.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1381,6 +1543,15 @@ fn migrate_v5(tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// re-entrant even if the version marker was reset.
 fn migrate_v6(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(MIGRATION_V6_TABLES)?;
+    Ok(())
+}
+
+/// Apply the v7 additions: the `meetings` calendar cache (M12).
+///
+/// Every statement is `CREATE TABLE/INDEX IF NOT EXISTS`, so the migration is
+/// re-entrant even if the version marker was reset.
+fn migrate_v7(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(MIGRATION_V7_TABLES)?;
     Ok(())
 }
 
@@ -1489,6 +1660,57 @@ fn row_to_call_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallLogEntry> {
         participants: participants_from_json(&participants_json),
         outcome: CallOutcome::from_db(&row.get::<_, String>(7)?),
     })
+}
+
+fn row_to_meeting(row: &rusqlite::Row<'_>) -> rusqlite::Result<Meeting> {
+    Ok(Meeting {
+        id: row.get(0)?,
+        subject: row.get(1)?,
+        start: row.get(2)?,
+        end: row.get(3)?,
+        all_day: row.get::<_, i64>(4)? != 0,
+        organizer: row.get(5)?,
+        organizer_email: row.get(6)?,
+        is_organizer: row.get::<_, i64>(7)? != 0,
+        join_url: row.get(8)?,
+        join_meeting_id: row.get(9)?,
+        passcode: row.get(10)?,
+        web_link: row.get(11)?,
+        location: row.get(12)?,
+        is_online: row.get::<_, i64>(13)? != 0,
+    })
+}
+
+/// Unix seconds → `YYYY-MM-DDTHH:MM:SSZ` (UTC, std only).
+///
+/// Used to turn [`Store::upcoming_meetings`]'s `from_secs` into the same
+/// lexicographic space as the stored Graph `start` strings.
+fn iso8601_from_unix(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days + 719_468);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Days since 0000-03-01 → (year, month, day). Hinnant's algorithm.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Serialize reactions for storage; the only fallible part of a message write.
@@ -2673,5 +2895,166 @@ mod tests {
         );
         assert!(store.call_log_entry("work", "old").unwrap().is_none());
         assert!(store.call_log_entry("work", "other").unwrap().is_some());
+    }
+
+    // ----- M12: calendar meetings -------------------------------------------
+
+    fn meeting(id: &str, subject: &str, start: Option<&str>) -> Meeting {
+        Meeting {
+            id: id.into(),
+            subject: subject.into(),
+            start: start.map(str::to_string),
+            end: None,
+            all_day: false,
+            organizer: Some("Doe, Jane".into()),
+            organizer_email: Some("jane@contoso.com".into()),
+            is_organizer: false,
+            join_url: Some(format!(
+                "https://teams.microsoft.com/l/meetup-join/19%3ameeting_{id}%40thread.v2/0"
+            )),
+            join_meeting_id: None,
+            passcode: None,
+            web_link: None,
+            location: None,
+            is_online: true,
+        }
+    }
+
+    #[test]
+    fn v6_database_upgrades_to_v7_adding_the_meetings_table() {
+        let path = temp_path("v6-to-v7");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            // Build a genuine v6 database: v1 DDL, v2 column + read_state, v3
+            // tables, v4 files, v5 mute column, v6 call_log, version marker 6.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN send_state TEXT NOT NULL DEFAULT 'sent';",
+            )
+            .unwrap();
+            conn.execute_batch(MIGRATION_V2_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V3_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V4_TABLES).unwrap();
+            conn.execute_batch("ALTER TABLE chats ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;")
+                .unwrap();
+            conn.execute_batch(MIGRATION_V6_TABLES).unwrap();
+            conn.pragma_update(None, "user_version", 6).unwrap();
+        }
+
+        let store = Store::open(&path).expect("open the v6 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        // The table exists and round-trips a row written after the upgrade.
+        assert!(
+            store
+                .upcoming_meetings("default", 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .upsert_meetings(
+                "default",
+                &[meeting(
+                    "E1",
+                    "Standup",
+                    Some("2026-09-24T09:00:00.0000000"),
+                )],
+            )
+            .unwrap();
+        assert_eq!(store.upcoming_meetings("default", 0, 10).unwrap().len(), 1);
+
+        // Reopening again is a clean no-op and the row survives.
+        drop(store);
+        let store = Store::open(&path).expect("reopen v7 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.upcoming_meetings("default", 0, 10).unwrap().len(), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn meetings_round_trip_order_by_start_and_are_profile_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(
+            store
+                .upcoming_meetings("default", 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .upsert_meetings(
+                "default",
+                &[
+                    meeting("late", "Demo", Some("2026-10-02T14:00:00.0000000")),
+                    meeting("early", "Standup", Some("2026-09-24T09:00:00.0000000")),
+                    meeting("mid", "Sync", Some("2026-09-29T10:00:00.0000000")),
+                    meeting("none", "No date", None),
+                ],
+            )
+            .unwrap();
+
+        // Soonest first; a meeting with no start is not "upcoming".
+        let all = store.upcoming_meetings("default", 0, 10).unwrap();
+        assert_eq!(
+            all.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["early", "mid", "late"]
+        );
+        assert_eq!(all[0].subject, "Standup");
+        assert!(all[0].is_online);
+        assert_eq!(all[0].organizer.as_deref(), Some("Doe, Jane"));
+        assert!(all[0].join_url.is_some());
+
+        // The `from_secs` filter (2026-09-29T00:00:00Z = 1790553600).
+        let from = store
+            .upcoming_meetings("default", 1_790_553_600, 10)
+            .unwrap();
+        assert_eq!(
+            from.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["mid", "late"]
+        );
+        // `limit` is honoured.
+        assert_eq!(store.upcoming_meetings("default", 0, 1).unwrap().len(), 1);
+
+        // `meeting()` fetches one; profile isolation.
+        assert_eq!(
+            store.meeting("mid", "default").unwrap().unwrap().subject,
+            "Sync"
+        );
+        assert!(store.meeting("mid", "work").unwrap().is_none());
+        assert!(store.upcoming_meetings("work", 0, 10).unwrap().is_empty());
+
+        // Idempotent re-upsert: same row, updated subject.
+        store
+            .upsert_meetings(
+                "default",
+                &[meeting(
+                    "mid",
+                    "Sync renamed",
+                    Some("2026-09-29T10:00:00.0000000"),
+                )],
+            )
+            .unwrap();
+        assert_eq!(store.upcoming_meetings("default", 0, 10).unwrap().len(), 3);
+        assert_eq!(
+            store.meeting("mid", "default").unwrap().unwrap().subject,
+            "Sync renamed"
+        );
+
+        // Delete drops only the named row.
+        assert!(store.delete_meeting("default", "mid").unwrap());
+        assert!(store.meeting("mid", "default").unwrap().is_none());
+        assert!(!store.delete_meeting("default", "mid").unwrap());
+        // A wrong-profile delete reports a miss.
+        assert!(!store.delete_meeting("work", "early").unwrap());
+        assert_eq!(store.upcoming_meetings("default", 0, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn iso8601_from_unix_matches_the_wire_ordering_space() {
+        assert_eq!(iso8601_from_unix(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601_from_unix(1_790_553_600), "2026-09-28T00:00:00Z");
+        // The Graph `start` text (no timezone, fractional seconds) still sorts
+        // after an earlier UTC boundary.
+        assert!("2026-09-28T09:00:00.0000000" >= iso8601_from_unix(1_790_553_600).as_str());
     }
 }

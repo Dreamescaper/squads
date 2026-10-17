@@ -1286,3 +1286,80 @@ job downloads every artifact and publishes a GitHub Release.
   on Linux; Windows/macOS need none for the default feature set.
 - Releases are driven by tags (`git tag v0.1.0 && git push origin v0.1.0`); the
   version is taken from the tag, falling back to `[workspace.package].version`.
+
+---
+
+## ADR-033 — Calendar service, a schema-v7 `meetings` cache, and the join hand-off to calls
+
+**Status:** accepted (M12)
+
+**Context.** M12 adds a calendar tab. Teams exposes the signed-in user's
+meetings through Graph `calendarView` (the vendored `calendar.rs`/`calweek.rs`
+lanes), and a meeting is joined by dialing its native thread id (the existing
+`CallService` path). Three things had to be decided: how the wire projection is
+modeled, where meetings are cached, and how a join string becomes a call.
+
+The vendored `MeetingInfo` projection carries only `id`, `subject`, `start`,
+`end`, `join_url`, `organizer`, `organizer_email`, `is_organizer` and
+`is_online`; `start`/`end` are Graph `dateTime` strings **verbatim**
+(`YYYY-MM-DDTHH:MM:SS.fffffff`, no timezone — the projection drops `timeZone`).
+The brief asked for `all_day`, `join_meeting_id`, `passcode`, `web_link` and
+`location` too, but the projection does not expose them and the protocol crate
+is off-limits.
+
+**Decision.**
+
+1. **Model.** `model::Meeting` is the owned, protocol-independent mirror of
+   `MeetingInfo` (`Meeting::from_info` / `From<&MeetingInfo>`). The five fields
+   the projection does not carry are **modeled for forward-compatibility** and
+   default `false`/`None` from the wire; the type docs state this explicitly
+   rather than guessing values. `start`/`end` stay the wire strings (so the
+   store orders and filters them lexicographically); `Meeting::Debug` is
+   redacting (a join URL can embed a passcode).
+2. **Store.** A **schema v7** `meetings` table keyed `(id, profile)` (the store's
+   convention), with idempotent `upsert_meetings`, `upcoming_meetings(profile,
+   from_secs, limit)` (start-ordered; the `from_secs` boundary is rendered to
+   ISO-8601 and compared as text against the wire `start`), `meeting(id,
+   profile)` and `delete_meeting`. `SCHEMA_VERSION = 7`; the v6→v7 migration is
+   `CREATE TABLE/INDEX IF NOT EXISTS` (re-entrant) and a newer `user_version`
+   remains a hard error. No numeric `start_secs` is stored (the wire carries no
+   timezone, so a UTC epoch would be a lie).
+3. **Service.** `calendar::Calendar { profile, Arc<Store>, Arc<ApiClient> }`
+   mirrors `Teams`/`Files`: `cached_upcoming` (local-only), `upcoming`
+   (fetch + upsert + return the cached upcoming set), `week(start_secs, days,
+   limit)` (fetch + cache), `schedule` (validate first), `cancel` (DELETE +
+   drop the cache), and `resolve_join`. Every Graph call is a thin, instrumented
+   wrapper on `ApiClient`.
+4. **Join hand-off.** `resolve_join(target_or_url, passcode)` classifies a
+   pasted string with the vendored pure `parse_join_url`: a native thread id
+   (`meetup-join/19:…@thread…` or a bare thread id) → kind `thread`; another
+   `https` link → `url`; anything else → `unknown`. A **numeric** meeting id is
+   attempted through Graph and, because the Teams first-party token is not
+   granted `OnlineMeetings.Read` (the vendored `graph_get` refuses
+   `/me/onlineMeetings` via `graph_denied` before any request), falls back to
+   the browser `/meet/<id>?p=` link (kind `meeting-id`). The UI hands a `thread`
+   target to `CallService::place` (the existing call path) and shows every other
+   target.
+5. **Lobby.** `lobby_step` / the `Lobby` holder wrap the vendored pure
+   `lobby_next` state machine (`idle → joining → lobby → admitted`, `failed`
+   reachable, `reset` from anywhere); no network, no clock.
+
+**Consequences.**
+
+- The calendar tab reads entirely from the store; `upcoming`/`week` are the only
+  network paths and they write-through in one pass.
+- Every request shape is pinned **offline** against a local TCP stub (the
+  `calendarView` path/params, the `POST`/`DELETE` bodies, the join
+  classification) — the strongest verification this credential-free environment
+  allows.
+- **Join-by-id is unusable with the Teams sign-in** (`OnlineMeetings.Read` is
+  not granted); the numeric path always returns the browser fallback. Recorded
+  as U-007; if a suitably-scoped token ever appears, only the fallback branch
+  changes.
+- The lobby machine is pure and tested, but **no realtime producer drives it**
+  (call frames are filtered out of the M4 bus, B-008); the UI feeds it from the
+  call-signalling callbacks once that exists.
+- No encryption change: meeting subjects/organizer names join chat content in
+  the plaintext store (B-007).
+- Adding a calendar field later (e.g. a real `all_day` once the projection
+  carries it) is a model + v7 column + `from_info` change, no caller impact.

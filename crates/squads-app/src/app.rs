@@ -26,11 +26,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use squads_core::model::{Channel, Message, SendState};
+use squads_core::api::JoinTarget;
+use squads_core::model::{Channel, Meeting, Message, SendState};
 use squads_core::{
-    Accent, AppDirs, CallIdentity, CallLogEntry, CallService, CallState, Chat, ContactPresence,
-    FileEntry, Files, IncomingCall, Messaging, NotificationContext, RealtimeEvent, Session,
-    Settings, SignInProgress, Store, Team, Teams, Theme,
+    Accent, AppDirs, Calendar, CallIdentity, CallLogEntry, CallService, CallState, Chat,
+    ContactPresence, FileEntry, Files, IncomingCall, Messaging, NotificationContext, RealtimeEvent,
+    Session, Settings, SignInProgress, Store, Team, Teams, Theme,
 };
 
 use crate::runtime::{AppEvent, AppRuntime};
@@ -49,6 +50,8 @@ pub enum Page {
     /// Chats: chat list + conversation.
     #[default]
     Chats,
+    /// Calendar: upcoming meetings, week view and scheduling.
+    Calendar,
     /// Teams & channels browser.
     Teams,
     /// Files for the selected chat/channel.
@@ -64,6 +67,7 @@ impl Page {
     pub fn label(self) -> &'static str {
         match self {
             Page::Chats => "Chats",
+            Page::Calendar => "Calendar",
             Page::Teams => "Teams",
             Page::Files => "Files",
             Page::Calls => "Calls",
@@ -71,15 +75,30 @@ impl Page {
         }
     }
 
-    /// Every page, in nav-rail order.
-    pub fn all() -> [Page; 5] {
+    /// Every page, in nav-rail order (also the `Ctrl/Cmd+1`…`5` slot order;
+    /// Settings has its own `Ctrl/Cmd+,`).
+    pub fn all() -> [Page; 6] {
         [
             Page::Chats,
+            Page::Calendar,
             Page::Teams,
             Page::Files,
             Page::Calls,
             Page::Settings,
         ]
+    }
+
+    /// The page a numbered shortcut slot selects (`Ctrl/Cmd+1`…`5`), or `None`
+    /// for an unbound slot.
+    pub fn from_slot(slot: u8) -> Option<Page> {
+        match slot {
+            1 => Some(Page::Chats),
+            2 => Some(Page::Calendar),
+            3 => Some(Page::Teams),
+            4 => Some(Page::Files),
+            5 => Some(Page::Calls),
+            _ => None,
+        }
     }
 }
 
@@ -132,6 +151,33 @@ pub enum Action {
     ToggleTeam(String),
     /// Refresh the files for a conversation.
     RefreshFiles(String),
+    /// Refresh the upcoming meetings from the calendar service (M12).
+    RefreshCalendar,
+    /// Refresh the calendar **week** view (M12): the next 7 days.
+    RefreshCalendarWeek,
+    /// Join a meeting from a pasted URL or a typed numeric meeting id (M12).
+    JoinMeeting {
+        /// The join URL or bare meeting id.
+        target: String,
+        /// Optional passcode.
+        passcode: String,
+    },
+    /// Schedule a new meeting (M12).
+    ScheduleMeeting {
+        /// Meeting subject.
+        subject: String,
+        /// Graph start datetime (`YYYY-MM-DDTHH:MM:SS`).
+        start: String,
+        /// Graph end datetime.
+        end: String,
+        /// IANA/Windows timezone name.
+        time_zone: String,
+    },
+    /// Cancel one meeting by its Graph event id (M12).
+    CancelMeeting {
+        /// Graph event id.
+        event_id: String,
+    },
     /// Download a cached file to the local media directory.
     DownloadFile {
         /// Owning conversation.
@@ -228,6 +274,7 @@ pub struct SquadsApp {
     teams_svc: Option<Arc<Teams>>,
     files_svc: Option<Arc<Files>>,
     calls_svc: Option<Arc<CallService>>,
+    calendar_svc: Option<Arc<Calendar>>,
 
     // Session / login
     signed_in: bool,
@@ -269,6 +316,21 @@ pub struct SquadsApp {
 
     files: Vec<FileEntry>,
 
+    /// Calendar (M12): the cached upcoming meetings, whether a fetch is in
+    /// flight, the last resolved join target, the agenda/week toggle, and the
+    /// "new meeting" form fields.
+    meetings: Vec<Meeting>,
+    calendar_loading: bool,
+    join_target: Option<JoinTarget>,
+    calendar_week: bool,
+    new_meeting_subject: String,
+    new_meeting_start: String,
+    new_meeting_end: String,
+    new_meeting_timezone: String,
+    /// Free-form "join by link or meeting id" inputs.
+    join_input: String,
+    join_passcode: String,
+
     call_state: CallState,
     call_log: Vec<CallLogEntry>,
     incoming: Option<IncomingCall>,
@@ -309,6 +371,7 @@ impl SquadsApp {
         // Paint the cached (offline) state immediately.
         app.reload_chats_from_store();
         app.reload_call_log_from_store();
+        app.reload_meetings_from_store();
 
         if app.session.tokens().is_some() {
             app.session.mark_ready();
@@ -331,6 +394,7 @@ impl SquadsApp {
         let mut app = Self::build(ctx, dirs, session, settings)?;
         app.reload_chats_from_store();
         app.reload_call_log_from_store();
+        app.reload_meetings_from_store();
         app.signed_in = app.session.state().is_ready();
         Ok(app)
     }
@@ -360,6 +424,7 @@ impl SquadsApp {
             teams_svc: None,
             files_svc: None,
             calls_svc: None,
+            calendar_svc: None,
             signed_in: false,
             signing_in: false,
             login: LoginView::default(),
@@ -385,6 +450,16 @@ impl SquadsApp {
             expanded_teams: HashSet::new(),
             channels: HashMap::new(),
             files: Vec::new(),
+            meetings: Vec::new(),
+            calendar_loading: false,
+            join_target: None,
+            calendar_week: false,
+            new_meeting_subject: String::new(),
+            new_meeting_start: String::new(),
+            new_meeting_end: String::new(),
+            new_meeting_timezone: "UTC".to_string(),
+            join_input: String::new(),
+            join_passcode: String::new(),
             call_state: CallState::Idle,
             call_log: Vec::new(),
             incoming: None,
@@ -451,6 +526,86 @@ impl SquadsApp {
     /// The files for the selected conversation.
     pub fn files(&self) -> &[FileEntry] {
         &self.files
+    }
+
+    /// The upcoming meetings (cached + fetched), soonest first.
+    pub fn meetings(&self) -> &[Meeting] {
+        &self.meetings
+    }
+
+    /// Whether a calendar fetch is in flight (drives the loading state).
+    pub fn calendar_loading(&self) -> bool {
+        self.calendar_loading
+    }
+
+    /// The last resolved join target, if any (shown when it cannot be dialled).
+    pub fn join_target(&self) -> Option<&JoinTarget> {
+        self.join_target.as_ref()
+    }
+
+    /// Whether the calendar is showing the week view (else the agenda).
+    pub fn calendar_week(&self) -> bool {
+        self.calendar_week
+    }
+
+    /// The "new meeting" form's subject field.
+    pub fn new_meeting_subject(&self) -> &str {
+        &self.new_meeting_subject
+    }
+
+    /// The "new meeting" form's start field.
+    pub fn new_meeting_start(&self) -> &str {
+        &self.new_meeting_start
+    }
+
+    /// The "new meeting" form's end field.
+    pub fn new_meeting_end(&self) -> &str {
+        &self.new_meeting_end
+    }
+
+    /// The "new meeting" form's timezone field.
+    pub fn new_meeting_timezone(&self) -> &str {
+        &self.new_meeting_timezone
+    }
+
+    /// Mutable subject field (the form edits it directly).
+    pub fn new_meeting_subject_mut(&mut self) -> &mut String {
+        &mut self.new_meeting_subject
+    }
+
+    /// Mutable start field.
+    pub fn new_meeting_start_mut(&mut self) -> &mut String {
+        &mut self.new_meeting_start
+    }
+
+    /// Mutable end field.
+    pub fn new_meeting_end_mut(&mut self) -> &mut String {
+        &mut self.new_meeting_end
+    }
+
+    /// Mutable timezone field.
+    pub fn new_meeting_timezone_mut(&mut self) -> &mut String {
+        &mut self.new_meeting_timezone
+    }
+
+    /// The free-form "join by link or meeting id" input.
+    pub fn join_input(&self) -> &str {
+        &self.join_input
+    }
+
+    /// The free-form join passcode input.
+    pub fn join_passcode(&self) -> &str {
+        &self.join_passcode
+    }
+
+    /// Mutable join input.
+    pub fn join_input_mut(&mut self) -> &mut String {
+        &mut self.join_input
+    }
+
+    /// Mutable join passcode input.
+    pub fn join_passcode_mut(&mut self) -> &mut String {
+        &mut self.join_passcode
     }
 
     /// The call state machine's current state.
@@ -720,6 +875,11 @@ impl SquadsApp {
             Shortcut::NextChat => self.push_action(Action::NextChat),
             Shortcut::PrevChat => self.push_action(Action::PrevChat),
             Shortcut::Send => self.push_action(Action::SendDraft),
+            Shortcut::PageSlot(slot) => {
+                if let Some(page) = Page::from_slot(slot) {
+                    self.push_action(Action::SetPage(page));
+                }
+            }
         }
     }
 
@@ -822,6 +982,12 @@ impl SquadsApp {
                 Err(e) => self.push_error(e),
             }
         }
+        if self.calendar_svc.is_none() {
+            match self.session.calendar() {
+                Ok(service) => self.calendar_svc = Some(Arc::new(service)),
+                Err(e) => self.push_error(e),
+            }
+        }
     }
 
     fn on_signed_in(&mut self) {
@@ -831,6 +997,7 @@ impl SquadsApp {
         self.ensure_services();
         self.reload_chats_from_store();
         self.reload_call_log_from_store();
+        self.reload_meetings_from_store();
         self.refresh_chats();
         self.start_realtime();
     }
@@ -909,6 +1076,14 @@ impl SquadsApp {
     fn reload_call_log_from_store(&mut self) {
         match self.store.call_log(&self.profile, 50) {
             Ok(entries) => self.call_log = entries,
+            Err(e) => self.push_error(e),
+        }
+    }
+
+    /// Paint the calendar from the store's cached meetings (offline).
+    fn reload_meetings_from_store(&mut self) {
+        match self.store.upcoming_meetings(&self.profile, 0, 100) {
+            Ok(meetings) => self.meetings = meetings,
             Err(e) => self.push_error(e),
         }
     }
@@ -1074,6 +1249,82 @@ impl SquadsApp {
         });
     }
 
+    /// Refresh the upcoming meetings: paint the cache, then fetch (M12).
+    fn refresh_calendar(&mut self) {
+        self.calendar_week = false;
+        self.reload_meetings_from_store();
+        let Some(calendar) = self.calendar_svc.clone() else {
+            return;
+        };
+        self.calendar_loading = true;
+        self.runtime.spawn(async move {
+            match calendar.upcoming(50).await {
+                Ok(meetings) => AppEvent::MeetingsLoaded(meetings),
+                Err(e) => AppEvent::Error(format!("calendar: {e}")),
+            }
+        });
+    }
+
+    /// Refresh the calendar week view (the next 7 days from now) (M12).
+    fn refresh_calendar_week(&mut self) {
+        self.calendar_week = true;
+        let Some(calendar) = self.calendar_svc.clone() else {
+            return;
+        };
+        self.calendar_loading = true;
+        let start = squads_core::auth::tokens::now_unix();
+        self.runtime.spawn(async move {
+            match calendar.week(start, 7, 100).await {
+                Ok(meetings) => AppEvent::MeetingsLoaded(meetings),
+                Err(e) => AppEvent::Error(format!("calendar week: {e}")),
+            }
+        });
+    }
+
+    /// Resolve a pasted join string or typed meeting id (M12). The result is
+    /// applied as [`AppEvent::JoinResolved`], which hands a `thread` target to
+    /// the call path and shows every other target.
+    fn join_meeting(&mut self, target: String, passcode: String) {
+        let Some(calendar) = self.calendar_svc.clone() else {
+            self.push_error("joining a meeting requires sign-in");
+            return;
+        };
+        self.runtime.spawn(async move {
+            match calendar.resolve_join(&target, &passcode).await {
+                Ok(resolved) => AppEvent::JoinResolved(resolved),
+                Err(e) => AppEvent::Error(format!("join: {e}")),
+            }
+        });
+    }
+
+    /// Schedule a new meeting (M12).
+    fn schedule_meeting(&mut self, subject: String, start: String, end: String, time_zone: String) {
+        let Some(calendar) = self.calendar_svc.clone() else {
+            self.push_error("scheduling a meeting requires sign-in");
+            return;
+        };
+        self.runtime.spawn(async move {
+            match calendar.schedule(&subject, &start, &end, &time_zone).await {
+                Ok(meeting) => AppEvent::MeetingScheduled(meeting),
+                Err(e) => AppEvent::Error(format!("schedule: {e}")),
+            }
+        });
+    }
+
+    /// Cancel one meeting (M12).
+    fn cancel_meeting(&mut self, event_id: String) {
+        let Some(calendar) = self.calendar_svc.clone() else {
+            self.push_error("cancelling a meeting requires sign-in");
+            return;
+        };
+        self.runtime.spawn(async move {
+            match calendar.cancel(&event_id).await {
+                Ok(()) => AppEvent::MeetingCancelled(event_id),
+                Err(e) => AppEvent::Error(format!("cancel: {e}")),
+            }
+        });
+    }
+
     fn place_call(&mut self, thread_id: String, callee: Option<String>, video: bool) {
         let Some(calls) = self.calls_svc.clone() else {
             self.push_error("calling requires sign-in");
@@ -1193,6 +1444,47 @@ impl SquadsApp {
                 if self.selected_chat.as_deref() == Some(chat_id.as_str()) {
                     self.files = files;
                 }
+            }
+            AppEvent::MeetingsLoaded(meetings) => {
+                if let Err(e) = self.store.upsert_meetings(&self.profile, &meetings) {
+                    self.push_error(e);
+                }
+                self.calendar_loading = false;
+                self.reload_meetings_from_store();
+            }
+            AppEvent::JoinResolved(target) => {
+                let thread_id = target.thread_id.clone();
+                let is_thread = target.kind == "thread";
+                let url = target.url.clone();
+                self.join_target = Some(target);
+                if is_thread {
+                    if let Some(thread_id) = thread_id {
+                        // A native thread target dials through the existing call
+                        // path (ADR-033).
+                        self.place_call(thread_id, None, false);
+                    }
+                } else {
+                    // Anything else cannot start a call: surface the resolved
+                    // target for the user to open.
+                    self.toasts.push(Toast {
+                        text: format!("Join target: {url}"),
+                        error: false,
+                    });
+                }
+            }
+            AppEvent::MeetingScheduled(meeting) => {
+                self.reload_meetings_from_store();
+                self.toasts.push(Toast {
+                    text: format!("Scheduled \"{}\"", meeting.subject),
+                    error: false,
+                });
+            }
+            AppEvent::MeetingCancelled(event_id) => {
+                self.reload_meetings_from_store();
+                self.toasts.push(Toast {
+                    text: format!("Cancelled meeting {event_id}"),
+                    error: false,
+                });
             }
             AppEvent::PresenceUpdated(list) => {
                 for presence in list {
@@ -1331,6 +1623,7 @@ impl SquadsApp {
             Action::SetPage(page) => {
                 self.page = page;
                 match page {
+                    Page::Calendar => self.refresh_calendar(),
                     Page::Teams => self.refresh_teams(),
                     Page::Files => {
                         if let Some(chat_id) = self.selected_chat.clone() {
@@ -1368,6 +1661,16 @@ impl SquadsApp {
             Action::RefreshTeams => self.refresh_teams(),
             Action::ToggleTeam(team_id) => self.toggle_team(team_id),
             Action::RefreshFiles(chat_id) => self.refresh_files(chat_id),
+            Action::RefreshCalendar => self.refresh_calendar(),
+            Action::RefreshCalendarWeek => self.refresh_calendar_week(),
+            Action::JoinMeeting { target, passcode } => self.join_meeting(target, passcode),
+            Action::ScheduleMeeting {
+                subject,
+                start,
+                end,
+                time_zone,
+            } => self.schedule_meeting(subject, start, end, time_zone),
+            Action::CancelMeeting { event_id } => self.cancel_meeting(event_id),
             Action::DownloadFile { chat_id, file_id } => self.download_file(chat_id, file_id),
             Action::PlaceCall {
                 thread_id,
@@ -1486,6 +1789,7 @@ impl SquadsApp {
         self.teams_svc = None;
         self.files_svc = None;
         self.calls_svc = None;
+        self.calendar_svc = None;
         self.realtime_started = false;
         self.chats.clear();
         self.timeline.clear();
@@ -1496,6 +1800,12 @@ impl SquadsApp {
         self.expanded_teams.clear();
         self.channels.clear();
         self.files.clear();
+        self.meetings.clear();
+        self.calendar_loading = false;
+        self.join_target = None;
+        self.calendar_week = false;
+        self.join_input.clear();
+        self.join_passcode.clear();
         self.call_state = CallState::Idle;
         self.incoming = None;
         self.page = Page::Chats;

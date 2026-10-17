@@ -15,7 +15,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 use squads_core::auth::MemoryTokenStore;
-use squads_core::model::{Channel, FileEntry, Message, SendState};
+use squads_core::model::{Channel, FileEntry, Meeting, Message, SendState};
 use squads_core::{AppDirs, Chat, Session, SessionState, Settings, Store, Team};
 
 use crate::app::{Action, Page, SquadsApp};
@@ -241,6 +241,7 @@ fn switching_sections_updates_the_page() {
     assert_eq!(harness.state().page(), Page::Chats);
 
     for page in [
+        Page::Calendar,
         Page::Teams,
         Page::Files,
         Page::Calls,
@@ -421,5 +422,106 @@ fn settings_screen_edits_preferences() {
     assert!(
         harness.state().compact_mode(),
         "clicking Compact mode should enable it"
+    );
+}
+
+fn meeting(id: &str, subject: &str, start: &str) -> Meeting {
+    Meeting {
+        id: id.into(),
+        subject: subject.into(),
+        start: Some(start.into()),
+        end: None,
+        all_day: false,
+        organizer: Some("Doe, Jane".into()),
+        organizer_email: None,
+        is_organizer: false,
+        join_url: Some(
+            "https://teams.microsoft.com/l/meetup-join/19%3ameeting_x%40thread.v2/0".into(),
+        ),
+        join_meeting_id: None,
+        passcode: None,
+        web_link: None,
+        location: None,
+        is_online: true,
+    }
+}
+
+#[test]
+fn calendar_page_renders_seeded_meetings_and_join_queues_an_action() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_meetings(
+                "default",
+                &[meeting("E1", "Standup", "2999-09-24T09:00:00.0000000")],
+            )
+            .expect("meetings");
+    });
+    harness.run();
+
+    // Nav to the Calendar page (the central heading is "Meetings", so the nav
+    // label is unambiguous).
+    harness.get_by_label("Calendar").click();
+    harness.run();
+    assert_eq!(harness.state().page(), Page::Calendar);
+
+    // The seeded meeting renders with its subject and organizer.
+    harness.get_by_label("Standup");
+    harness.get_by_label("Doe, Jane");
+
+    // A Join button per meeting resolves the target; here it queues the action.
+    harness.get_by_label("Join").click();
+    harness.run();
+    let joined = harness
+        .state()
+        .applied_actions()
+        .iter()
+        .any(|action| matches!(action, Action::JoinMeeting { target, .. } if target.contains("meetup-join")));
+    assert!(
+        joined,
+        "expected a JoinMeeting action; got {:?}",
+        harness.state().applied_actions()
+    );
+
+    // Cancelling queues a CancelMeeting for the event id.
+    harness.get_by_label("Cancel").click();
+    harness.run();
+    let cancelled = harness
+        .state()
+        .applied_actions()
+        .iter()
+        .any(|action| matches!(action, Action::CancelMeeting { event_id } if event_id == "E1"));
+    assert!(
+        cancelled,
+        "expected a CancelMeeting action; got {:?}",
+        harness.state().applied_actions()
+    );
+}
+
+#[test]
+fn calendar_page_join_by_link_queues_a_join_action() {
+    let (mut harness, _store) = app_harness(|_| {});
+    harness.run();
+    harness.get_by_label("Calendar").click();
+    harness.run();
+
+    // Type a link into the free-form join box and press Join meeting.
+    harness.get_by_label("Join by link or ID").click();
+    harness.run();
+    harness
+        .get_by_label("Join by link or ID")
+        .type_text("https://teams.microsoft.com/l/meetup-join/19%3ameeting_y%40thread.v2/0");
+    harness.run();
+    harness.get_by_label("Join meeting").click();
+    harness.run();
+
+    let joined = harness
+        .state()
+        .applied_actions()
+        .iter()
+        .any(|action| matches!(action, Action::JoinMeeting { target, .. } if target.contains("meeting_y")));
+    assert!(
+        joined,
+        "expected a JoinMeeting action; got {:?}",
+        harness.state().applied_actions()
     );
 }

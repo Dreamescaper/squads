@@ -5,7 +5,7 @@ An alternative, cross-platform Microsoft Teams client in **Rust + egui**.
 | Doc | What it covers |
 |---|---|
 | [STATUS.md](STATUS.md) | One-screen project state: what works, the ADR list, open blockers, how to verify by hand. |
-| [PLAN.md](PLAN.md) | The milestone roadmap (M0–M11) and working agreement. |
+| [PLAN.md](PLAN.md) | The milestone roadmap (M0–M12) and working agreement. |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Crate graph, responsibilities, data flow, protocol notes. |
 | [DECISIONS.md](DECISIONS.md) | Architecture decision records (ADRs). |
 | [PROGRESS.md](PROGRESS.md) | Live status per milestone and what actually landed. |

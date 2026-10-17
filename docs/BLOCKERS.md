@@ -521,3 +521,44 @@ CI) is verified offline; the *features behind the placeholders* and the
 `resolve`/`apply_shortcut` once a feature exists); the notification settings are
 already threaded to the router; the packaging instructions are concrete enough
 for a contributor to run and correct on real hardware.
+
+### U-007 — M12 calendar aspects not exercised offline
+
+M12's calendar calls are thin wrappers over the vendored Graph calendar lanes,
+tested offline against local TCP stubs (path/params/body + store effects), and
+its join/lobby logic is pure. The following cannot be exercised here (B-002 — no
+live tenant):
+
+- **Live Graph calendar acceptance.** The exact server behaviour of the
+  `calendarView` read (does the returned `dateTime` always match the `$select`
+  shape we order on?), the `POST /me/calendar/events` create with
+  `isOnlineMeeting`/`teamsForBusiness` (does Graph provision `onlineMeeting
+  .joinUrl` every time?), and the `DELETE` cancel are assumed from the vendored
+  crate + stubs, not proven. The stub tests pin the request shapes so a
+  regression is caught.
+- **Join-by-id is unavailable with the Teams sign-in.** The vendored
+  `graph_get` refuses `GET /me/onlineMeetings` (`graph_denied`:
+  `OnlineMeetings.Read` is not granted to the Teams web client), so
+  `Calendar::resolve_join` for a typed **numeric** meeting id always falls back
+  to the browser `/meet/<id>?p=` link (kind `meeting-id`). The Graph lookup
+  wrapper exists and is unit-tested only for its refusal; a live tenant would
+  confirm whether a suitably-scoped token changes this. Recorded in ADR-033.
+- **The lobby machine has no realtime producer.** `lobby_step`/`Lobby` wrap the
+  vendored pure `lobby_next` and are fully tested, but call frames are filtered
+  out of the M4 bus (B-008), so nothing drives `idle → joining → lobby →
+  admitted` from the wire; the UI must feed the transitions from the
+  call-signalling callbacks once that producer exists.
+- **Time-zone fidelity.** `Meeting::start`/`end` keep the Graph `dateTime`
+  string verbatim (no timezone; the projection drops `timeZone`), so the store's
+  `from_secs` filter and ordering assume the strings share the wire format and
+  are effectively UTC-ish. A meeting in a non-UTC zone may be filtered at the
+  boundary by up to the zone offset; the assumption is not exercised live.
+
+**Impact:** calendar correctness is assumed from the vendored crate + stubs, not
+proven; the join-by-id path is a browser fallback in practice, and the lobby has
+no live driver.
+
+**Mitigation:** keep the calls behind `ApiClient`/`Calendar` so a live fix is
+contained; the deterministic stub tests pin the exact paths/params/bodies so a
+regression is caught; the join classification and lobby machine are pure and
+fully unit-tested.

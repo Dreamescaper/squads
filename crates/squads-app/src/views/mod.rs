@@ -6,6 +6,7 @@
 //! mutates the core directly — [`crate::app::SquadsApp::apply_actions`] runs
 //! after the frame is drawn.
 
+pub mod calendar;
 pub mod call;
 pub mod chat_list;
 pub mod composer;
