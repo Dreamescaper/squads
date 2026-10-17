@@ -10,7 +10,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started · ⛔ blocked (see [BLO
 | M1 | Authentication | ✅ | Device-code flow, five-token model, 0600 file store, testable `AuthTransport`. |
 | M2 | Protocol clients & session core | ✅ | `ApiClient` over the vendored `TeamsClient`; `tokens_to_config`; lazy `Session::api()`; token refresh; offline `list_chats`/`read_messages` tests. |
 | M3 | Local persistence & offline cache | ✅ | UI-free `model`; bundled-SQLite `Store` (`user_version` migrations, idempotent upserts, per-chat paging); JSON `Settings` with atomic saves; `Session` owns the store. |
-| M4 | Realtime (Trouter) | ⬜ | |
+| M4 | Realtime (Trouter) | ✅ | Wrap the vendored Trouter loop; `RealtimeEvent` decode; `EventBus` broadcast fan-out; collector write-through; `Session::start_realtime`/`subscribe`. |
 | M5 | Messaging | ⬜ | |
 | M6 | Teams & channels | ⬜ | |
 | M7 | Files | ⬜ | |
@@ -223,3 +223,81 @@ call `session.store().upsert_chats(profile, &chats)` from fetched data, then
 no network.
 
 **Blockers.** B-007 (chat/message content is stored **unencrypted at rest**).
+
+---
+
+## M4 — Realtime (Trouter)
+
+**Goal.** Turn the vendored Trouter push stream into typed, UI-facing events and
+write-through to the local store, without reimplementing the socket layer and
+without any network or timing in the tests.
+
+**Landed.** New module `crates/squads-core/src/realtime/`:
+
+- `event` — the owned [`RealtimeEvent`] domain enum: `NewMessage { chat_id,
+  message }`, `MessageEdited { chat_id, message_id, content, edited_id }`,
+  `MessageDeleted { chat_id, message_id }`, `Typing { chat_id, sender_mri,
+  sender_name }`, `ReadState { chat_id, viewer_mri, horizon, message_id }`,
+  `ThreadUpdate { chat_id, change: ThreadChange }`, `Resync { reason }` and a
+  defensive `Unknown { resource_type, raw }` that keeps the raw JSON verbatim so
+  nothing is dropped. `decode(json) -> RealtimeEvent` and
+  `decode_all(json) -> Vec<RealtimeEvent>` are **pure and total** (never panic):
+  keys are matched case-insensitively, missing fields default, and both the
+  single-object and `eventMessages`-array shapes (plus defensive `data`/`body`
+  wrappers) decode. A batch yields one event per entry; `decode` returns the
+  first. Native fields read: `id`, `content`, `imdisplayname`,
+  `originalarrivaltime`/`composetime`, `from`, `messagetype`, `clientmessageid`,
+  `properties` (incl. reactions via the public vendored
+  `reaction_counts_from_values` and reply parents via `split_reply_quote`).
+  `Debug` is redacting (`Unknown` prints the raw *length*, never the body).
+- `bus` — `EventBus`, a `tokio::sync::broadcast` fan-out: `new(capacity)`,
+  `subscribe() -> Receiver<RealtimeEvent>`, `publish(event) -> usize` (never
+  blocks/errors). Lag is documented: a subscriber more than `capacity` behind
+  receives `Lagged`; the free `recv(&mut rx)` helper converts that into a single
+  `RealtimeEvent::Resync`, which is the client's cue to re-fetch. A `Resync` also
+  flows through when the server reports message loss.
+- `service` — `RealtimeService::start(handle, profile, tokens, store)` spawns two
+  tasks on a caller-provided runtime: the **connection** task
+  (`ost::trouter::connect_and_run_with_config(Some(cfg))`, `cfg` built by the M2
+  `tokens_to_config`) and a **collector** that loops `event_hub::drain_wait`,
+  decodes each payload and applies it. `stop()`/`Drop` abort both. The
+  deterministic, clock-free core is `collect_once(profile, &Store, &EventBus) ->
+  usize` (drains what is queued now, decodes, applies) — the loop is a thin
+  wrapper, so tests drive it with no timing. Write-through: new message →
+  `Store::upsert_messages`; edit → new `Store::update_message_edit` (content +
+  `edited` only, so a partial edit payload cannot clobber sender/reactions);
+  delete → new `Store::delete_message`; typing/read-state/thread/resync/unknown
+  are bus-only in M4. The store write happens **before** the publish, so a
+  consumer that reads the store on an event sees the new state.
+- `session` — `Session::start_realtime()` (requires a tokio runtime and a token
+  set; builds the config from the current `TokenSet` and stores the service),
+  `stop_realtime()`, `realtime()`, `subscribe()` / `events()` (independent bus
+  cursors). Token changes (restore, sign-in completion, refresh, sign-out) stop
+  the feed so it never runs with credentials the session has moved on from.
+
+**Decisions.** **ADR-013** (wrap the vendored Trouter loop: injected `Config`,
+`event_hub` polling, collector design, no socket-layer fork; call frames are
+filtered upstream).
+
+**Tests.** `cargo test -p squads-core` — **120** offline unit tests (85 from
+M1–M3 + 35 new: 19 `realtime::event`, 5 `realtime::bus`, 6
+`realtime::service`, 3 `session` realtime, 2 new `store` methods).
+`cargo test -p squads-protocol` still passes **377**. New coverage includes:
+every `RealtimeEvent` variant with realistic fixtures; case-insensitive keys;
+`eventMessages` batches; wrapper unwrapping; invalid JSON / missing ids → the
+defensive `Unknown`; the bus fan-out, the zero-subscriber case and the
+lag→`Resync` path; and the write-through integration (publish a new-message
+fixture into `ost::event_hub`, `collect_once`, assert the row is in an in-memory
+`Store` and the bus produced the event; the same for an edit updating an existing
+row and a delete; `Resync` surfaced). The hub is process-global, so these tests
+serialize on a module lock, use unique ids and drain first.
+
+**How to verify manually** (real tenant; not runnable here): after signing in,
+call `session.start_realtime()` on the core's tokio runtime, then
+`session.subscribe()`; send yourself a message from another client and confirm a
+`RealtimeEvent::NewMessage` arrives and `session.store().messages(chat_id, 10)`
+has the row.
+
+**Blockers.** B-008 (call frames are filtered out of the hub → call
+notifications deferred to M9; `event_hub` is process-global; reconnect token
+staleness).

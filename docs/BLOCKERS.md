@@ -103,6 +103,53 @@ revisited (encryption at rest, e.g. SQLCipher, or an encrypted blob column).
 encrypted engine can replace it without touching callers. A future ADR must also
 settle the key source and plaintext→encrypted migration; see ADR-011.
 
+### B-008 — Realtime (M4): call frames filtered, global hub, reconnect token staleness
+
+Three properties of the wrapped vendored Trouter path (ADR-013) are worth being
+explicit about:
+
+1. **Call notifications cannot be surfaced from `event_hub`.** The vendored
+   `trouter::data_frame_event` *deliberately* filters call frames
+   (`NGCallManagerWin` / `SkypeSpacesWeb`) out of the hub, so our
+   `RealtimeEvent` has no call variant and `squads-core` never sees ringing/
+   invitation events. Calls still take the vendored path (auto-answer unless
+   `TEAMS_MANUAL_CALLS` is set).
+
+   **Impact:** incoming/ongoing call UI is impossible through the M4 bus.
+
+   **Mitigation/deferred:** real call signalling and notifications land in **M9**
+   (`ost::calling`); M9 should either add a call event to the bus (a future patch
+   to the vendored filter) or drive calls directly from the vendored path. A
+   `TEAMS_MANUAL_CALLS`-style opt-out will be needed so the M4 feed and M9
+   handling do not fight over the same frames.
+
+2. **`ost::event_hub` is process-global and bounded (1024, oldest dropped).**
+   Every squads-core account (and any other embedder in-process) shares one FIFO.
+   A full queue silently drops the oldest events, and two collectors would steal
+   each other's events.
+
+   **Impact:** with a single account and a single collector (today) this is
+   fine; multi-account would cross-feed. Tests that publish to the hub must
+   serialize (the M4 tests take a module lock, use unique ids and drain first).
+
+   **Mitigation:** the collector drains the hub fully each pass; if multi-account
+   lands, either give the service its own hub (a vendored change) or tag events
+   with a profile upstream. The bounded drop is partially covered by the
+   server-side `message_loss` → `Resync` signal.
+
+3. **Reconnect token staleness.** `connect_and_run_with_config` reuses the same
+   in-memory `Config` on every reconnect, so a reconnect after the access tokens
+   expire re-negotiates with stale credentials.
+
+   **Impact:** without intervention the socket can spin on auth failures during
+   backoff (1s…64s).
+
+   **Mitigation:** `squads-core` stops the feed whenever its own token set
+   changes (`restore`, sign-in completion, `ensure_fresh_tokens`, `sign_out`) and
+   the caller must call `Session::start_realtime()` again; the vendored loop
+   itself is not restarted with fresh tokens mid-flight. A future M5/M10 wiring
+   should restart realtime after every refresh.
+
 ### U-001 — M3 store aspects not exercised offline
 
 - **Cross-account chat-id collision:** `messages` is keyed `(id, chat_id)` with

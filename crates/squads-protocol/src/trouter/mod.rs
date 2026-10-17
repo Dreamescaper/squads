@@ -28,10 +28,19 @@ enum DisconnectReason {
 /// exponential backoff (1s, 2s, 4s, ... capped at 64s). On clean shutdown
 /// (Ctrl+C), exits immediately.
 pub async fn connect_and_run() -> Result<()> {
+    connect_and_run_with_config(None).await
+}
+
+/// SQUADS PATCH: same as [`connect_and_run`], but the caller may inject the
+/// in-memory [`Config`] (its own token store) instead of the on-disk
+/// `teams-cli` TOML that [`connect_and_run`] loads. `None` keeps the original
+/// behaviour. On each reconnect the same `Config` is reused (the caller is
+/// responsible for restarting with fresh tokens when they expire).
+pub async fn connect_and_run_with_config(config: Option<Config>) -> Result<()> {
     let mut backoff = 1u64;
 
     loop {
-        match connect_and_run_inner().await {
+        match connect_and_run_inner(config.clone()).await {
             Ok(DisconnectReason::Shutdown) => {
                 return Ok(());
             }
@@ -76,9 +85,13 @@ pub async fn connect_and_run() -> Result<()> {
 ///
 /// Returns `DisconnectReason::Shutdown` on clean Ctrl+C, or
 /// `DisconnectReason::Error` when the connection should be retried.
-async fn connect_and_run_inner() -> Result<DisconnectReason> {
-    // Reload config each attempt so we pick up refreshed tokens.
-    let config = Config::load_cached().context("Failed to load config")?;
+async fn connect_and_run_inner(injected: Option<Config>) -> Result<DisconnectReason> {
+    // Reload config each attempt so we pick up refreshed tokens. SQUADS PATCH:
+    // an injected in-memory config is used verbatim instead.
+    let config = match injected {
+        Some(c) => c,
+        None => Config::load_cached().context("Failed to load config")?,
+    };
 
     let skype_token = config
         .get_skype_token()

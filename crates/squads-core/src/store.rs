@@ -423,6 +423,42 @@ impl Store {
         )
     }
 
+    /// Apply a realtime **edit** to a stored message in place (M4).
+    ///
+    /// Replaces only the plain-text `content`, sets `edited` and advances
+    /// `updated_at`; every other column (sender, timestamp, raw HTML, reactions,
+    /// reply link) is left untouched, so a partial realtime edit payload cannot
+    /// clobber a richer cached row. Returns whether a matching
+    /// `(id, chat_id, profile)` row existed.
+    pub fn update_message_edit(
+        &self,
+        profile: &str,
+        chat_id: &str,
+        message_id: &str,
+        content: &str,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let now = now_unix() as i64;
+        let changed = conn.execute(
+            "UPDATE messages
+                SET content = ?1, edited = 1, updated_at = MAX(updated_at, ?2)
+              WHERE id = ?3 AND chat_id = ?4 AND profile = ?5",
+            params![content, now, message_id, chat_id, profile],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Delete one stored message (M4 realtime delete). Returns whether a
+    /// matching `(id, chat_id, profile)` row existed.
+    pub fn delete_message(&self, profile: &str, chat_id: &str, message_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let removed = conn.execute(
+            "DELETE FROM messages WHERE id = ?1 AND chat_id = ?2 AND profile = ?3",
+            params![message_id, chat_id, profile],
+        )?;
+        Ok(removed > 0)
+    }
+
     /// Shared message query: rows come back newest-first; reverse for display.
     fn messages_query(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Message>> {
         let conn = self.lock();
@@ -804,6 +840,59 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn update_message_edit_touches_content_only_and_reports_misses() {
+        let store = Store::open_in_memory().unwrap();
+        let mut msg = message("m1", "c1", "t1");
+        msg.reactions = vec![Reaction {
+            emoji: "👍".into(),
+            count: 1,
+            reactors: Vec::new(),
+        }];
+        store.upsert_messages("default", &[msg]).unwrap();
+
+        assert!(
+            store
+                .update_message_edit("default", "c1", "m1", "changed")
+                .unwrap()
+        );
+        let got = store.messages("c1", 10).unwrap();
+        assert_eq!(got.len(), 1, "an edit must not add a row");
+        assert_eq!(got[0].content, "changed");
+        assert!(got[0].edited);
+        assert_eq!(got[0].sender_name, "Alice", "sender preserved");
+        assert_eq!(got[0].reactions.len(), 1, "reactions preserved");
+
+        // A miss is reported as `false`, not an error.
+        assert!(
+            !store
+                .update_message_edit("default", "c1", "missing", "x")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_message_edit("other-profile", "c1", "m1", "x")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn delete_message_removes_only_the_named_row() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_messages(
+                "default",
+                &[message("a", "c1", "t1"), message("b", "c1", "t2")],
+            )
+            .unwrap();
+
+        assert!(store.delete_message("default", "c1", "a").unwrap());
+        let left = store.messages("c1", 10).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, "b");
+        assert!(!store.delete_message("default", "c1", "a").unwrap());
     }
 
     #[test]

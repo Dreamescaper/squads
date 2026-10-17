@@ -22,12 +22,15 @@
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 
+use tokio::sync::broadcast;
+
 use crate::api::ApiClient;
 use crate::auth::flow::{AuthDriver, AuthTransport, HttpTransport, SignInProgress};
 use crate::auth::store::{DEFAULT_PROFILE, FileTokenStore, TokenStore};
 use crate::auth::tokens::TokenSet;
 use crate::error::{CoreError, Result};
 use crate::paths::AppDirs;
+use crate::realtime::{RealtimeEvent, RealtimeService};
 use crate::store::Store;
 
 /// High-level state of the local client, independent of rendering.
@@ -92,6 +95,9 @@ pub struct Session {
     /// Lazily-built protocol client (M2). Dropped whenever the token set
     /// changes so the next [`Session::api`] rebuilds it with fresh credentials.
     api: Option<ApiClient>,
+    /// The running realtime (Trouter) feed (M4), if [`Session::start_realtime`]
+    /// has been called.
+    realtime: Option<RealtimeService>,
 }
 
 impl Session {
@@ -137,6 +143,7 @@ impl Session {
             tokens: None,
             sign_in: None,
             api: None,
+            realtime: None,
         })
     }
 
@@ -205,6 +212,60 @@ impl Session {
         self.api.is_some()
     }
 
+    /// Start the realtime (Trouter) feed for the current token set (M4).
+    ///
+    /// Spawns the vendored connection loop and our collector task on the
+    /// **ambient tokio runtime** ([`tokio::runtime::Handle::try_current`]) and
+    /// stores the handle on the session. Requires a token set
+    /// ([`CoreError::NotSignedIn`] otherwise) and a runtime
+    /// ([`CoreError::NotReady`] otherwise). Calling it again replaces any
+    /// previous feed (the old tasks are aborted on drop).
+    ///
+    /// The connection is the vendored [`ost::trouter::connect_and_run_with_config`],
+    /// which reconnects with backoff forever; consumers read events from
+    /// [`Session::subscribe`]. The feed runs with the token set captured at
+    /// start time — see B-008 on reconnect token staleness.
+    pub fn start_realtime(&mut self) -> Result<()> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| CoreError::NotReady("start_realtime requires an async runtime".into()))?;
+        let tokens = self.tokens.as_ref().ok_or(CoreError::NotSignedIn)?.clone();
+        // Dropping the previous service aborts its tasks.
+        self.realtime = None;
+        let service = RealtimeService::start(
+            &handle,
+            self.profile.clone(),
+            &tokens,
+            Arc::clone(&self.store),
+        );
+        self.realtime = Some(service);
+        Ok(())
+    }
+
+    /// Stop the realtime feed, aborting its tasks. Idempotent.
+    pub fn stop_realtime(&mut self) {
+        self.realtime = None;
+    }
+
+    /// The running realtime service, if any.
+    pub fn realtime(&self) -> Option<&RealtimeService> {
+        self.realtime.as_ref()
+    }
+
+    /// Subscribe to the realtime event bus.
+    ///
+    /// Returns `None` when realtime is not running (call
+    /// [`Session::start_realtime`] first). Each call returns an independent
+    /// cursor; a slow consumer that falls behind receives
+    /// [`RealtimeEvent::Resync`] via [`crate::realtime::recv`].
+    pub fn subscribe(&self) -> Option<broadcast::Receiver<RealtimeEvent>> {
+        self.realtime.as_ref().map(|service| service.subscribe())
+    }
+
+    /// Alias for [`Session::subscribe`].
+    pub fn events(&self) -> Option<broadcast::Receiver<RealtimeEvent>> {
+        self.subscribe()
+    }
+
     /// Refresh the token set if any token has expired, using the real HTTP
     /// transport. Persists the refreshed set and drops the cached protocol
     /// client so the next [`Session::api`] picks up the new credentials.
@@ -243,6 +304,9 @@ impl Session {
         self.tokens = Some(refreshed);
         // The cached client holds the old tokens in its config.
         self.api = None;
+        // The realtime feed also captured the old tokens; stop it and let the
+        // caller restart it (B-008).
+        self.realtime = None;
         Ok(true)
     }
 
@@ -252,6 +316,8 @@ impl Session {
     pub fn restore(&mut self) -> Result<()> {
         // Any previously cached client was built from a different token set.
         self.api = None;
+        // The realtime feed was started with the previous token set, if any.
+        self.realtime = None;
         match self.token_store.load(&self.profile)? {
             Some(tokens) => {
                 tracing::info!(profile = %self.profile, "restored stored credentials");
@@ -351,6 +417,7 @@ impl Session {
             SignInProgress::Completed(tokens) => {
                 self.tokens = Some(tokens.clone());
                 self.api = None;
+                self.realtime = None;
                 self.state = SessionState::Ready;
                 self.sign_in = None;
             }
@@ -375,6 +442,8 @@ impl Session {
         if let Some(task) = self.sign_in.take() {
             task.handle.abort();
         }
+        // Stop the realtime feed before dropping the credentials it captured.
+        self.realtime = None;
         self.tokens = None;
         self.api = None;
         self.token_store.delete(&self.profile)?;
@@ -731,6 +800,45 @@ mod tests {
             store.load("default").unwrap().unwrap().graph.token(),
             "t-graph"
         );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ----- M4: realtime wiring ------------------------------------------------
+
+    #[test]
+    fn subscribe_is_none_before_realtime_starts() {
+        let (tmp, dirs) = dirs();
+        let session = Session::new(dirs).expect("session");
+        assert!(session.realtime().is_none());
+        assert!(session.subscribe().is_none());
+        assert!(session.events().is_none());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn start_realtime_without_runtime_errors() {
+        let (tmp, dirs) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        store.save("default", &sample_set()).unwrap();
+        let mut session = Session::with_store(dirs, "default", store).expect("session");
+        session.restore().expect("restore");
+
+        // Plain test: no tokio runtime, so this must fail before spawning any
+        // network task.
+        let err = session.start_realtime().unwrap_err();
+        assert!(format!("{err}").contains("async runtime"), "got {err:?}");
+        assert!(session.realtime().is_none());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn start_realtime_without_tokens_is_not_signed_in() {
+        let (tmp, dirs) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs, "default", store).expect("session");
+        // No tokens: must not spawn the connection loop.
+        let err = session.start_realtime().unwrap_err();
+        assert!(matches!(err, CoreError::NotSignedIn), "got {err:?}");
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

@@ -373,4 +373,71 @@ module docs.
 - No async DB layer: a future async caller must not hold the lock across an
   `.await`. That is a documented convention, not enforced by the type system.
 
+---
+
+## ADR-013 — Wrap the vendored Trouter loop; poll `event_hub` into a typed bus
+
+**Status:** accepted (M4)
+
+**Context.** M4 needs live Teams events (new message, edit, delete, typing,
+read-state, thread updates) in `squads-core`. The vendored protocol crate already
+implements Trouter end to end — socket.io v1 over WSS negotiate → session →
+WebSocket → registrar, the `3:::` ack contract, gzip/base64 payload unwrapping,
+and reconnect with exponential backoff (1s…64s). It exposes:
+
+- `ost::trouter::connect_and_run_with_config(config: Option<Config>)`, a new
+  SQUADS PATCH entry point that runs forever and reuses an injected in-memory
+  `Config` (built by our M2 `tokens_to_config`) across reconnects;
+- `ost::trouter::data_frame_event(payload) -> Option<String>`, which decodes one
+  `3:::` data frame into the pushed chat-service event JSON and **deliberately
+  filters call frames out** (`NGCallManagerWin` / `SkypeSpacesWeb` → `None`);
+- `ost::event_hub`, a process-global, bounded (1024, drops oldest) FIFO with
+  `drain` / `drain_wait` that the frame handler feeds.
+
+The question was whether to (a) wrap that loop, (b) fork the socket layer into
+`squads-core`, or (c) reconnect through a different embedding API.
+
+**Decision.** **Wrap it (a).** `squads-core` does not touch the socket layer:
+
+1. `RealtimeService::start` spawns `connect_and_run_with_config(Some(cfg))` on a
+   caller-provided tokio runtime, with `cfg = tokens_to_config(current TokenSet)`.
+   We rely on the vendored reconnect/backoff and the ack contract unchanged.
+2. A **collector task** polls `ost::event_hub::drain_wait`, decodes each payload
+   into our owned [`RealtimeEvent`], writes through to the shared `Arc<Store>`
+   and publishes onto a `tokio::sync::broadcast` `EventBus`.
+3. The collector's clock-free core is `collect_once(&Store, &EventBus) -> usize`
+   (drain-now → decode → apply); the task loop is a thin wrapper, so the whole
+   pipeline is unit-testable offline with no timing (`event_hub::publish` a
+   fixture, call `collect_once`).
+
+We chose the `event_hub` **polling** bridge (rather than, say, having the
+vendored loop call a callback) because `event_hub` is the crate's existing
+embedder boundary, it needs no further patch to `squads-protocol`, and it lets
+the collector live on the core's runtime independent of the connection task.
+`decode` is pure and total, so unknown wire shapes never panic and never silently
+vanish: they become `RealtimeEvent::Unknown { resource_type, raw }`, which keeps
+the raw JSON.
+
+**Consequences.**
+
+- No duplication of the fragile socket.io/registrar/reconnect logic (ADR-001);
+  protocol fixes come from the vendored crate. We do not fork it.
+- The full pipeline — decode, fan-out, write-through — is deterministic and
+  offline-testable via `collect_once`; only the connection loop itself needs a
+  live tenant.
+- `event_hub` is **process-global** and bounded (oldest dropped over 1024), so
+  the collector drains it fully on every pass and tests that touch it must
+  serialize — recorded as B-008.
+- `drain_wait` blocks the calling thread on a condition variable, so the
+  collector wants a multi-threaded runtime (the core owns one, ADR-004) and its
+  wait is bounded (250 ms) so `stop()` is responsive.
+- **Call events are unfixable here**: `data_frame_event` filters them out before
+  the hub, so `RealtimeEvent` cannot represent call signalling. Incoming-call
+  handling stays in the vendored path (auto-answer unless `TEAMS_MANUAL_CALLS`)
+  and is deferred to M9 — recorded as B-008.
+- The vendored loop reuses one `Config` across reconnects, so a reconnect after
+  the access tokens expire carries stale credentials; `squads-core` stops the
+  feed whenever its own token set changes (restore/sign-in/refresh/sign-out) and
+  the caller restarts it — the residual gap is recorded as B-008.
+
 
