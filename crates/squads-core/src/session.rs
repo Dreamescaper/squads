@@ -2,16 +2,21 @@
 //!
 //! M0 laid down the *shape* of a session; **M1** adds authentication:
 //! [`Session::restore`], [`Session::begin_sign_in`], [`Session::poll_sign_in`]
-//! and [`Session::sign_out`]. Protocol clients (M2), the store (M3) and the
-//! realtime feed (M4) attach to this type in later milestones.
+//! and [`Session::sign_out`]. **M2** attaches the protocol client
+//! ([`Session::api`], built lazily from the token set) and token refresh
+//! ([`Session::ensure_fresh_tokens`]). The store (M3) and the realtime feed
+//! (M4) attach to this type in later milestones.
 //!
-//! Network access only ever happens through the sign-in driver; with a
-//! [`MemoryTokenStore`] and no `begin_sign_in`, a `Session` is fully usable
-//! offline (as the tests demonstrate).
+//! Network access only ever happens through the sign-in driver, a
+//! [`Session::ensure_fresh_tokens`] refresh, or a call on the [`ApiClient`]
+//! returned by [`Session::api`]; with a [`MemoryTokenStore`] and no sign-in, a
+//! `Session` — and building its `ApiClient` — is fully offline (as the tests
+//! demonstrate).
 
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 
+use crate::api::ApiClient;
 use crate::auth::flow::{AuthDriver, AuthTransport, HttpTransport, SignInProgress};
 use crate::auth::store::{DEFAULT_PROFILE, FileTokenStore, TokenStore};
 use crate::auth::tokens::TokenSet;
@@ -74,6 +79,9 @@ pub struct Session {
     store: Arc<dyn TokenStore>,
     tokens: Option<TokenSet>,
     sign_in: Option<SignInTask>,
+    /// Lazily-built protocol client (M2). Dropped whenever the token set
+    /// changes so the next [`Session::api`] rebuilds it with fresh credentials.
+    api: Option<ApiClient>,
 }
 
 impl Session {
@@ -100,6 +108,7 @@ impl Session {
             store,
             tokens: None,
             sign_in: None,
+            api: None,
         })
     }
 
@@ -135,10 +144,73 @@ impl Session {
         self.tokens.as_ref()
     }
 
+    /// The protocol client for this session, building it lazily on first use
+    /// from the current [`TokenSet`].
+    ///
+    /// Returns [`CoreError::NotSignedIn`] when no token set is loaded.
+    /// Construction is offline (it only moves tokens into an in-memory config),
+    /// so calling this never hits the network; the first `list_chats` /
+    /// `read_messages` call does.
+    pub fn api(&mut self) -> Result<&ApiClient> {
+        if self.api.is_none() {
+            let tokens = self.tokens.as_ref().ok_or(CoreError::NotSignedIn)?;
+            self.api = Some(ApiClient::from_tokens(tokens));
+        }
+        Ok(self.api.as_ref().expect("api built above"))
+    }
+
+    /// Whether a protocol client has already been built for this session.
+    pub fn has_api(&self) -> bool {
+        self.api.is_some()
+    }
+
+    /// Refresh the token set if any token has expired, using the real HTTP
+    /// transport. Persists the refreshed set and drops the cached protocol
+    /// client so the next [`Session::api`] picks up the new credentials.
+    ///
+    /// Returns `true` when a refresh happened, `false` when the tokens were
+    /// still fresh (a no-op, no network).
+    ///
+    /// **Requires a tokio runtime**: the underlying `AuthDriver::refresh` is
+    /// async and may make network calls. When there is no token set this is a
+    /// no-op returning `Ok(false)`.
+    pub async fn ensure_fresh_tokens(&mut self) -> Result<bool> {
+        let driver = AuthDriver::new(HttpTransport::new());
+        self.ensure_fresh_tokens_with_driver(driver).await
+    }
+
+    /// [`Session::ensure_fresh_tokens`] with an injected driver (tests supply a
+    /// deterministic offline transport, mirroring
+    /// [`Session::begin_sign_in_with_driver`]).
+    pub async fn ensure_fresh_tokens_with_driver<T>(
+        &mut self,
+        driver: AuthDriver<T>,
+    ) -> Result<bool>
+    where
+        T: AuthTransport,
+    {
+        let Some(current) = self.tokens.clone() else {
+            return Ok(false);
+        };
+        if !current.needs_refresh() {
+            return Ok(false);
+        }
+        let store = Arc::clone(&self.store);
+        let refreshed = driver
+            .refresh(&current, &self.profile, store.as_ref(), |_| {})
+            .await?;
+        self.tokens = Some(refreshed);
+        // The cached client holds the old tokens in its config.
+        self.api = None;
+        Ok(true)
+    }
+
     /// Load any stored token set for this profile. On success the state becomes
     /// [`SessionState::Loading`] when credentials were found, otherwise
     /// [`SessionState::SignedOut`].
     pub fn restore(&mut self) -> Result<()> {
+        // Any previously cached client was built from a different token set.
+        self.api = None;
         match self.store.load(&self.profile)? {
             Some(tokens) => {
                 tracing::info!(profile = %self.profile, "restored stored credentials");
@@ -237,6 +309,7 @@ impl Session {
         match progress {
             SignInProgress::Completed(tokens) => {
                 self.tokens = Some(tokens.clone());
+                self.api = None;
                 self.state = SessionState::Ready;
                 self.sign_in = None;
             }
@@ -262,6 +335,7 @@ impl Session {
             task.handle.abort();
         }
         self.tokens = None;
+        self.api = None;
         self.store.delete(&self.profile)?;
         self.state = SessionState::SignedOut;
         Ok(())
@@ -452,6 +526,132 @@ mod tests {
         assert_eq!(tokens.recorder.token(), "t-recorder");
         assert!(store.contains("default"));
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ----- M2: protocol client + refresh wiring -------------------------------
+
+    #[test]
+    fn api_without_tokens_is_not_signed_in() {
+        let (tmp, dirs) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs, "default", store).expect("session");
+        assert!(!session.has_api());
+        let err = session.api().unwrap_err();
+        assert!(matches!(err, CoreError::NotSignedIn), "got {err:?}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn api_builds_lazily_and_offline_from_restored_tokens() {
+        let (tmp, dirs) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        store.save("work", &sample_set()).unwrap();
+        let mut session = Session::with_store(dirs, "work", store).expect("session");
+        session.restore().expect("restore");
+
+        // Nothing built until `api()` is called; building makes no request.
+        assert!(!session.has_api());
+        let url = {
+            let client = session.api().expect("api");
+            assert_eq!(client.request_count(), 0);
+            client.chat_service_url()
+        };
+        assert!(session.has_api());
+        assert!(url.contains("ng.msg.teams.microsoft.com"), "url = {url}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The M2 exit criterion at the `Session` level: `Session::api()` then
+    /// `list_chats` against a local fake.
+    #[tokio::test]
+    async fn session_lists_chats_against_local_fake() {
+        let (tmp, dirs) = dirs();
+        let body = serde_json::json!({
+            "conversations": [{
+                "id": "19:alice@unq.gbl.spaces",
+                "threadProperties": { "topic": "Alice" },
+                "lastMessage": { "imdisplayname": "Alice", "content": "<p>hi</p>" }
+            }]
+        })
+        .to_string();
+        let (base, seen, task) = crate::api::one_shot_json_stub(body).await;
+
+        let mut set = sample_set();
+        set.skype = StoredToken::with_expiry("skype-token", 4_000_000_000);
+        set.region_gtms = serde_json::json!({
+            "csaBase": base,
+            "graphBase": base,
+            "chatService": base
+        });
+        let store = Arc::new(MemoryTokenStore::new());
+        store.save("default", &set).unwrap();
+        let mut session = Session::with_store(dirs, "default", store).expect("session");
+        session.restore().expect("restore");
+        session.mark_ready();
+
+        let chats = {
+            let client = session.api().expect("api");
+            client.list_chats(10).await.expect("list chats")
+        };
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].name, "Alice");
+        assert!(session.has_api());
+
+        task.await.expect("stub drains");
+        let req = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            req.starts_with("GET /teams/users/ME/conversations"),
+            "{req}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_tokens_is_noop_when_fresh() {
+        let (tmp, dirs) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        store.save("default", &sample_set()).unwrap();
+        let mut session = Session::with_store(dirs, "default", store.clone()).expect("session");
+        session.restore().expect("restore");
+
+        let driver = AuthDriver::new(StubTransport);
+        let refreshed = session
+            .ensure_fresh_tokens_with_driver(driver)
+            .await
+            .expect("no-op");
+        assert!(!refreshed);
+        assert_eq!(session.tokens().unwrap().skype_token(), "tok");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_tokens_refreshes_expired_and_updates_store() {
+        let (tmp, dirs) = dirs();
+        let mut set = sample_set();
+        set.graph = StoredToken::with_expiry("old-graph", 1_000);
+        let store = Arc::new(MemoryTokenStore::new());
+        store.save("default", &set).unwrap();
+        let mut session = Session::with_store(dirs, "default", store.clone()).expect("session");
+        session.restore().expect("restore");
+        // Build a client first so we can prove it is invalidated on refresh.
+        session.api().expect("api");
+
+        let driver = AuthDriver::new(StubTransport);
+        let refreshed = session
+            .ensure_fresh_tokens_with_driver(driver)
+            .await
+            .expect("refresh");
+        assert!(refreshed);
+        assert_eq!(session.tokens().unwrap().graph.token(), "t-graph");
+        assert!(
+            !session.has_api(),
+            "cached client must be dropped on refresh"
+        );
+        assert_eq!(
+            store.load("default").unwrap().unwrap().graph.token(),
+            "t-graph"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

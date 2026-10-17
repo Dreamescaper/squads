@@ -8,7 +8,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started · ⛔ blocked (see [BLO
 |---|---|---|---|
 | M0 | Workspace & scaffolding | ✅ | Workspace + 3 crates; vendored protocol core; docs. |
 | M1 | Authentication | ✅ | Device-code flow, five-token model, 0600 file store, testable `AuthTransport`. |
-| M2 | Protocol clients & session core | ⬜ | |
+| M2 | Protocol clients & session core | ✅ | `ApiClient` over the vendored `TeamsClient`; `tokens_to_config`; lazy `Session::api()`; token refresh; offline `list_chats`/`read_messages` tests. |
 | M3 | Local persistence & offline cache | ⬜ | |
 | M4 | Realtime (Trouter) | ⬜ | |
 | M5 | Messaging | ⬜ | |
@@ -100,3 +100,58 @@ later).
 **Blockers.** B-002 (no live tenant here), B-004 (browser PKCE loopback listener
 not implemented yet), B-005 (`exchange_skype_token` uses the vendored client, so
 that one call is not unit-testable).
+
+---
+
+## M2 — Protocol clients & session core
+
+**Goal.** Wrap the vendored protocol clients behind a UI-free facade, expose the
+`Session`/client lifecycle and region routing, and prove a `Session` can list
+chats against a fake transport — entirely offline.
+
+**Landed.** New module `crates/squads-core/src/api/` and `Session` wiring:
+
+- `api::tokens_to_config(&TokenSet) -> ost::config::Config` — pure mapping of the
+  M1 five-token model into the vendored config. Each token carries our
+  **absolute** `expires_at` straight through (not `StoredToken::new`, which
+  recomputes from a lifetime), `tenant_id` follows the tenant, and
+  `region_gtms` is stored as its JSON string (`None` when our blob is `null`).
+- `api::ApiClient` — owns an `ost::api::client::TeamsClient` built with
+  `TeamsClient::from_config` (ADR-010). Exposes `list_chats(limit)` and
+  `read_messages(chat_id, limit)` (thin over `ost::api::list_chats_data` /
+  `read_messages_data`), the `region_gtms` blob, resolved service URLs
+  (`chat_service_url` / `chatsvcagg_url` / `middle_tier_url`) and a request
+  counter + `tracing` debug spans. `Debug` is redacting; construction is
+  offline (the shared HTTP pool is only used on the first call).
+  `ApiClient::from_tokens(&TokenSet)` is the entry point.
+- `Session` (extended): `Session::api()` builds the client lazily from the
+  current token set (`NotSignedIn` when absent) and is cached until the tokens
+  change; `Session::has_api()`; `Session::ensure_fresh_tokens()` (async, needs a
+  tokio runtime) refreshes when `tokens.needs_refresh()`, persists through the
+  store and drops the cached client; `ensure_fresh_tokens_with_driver(..)` takes
+  a fake transport for offline tests. `restore`/`sign_out`/sign-in completion
+  all invalidate the cached client.
+- **Exit criterion (offline):** `crates/squads-core/src/api/mod.rs` starts a
+  one-shot `tokio::net::TcpListener` stub that answers the CSA conversations
+  request, points `region_gtms.csaBase` at it, and asserts the parsed
+  `ChatInfo`s (name, group flag, sender, preview, time). `read_messages` is
+  covered the same way, and `session::tests::session_lists_chats_against_local_fake`
+  drives the same stub through `Session::api()`.
+
+**Decisions.** ADR-010 (vendored embedding patch).
+
+**Tests.** `cargo test -p squads-core` — 55 offline unit tests (43 from M1 + 12
+new: 7 in `api`, 5 in `session`). `cargo test -p squads-protocol` still passes
+377.
+
+**How to verify manually** (real tenant; not runnable in this headless env):
+
+1. Sign in (M1), then from a scratch binary call
+   `Session::api()?.list_chats(20)` and `read_messages(id, 50)`.
+2. Confirm the returned `ChatInfo` names for 1:1 chats resolve to mate names
+   (exercises the vendored roster/history lookups) and that
+   `client.chat_service_url()` matches the tenant's region.
+
+**Blockers.** B-005 (Skype exchange is not redirectable), B-006 (the
+mate-name resolution branch and its process-global mate cache are not
+exercised offline).

@@ -69,6 +69,23 @@ around it (ordering, `regionGtms` capture, refresh dependency on the Spaces
 token) is covered offline. If the vendored crate ever exposes an injectable
 client, add a local stub test.
 
+### B-006 — 1:1 mate-name resolution and the vendored mate cache are not exercised offline (M2)
+
+`ost::api::list_chats_data` names 1:1 chats without a topic through a second
+pass: a `whoami` call, a per-thread roster read and a history read, memoised in
+a process-global cache keyed by `ost::config::active_profile()` (which defaults
+to `"default"`). `squads-core`'s `ApiClient` does not (yet) set that vendored
+active profile, and the extra requests would need several stub endpoints.
+
+**Impact:** the offline `list_chats` tests give every chat a topic, so this
+branch is skipped; only the topic/last-sender/system-label naming is covered
+here. The mate-name path is exercised only against a live tenant.
+
+**Mitigation:** the code path otherwise passes through untouched; M3/M5 should
+decide whether `squads-core` owns mate-name resolution (using its own store)
+rather than relying on the vendored global profile. Once that lands, extend the
+stub to serve `whoami` + roster + history and cover the branch offline.
+
 ## Deferred work
 
 ### D-001 — Third-party Teams app hosting (TeamsJS/web frames)

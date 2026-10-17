@@ -177,10 +177,13 @@ impl TeamsClient {
         })
     }
 
-    /// Graph root. Production is always [`GRAPH_BASE`]; unit tests may
-    /// point it at a local fake through the config's `graphBase` key.
+    /// Graph root. Defaults to [`GRAPH_BASE`]; `region_gtms.graphBase` overrides
+    /// it (regional routing, and local fakes in tests).
+    ///
+    /// SQUADS PATCH: the `region_gtms` override used to be `#[cfg(test)]`-only.
+    /// Squads needs it at runtime to route requests through a test stub and to
+    /// honour regional Graph endpoints returned by `authsvc`.
     fn graph_base(&self) -> String {
-        #[cfg(test)]
         if let Some(b) = self
             .config
             .get_region_gtms()
@@ -191,10 +194,11 @@ impl TeamsClient {
         GRAPH_BASE.to_string()
     }
 
-    /// CSA root (`…/api/csa/api/v1`). Production is always the Teams
-    /// host; unit tests may point it at a local fake (`csaBase` key).
+    /// CSA root (`…/api/csa/api/v1`). `region_gtms.csaBase` overrides it.
+    ///
+    /// SQUADS PATCH: override promoted from `#[cfg(test)]` to runtime (see
+    /// [`Self::graph_base`]).
     pub(crate) fn csa_base(&self) -> String {
-        #[cfg(test)]
         if let Some(b) = self
             .config
             .get_region_gtms()
@@ -203,6 +207,19 @@ impl TeamsClient {
             return b;
         }
         CSA_BASE.to_string()
+    }
+
+    /// Build a client over an in-memory [`Config`].
+    ///
+    /// SQUADS PATCH: exposes the previously test-only constructor so an embedder
+    /// (Squads) can supply tokens from its own store instead of `teams-cli`'s
+    /// on-disk TOML, without going through [`Self::new_for_profile`]'s refresh.
+    pub fn from_config(config: Config) -> Self {
+        Self {
+            http: shared_http(),
+            config,
+            timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+        }
     }
 
     /// Client over an in-memory config (unit tests against a local fake).

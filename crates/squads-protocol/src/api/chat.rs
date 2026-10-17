@@ -2277,9 +2277,12 @@ async fn fill_member_names(client: &TeamsClient, members: &mut [ChatMemberInfo])
 /// Mate resolution is best-effort: roster/history/whoami failures
 /// keep the sender/label fallback, never fail the list.
 pub async fn list_chats_data(client: &TeamsClient, limit: usize) -> Result<Vec<ChatInfo>> {
-    // Strategy 1: CSA AFD endpoint with Bearer auth
+    // Strategy 1: CSA AFD endpoint with Bearer auth.
+    // SQUADS PATCH: built from `csa_base()` (was a hard-coded host) so the
+    // regional/`region_gtms` route and test stubs apply here too.
     let csa_url = format!(
-        "https://teams.microsoft.com/api/csa/api/v1/teams/users/ME/conversations?view=mychats&pageSize={}",
+        "{}/teams/users/ME/conversations?view=mychats&pageSize={}",
+        client.csa_base(),
         limit
     );
     tracing::debug!("Trying CSA endpoint: {}", csa_url);

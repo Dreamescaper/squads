@@ -239,4 +239,60 @@ because it cannot be verified in this environment.
 - The PKCE pieces are ready to wire into the M10 login screen / a future CLI
   subcommand without re-deriving them.
 
+---
+
+## ADR-010 — Vendored `ost` embedding patch: `TeamsClient::from_config` and runtime base URLs
+
+**Status:** accepted (M2) — a small, already-applied patch to `crates/squads-protocol`
+
+**Context.** ADR-001 says we **wrap** the vendored `ost` core instead of
+reimplementing it. M2 needs to drive its chat client from *our* token store and
+against a local fake, but upstream's `TeamsClient` was built for the `squads-cli`
+binary:
+
+- `new()` / `new_for_profile()` load `config.toml` from disk and may kick off an
+  AAD refresh via `ost::auth::oauth::refresh_for` — neither of which we want in
+  `squads-core` (we own tokens and refresh in M1/M2).
+- The regional base URLs (`graphBase`, `csaBase`, `middleTier`, `chatService`,
+  `chatServiceAggregator`) were read from `region_gtms` only under `#[cfg(test)]`,
+  so an embedder could not route through a stub or honour `authsvc`'s regional
+  endpoints at runtime.
+- `list_chats_data` built its CSA URL from a hard-coded host, ignoring
+  `csa_base()`.
+
+Reimplementing the client or the chat calls would violate ADR-001; leaving it
+unpatchable would make M2's exit criterion (offline `list_chats` against a fake)
+impossible.
+
+**Decision.** Apply a minimal embedding patch to the vendored crate (three
+changes, no behaviour change for `squads-cli`):
+
+1. `TeamsClient::from_config(config: ost::config::Config) -> TeamsClient` — a
+   **public** constructor that builds a client from an in-memory config, with no
+   disk access and no automatic refresh.
+2. The `region_gtms` overrides for `graphBase`, `csaBase`, `middleTier`,
+   `chatService` and `chatServiceAggregator` are honoured **at runtime**
+   (the `#[cfg(test)]` gate was removed), so an embedder can point the client at
+   a local stub or a regional endpoint.
+3. `list_chats_data` builds its CSA URL from `csa_base()` instead of a
+   hard-coded host.
+
+**Consequences.**
+
+- `squads-core` can own the client lifecycle: `tokens_to_config` maps our
+  `TokenSet` into `ost::config::Config`, and `ApiClient` wraps the client built
+  with `from_config`. Token refresh stays in our M1 `AuthDriver`.
+- Region routing becomes a first-class, testable feature: the M2 exit-criterion
+  test points `region_gtms.csaBase` at a local TCP stub and asserts parsed
+  chats, with no live tenant.
+- The patch is intentionally tiny and upstream-compatible: `new()` /
+  `new_for_profile()` still behave exactly as before, so `squads-cli` is
+  unaffected. `docs/PROGRESS.md` records it as a vendored divergence to
+  re-apply if the crate is ever re-vendored.
+- Caveat: `graph_base()` / `csa_base()` remain private / `pub(crate)`, so our
+  `ApiClient` exposes the *public* resolved URLs (`chat_service_url`,
+  `chatsvcagg_url`, `middle_tier_url`) plus the raw `region_gtms` blob. If a
+  later milestone needs the resolved Graph/CSA URLs directly, that is a
+  follow-up patch.
+
 
