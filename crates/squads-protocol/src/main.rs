@@ -6,6 +6,7 @@
 //! standalone; dead-code warnings are suppressed for the same reason as in
 //! `lib.rs` (vendored code).
 #![allow(dead_code)]
+#![allow(unused_imports)]
 
 mod api;
 mod auth;

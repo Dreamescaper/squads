@@ -163,3 +163,80 @@ only `squads-app` and this document change.
 
 ---
 
+## ADR-007 — Async `AuthTransport` trait for network-free auth testing
+
+**Status:** accepted (M1)
+
+**Context.** M1's sign-in orchestrates several network round-trips (device code,
+token poll, Skype exchange, three refresh grants). The vendored crate's
+`exchange_skype_token` uses a private shared HTTP client, and the acceptance
+criteria demand a deterministic **offline** full-sign-in test. Hard-coding
+`reqwest` calls into the driver would make that impossible without a live tenant.
+
+**Decision.** Define a small `AuthTransport` trait describing exactly the
+network operations the flow needs (`request_device_code`, `poll_device_code`,
+`exchange_skype`, `refresh_grant`). `AuthDriver<T: AuthTransport>` is generic
+over it; `HttpTransport` is the real implementation and a hand-written fake is
+used in tests. Use **native async-in-trait** (`-> impl Future + Send`) rather
+than the `async-trait` crate, so no extra dependency and no `Box` per call.
+
+**Consequences.**
+
+- The complete sign-in and refresh logic is unit-tested offline, including the
+  "only re-mint expired tokens" property.
+- The HTTP implementation is tested against a local one-shot TCP stub; only
+  `exchange_skype` (which delegates to the vendored client) cannot be redirected
+  (see B-005).
+- `Session` stays non-generic: it holds only a progress channel, and a generic
+  method (`begin_sign_in_with_driver`) injects any transport.
+
+---
+
+## ADR-008 — File token store by default; OS keyring behind a feature
+
+**Status:** accepted (M1)
+
+**Context.** M1 lists "OS keyring + 0600 file fallback". A keyring dependency
+pulls platform backends (Secret Service/DBus on Linux) that are unavailable in
+this headless CI environment, and would make the default build fragile there.
+
+**Decision.** Ship `FileTokenStore` as the default: one JSON file per profile
+under `AppDirs::config`, written atomically (unique temp file + `rename`) and
+forced to mode `0600` on Unix regardless of umask. Provide
+`MemoryTokenStore` for tests. Declare a default-off `keyring` cargo feature and
+document `KeyringTokenStore` as a TODO; the `keyring` crate is **not** added yet.
+
+**Consequences.**
+
+- `cargo build`/`cargo test` work on any machine with no OS secret service.
+- Tokens at rest are protected by file permissions (0600), not by the OS keyring.
+  Adding the keyring is a self-contained follow-up behind the existing feature
+  flag.
+- The store is keyed by profile, which is how multi-account is realized
+  (`default` plus `tokens-<sanitized>.json`).
+
+---
+
+## ADR-009 — Device-code first; browser PKCE helpers only
+
+**Status:** accepted (M1)
+
+**Context.** M1 asks for both a device-code flow and a browser PKCE flow. The
+device-code flow is fully driveable from a headless CLI and is what the vendored
+`ost` crate already uses; the browser flow additionally needs a loopback HTTP
+listener and a real browser/tenant to test.
+
+**Decision.** Implement the **device-code flow end-to-end** (request, poll with
+`slow_down` handling, error-code mapping) as the primary sign-in path, and land
+the **PKCE building blocks** (`verifier`/`challenge`/`state`, authorize URL,
+redirect parsing, RFC 7636 KAT) as tested, reusable pieces. The loopback
+listener that completes the browser flow is deferred to a follow-up (B-004)
+because it cannot be verified in this environment.
+
+**Consequences.**
+
+- A working, testable sign-in path exists now, with no unusable UI code.
+- The PKCE pieces are ready to wire into the M10 login screen / a future CLI
+  subcommand without re-deriving them.
+
+

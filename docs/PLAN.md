@@ -136,7 +136,7 @@ Documentation is updated continuously:
 ## 6. Milestone checklist
 
 - [x] M0 — Workspace & scaffolding
-- [ ] M1 — Authentication
+- [x] M1 — Authentication
 - [ ] M2 — Protocol clients & session core
 - [ ] M3 — Local persistence & offline cache
 - [ ] M4 — Realtime (Trouter)

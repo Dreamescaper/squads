@@ -7,10 +7,12 @@
 //! The heavy protocol lifting lives in the vendored [`ost`] crate
 //! (`squads-protocol`); this crate wraps it into a stable, testable API for the UI.
 
+pub mod auth;
 pub mod error;
 pub mod paths;
 pub mod session;
 
+pub use auth::{AuthDriver, AuthTransport, SignInProgress, TokenKind, TokenSet};
 pub use error::{CoreError, Result};
 pub use paths::AppDirs;
 pub use session::{Session, SessionState};

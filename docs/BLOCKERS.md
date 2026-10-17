@@ -39,6 +39,36 @@ Teams endpoints are undocumented and change without notice. Region routing
 **Mitigation:** reuse the protocol core's existing fallbacks; keep protocol-touching code
 behind `squads-core`; record any known-fragile areas in this file.
 
+### B-004 — Browser PKCE flow has no loopback listener yet (M1)
+
+M1 landed the PKCE primitives (verifier/challenge/`state`, authorize URL,
+redirect parsing) but not the local loopback HTTP listener that receives the
+browser redirect and completes the authorization-code exchange. A loopback
+listener plus a real browser and tenant cannot be exercised in this headless,
+credential-free environment.
+
+**Impact:** browser-based sign-in is not available; the supported sign-in path is
+device code (which is fully implemented and tested).
+
+**Mitigation:** the PKCE pieces are unit-tested and ready to wire up; add the
+loopback listener and code redemption as an M10 login-screen follow-up (see
+PROGRESS "M1 — Authentication").
+
+### B-005 — `exchange_skype_token` is not unit-testable (M1)
+
+The vendored `ost::auth::skype::exchange_skype_token` always uses the protocol
+crate's private shared HTTP client and hard-coded `authsvc` URLs (work + personal
+hosts), so it cannot be redirected to a local stub without modifying
+`crates/squads-protocol` (which is off-limits).
+
+**Impact:** the Skype-ish exchange step is covered only by the fake transport in
+tests; the real HTTP call is exercised only against a live tenant.
+
+**Mitigation:** `HttpTransport::exchange_skype` is a thin adapter; all flow logic
+around it (ordering, `regionGtms` capture, refresh dependency on the Spaces
+token) is covered offline. If the vendored crate ever exposes an injectable
+client, add a local stub test.
+
 ## Deferred work
 
 ### D-001 — Third-party Teams app hosting (TeamsJS/web frames)

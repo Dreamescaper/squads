@@ -6,8 +6,8 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started · ⛔ blocked (see [BLO
 
 | # | Milestone | Status | Notes |
 |---|---|---|---|
-| M0 | Workspace & scaffolding | 🟡 | Workspace + 3 crates; vendored protocol core; docs. |
-| M1 | Authentication | ⬜ | |
+| M0 | Workspace & scaffolding | ✅ | Workspace + 3 crates; vendored protocol core; docs. |
+| M1 | Authentication | ✅ | Device-code flow, five-token model, 0600 file store, testable `AuthTransport`. |
 | M2 | Protocol clients & session core | ⬜ | |
 | M3 | Local persistence & offline cache | ⬜ | |
 | M4 | Realtime (Trouter) | ⬜ | |
@@ -44,3 +44,59 @@ core, a UI-free core crate, and the egui app; document the architecture.
 **Decisions.** ADR-001 (reuse `ost`), ADR-002 (workspace), ADR-006 (egui over GPUI).
 
 **Blockers.** B-001 (headless: GUI cannot run), B-002 (no live tenant).
+
+---
+
+## M1 — Authentication
+
+**Goal.** Sign a user in against Azure AD, mint the full Teams token set and
+persist it securely, without letting the network leak into the UI or the tests.
+
+**Landed.** New module `crates/squads-core/src/auth/`:
+
+- `tokens` — the five-token model. `StoredToken` (`token` + absolute
+  `expires_at`, five-minute refresh skew), `TokenKind`
+  (`Spaces`/`Skype`/`Graph`/`Ic3`/`Recorder`), and `TokenSet` (refresh token,
+  tenant, `region_gtms`, all five tokens) with per-kind accessors,
+  `expired_kinds()`/`needs_refresh()` and a **redacting `Debug`** that never
+  prints token contents.
+- `pkce` — RFC 7636 helper: CSPRNG verifier (43 chars from 32 random bytes),
+  `BASE64URL-NOPAD(SHA256(verifier))` challenge, random `state`, authorize-URL
+  builder and redirect parser (`code`/`state` and `error`/`error_description`).
+  Includes the RFC 7636 Appendix B known-answer test.
+- `device_code` — RFC 8628 types: `DeviceCodeStart`, `TokenResponse` and
+  `PollResult` with correct mapping of `authorization_pending`, `slow_down`,
+  `authorization_declined`/`access_denied`, `expired_token` (and a hard error
+  for `bad_verification_code`).
+- `store` — `TokenStore` trait; `FileTokenStore` (default; one JSON file per
+  profile under `AppDirs::config`, atomic temp-file+rename, forced mode `0600`
+  on Unix) and `MemoryTokenStore`. `KeyringTokenStore` is documented but
+  deferred behind a default-off `keyring` feature (ADR-008).
+- `flow` — `AuthTransport` (native async-in-trait, every future `Send`) +
+  `HttpTransport` (real AAD/`authsvc`/refresh grants, reusing the protocol
+  crate's shared HTTP pool) + `AuthDriver` orchestrating
+  device-code → poll → Skype exchange → Graph/IC3/Recorder grants → persist, and
+  a `refresh()` that re-mints **only** the expired tokens. Progress is emitted as
+  `SignInProgress` values (no stdout).
+- `session` — wired in: `restore()`, `begin_sign_in(use_personal)`,
+  `begin_sign_in_with_driver(..)` (fake transports), `poll_sign_in()`,
+  `sign_out()`, `mark_ready()`, `profile()` and `tokens()`. Sign-in runs on a
+  spawned task and reports progress over an `mpsc` channel.
+
+**Decisions.** ADR-007 (async-in-trait transport for offline tests), ADR-008
+(file store default, keyring behind a feature), ADR-009 (device-code first, PKCE
+later).
+
+**How to verify manually** (real tenant; not runnable in this headless env):
+
+1. `cargo test -p squads-core` — 43 offline unit tests.
+2. On a machine with a browser, from a scratch binary or `squads-cli`, run the
+   device-code flow; AAD prints a code + `https://microsoft.com/devicelogin`.
+   Complete it and confirm `~/.config/squads/tokens.json` is created with mode
+   `600` (`stat -c '%a' …`) and contains `spaces`/`skype`/`graph`/`ic3`/`recorder`.
+3. Re-run after the access tokens expire (or edit `expires_at`) and confirm only
+   expired entries change.
+
+**Blockers.** B-002 (no live tenant here), B-004 (browser PKCE loopback listener
+not implemented yet), B-005 (`exchange_skype_token` uses the vendored client, so
+that one call is not unit-testable).

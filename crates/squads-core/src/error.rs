@@ -30,6 +30,11 @@ pub enum CoreError {
     #[error("not signed in")]
     NotSignedIn,
 
+    /// An authentication/OAuth failure. Carries AAD error codes and short
+    /// descriptions only — never token values.
+    #[error("auth error: {0}")]
+    Auth(String),
+
     /// The session is not ready to serve the request yet.
     #[error("session not ready: {0}")]
     NotReady(String),

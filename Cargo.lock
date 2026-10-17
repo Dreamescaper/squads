@@ -3672,15 +3672,20 @@ name = "squads-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "directories 6.0.0",
  "futures",
+ "getrandom 0.2.17",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "squads-protocol",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
