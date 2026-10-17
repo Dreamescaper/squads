@@ -1728,3 +1728,99 @@ ones:
   the roster is in-process only (B-007 still applies).
 - B2b (folders, pinned messages) is a separate, additive change to the same
   `api`/`store`/app surfaces.
+
+---
+
+## ADR-039 — Folders & pins: `chats.folder_id` + a pin-membership table (schema v11), and the Graph-vs-thread pin sources
+
+**Status:** accepted (B2b)
+
+**Context.** Backlog item **B2b** adds the last chat-management surface: **chat
+folders** (read the folder list, file a chat into one, and filter the chat list
+by folder) and **pinned messages** (list a chat's server-side pins, jump to one,
+unpin). Four questions had to be settled: where the folder read/move write, how
+folder membership is modelled, where pins come from, and where the state lives.
+
+The vendored surfaces:
+
+- **Folders.** `conversation_folders_data(bearer)` GETs a **fixed CSA URL**
+  (`https://teams.microsoft.com/api/csa/api/v1/teams/users/me/conversationFolders?…`)
+  through the process-wide `shared_http()` client — it does **not** take the
+  `TeamsClient`, so it is **not redirectable** to a local stub (unlike every
+  other lane). `conversation_folder_move_with_client(client, bearer, chat, target)`
+  does a hierarchy GET, one POST of the pure `folder_move_actions`/
+  `folder_move_body` edits, then a re-read. The parser **drops** the
+  server-generated views (`SYSTEM_FOLDER_TYPES`), so what comes back is
+  Favorites + user folders — the folders a chat can be moved into.
+- **Pins.** `chat_pinned_messages_data(client, chat)` reads the **chat-service**
+  thread properties (`GET /v1/threads/{id}?view=msnp24Equivalent`, skypetoken)
+  and parses tolerantly (`parse_thread_pins`), filling a bare pin's
+  sender/preview/time from its per-message GET. The Graph
+  `pinnedMessages?$expand=message` fallback needs `Chat.Read`, which the Teams
+  token lacks (expected 403 live), so `pick_pins` prefers the chat-service pins.
+  **Unpinning** is Graph `DELETE /chats/{id}/pinnedMessages/{pinId}`, which needs
+  `ChatMessage.ReadWrite`/`Chat.ReadWrite` — also not granted — so
+  `chat_unpin_message_with_client` **refuses before any network**.
+
+**Decision.**
+
+1. **Wrappers.** `ApiClient` gains `conversation_folders()`,
+   `move_chat_to_folder(chat_id, target)`, `pinned_messages(chat_id)` and
+   `unpin_message(chat_id, message_id)`, in the existing instrumented (redacting
+   `Debug`, request counter, `tracing` spans) style. The folder lane needs the
+   bearer the vendored call takes as a parameter, so `ApiClient` now **retains
+   the skype token** it was built with (the same host/token pair `csa_get`
+   uses for the chat list) and refuses with `NotSignedIn` when there is none.
+   The B2b pure helpers/types are re-exported.
+2. **Models.** `model::ChatFolder` (id/name/folder_type, `is_system` computed
+   from `SYSTEM_FOLDER_TYPES`, `item_ids`) and `model::PinnedMessage`
+   (chat_id/message_id/sender/preview/time/pinned_at/by/graph_pin_id, plus an
+   `Option<Message>` resolved from the store on read — **not** persisted).
+3. **Services.** A small `Folders { profile, Arc<Store>, Arc<ApiClient> }` and
+   `Pins { … }`, mirroring `Chats`/`People`. `Folders::folders` fetches + caches;
+   `cached_folders` is local-only; `move_to_folder` is **local-first** (the
+   membership is written immediately so the tabs update offline; the server move
+   is best-effort and re-caches the server's state on success — the folder lane
+   cannot be stubbed and, offline, always fails, exactly like B2a's server mute).
+   `Pins::pinned` fetches + caches + resolves messages; `cached_pinned` is
+   local-only; `unpin` drops the local pin and treats the (always-refusing)
+   server call as best-effort. `Session::folders()` / `Session::pins()`.
+4. **Store (schema v11).** `chat_folders(id, profile, name, folder_type,
+   is_system, position)` holds the folder list; **membership lives on a nullable
+   `chats.folder_id`** rather than a join table, because a chat is in **at most
+   one** movable folder (`folder_move_actions` removes it from every other one
+   when it adds it to the target) — a join table would model an impossible
+   state. `Store::chat_folders` rebuilds each folder's `item_ids` from that
+   column, so the two can never disagree. `pinned_messages(chat_id, message_id,
+   profile)` holds the pin **membership metadata** only; the body is resolved
+   from `messages`. The migration is `CREATE TABLE/INDEX IF NOT EXISTS` + a
+   guarded `ALTER TABLE chats ADD COLUMN folder_id`; `SCHEMA_VERSION = 11`,
+   forward-only, re-entrant, a newer `user_version` still a hard error.
+   `chats.muted`/`server_muted`/`hidden` are untouched.
+5. **App.** The chat list gets **folder tabs** ("All" + one per folder, with
+   counts) filtering the list, and a **Move to folder** row in the B2a context
+   menu; the conversation info pane gets a **pinned-messages panel** (sender,
+   preview, time) whose **Go** reuses B1's jump/highlight and whose **Unpin**
+   removes the pin. All of it rides the existing `AppRuntime`/`AppEvent` bridge
+   and repaints only when something changed (ADR-027).
+
+**Consequences.**
+
+- The pin lane is fully offline-testable (the chat-service thread GET is
+  stubbable): the request line, the tolerant parse of both the thread and Graph
+  shapes, the fill-from-message pass, the store round-trip and unpin are pinned
+  by tests.
+- **The folder lane cannot be stubbed offline** (the vendored GET/POST use a
+  fixed CSA URL and `shared_http()`); its pure shapes (`conversation_folders_url`,
+  `folder_move_actions`, `folder_move_body`, `parse_conversation_folders`) are
+  pinned, and the service's **local-first** behaviour is tested, but the live
+  request is unverified — recorded as **U-012**.
+- **Server unpin is unavailable with the Teams sign-in** (Graph `Chat.ReadWrite`
+  not granted); `Pins::unpin` therefore removes the pin **locally** and logs the
+  refused server call. A live tenant with a suitably-scoped token changes only
+  that one branch.
+- The Graph-vs-thread pin-source split is explicit: the chat-service thread
+  properties are authoritative today; `pick_pins`/`PinSource` keep the Graph
+  fallback ready for a token that can read it.
+- No encryption change: folder names and pin previews join chat content in the
+  plaintext store (B-007).

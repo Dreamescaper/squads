@@ -692,3 +692,45 @@ policy. The following cannot be exercised here (B-002 — no live tenant):
 **Mitigation:** keep every call behind `ApiClient`/`Chats` so a live fix is
 contained; the deterministic stub tests pin the exact paths/bodies/auth so a
 regression is caught; the local flags remain the routing truth regardless.
+
+### U-012 — B2b folders & pins not exercised offline (folder lane unstubbable)
+
+B2b's **pinned-messages** lane is fully tested offline (the chat-service thread
+`GET` is stubbable; the tolerant thread/Graph parsers, the fill-from-message
+pass, the store round-trip and unpin are all pinned). The following cannot be
+exercised here (B-002 — no live tenant):
+
+- **The folder lane cannot be pointed at a stub at all.** The vendored
+  `conversation_folders_data` and `conversation_folder_move_with_client` build a
+  **fixed CSA URL** (`https://teams.microsoft.com/api/csa/api/v1/teams/users/me/conversationFolders?…`)
+  and send it through the process-wide `shared_http()` client — they do not take
+  the `TeamsClient`, so there is no injectable base URL (unlike every other
+  lane). The wrapper's **pure** shapes (`conversation_folders_url`,
+  `folder_move_actions`, `folder_move_body`, `parse_conversation_folders`) and
+  its pre-network validation (missing bearer → `NotSignedIn`) are tested, and
+  `Folders::move_to_folder`'s **local-first** behaviour is tested, but the real
+  request is unverified.
+- **Live folder read/move acceptance.** Whether the CSA service accepts the
+  skype token as the Bearer (the `csa_get` precedent for the chat list suggests
+  it does, but it is unproven), returns the folder shapes we parse, and applies
+  the `AddItem`/`RemoveItem` edits (and answers with the post-move hierarchy) is
+  assumed from the vendored crate + stubs.
+- **Server unpin is unavailable.** Graph `DELETE /chats/{id}/pinnedMessages/{pinId}`
+  needs `ChatMessage.ReadWrite`/`Chat.ReadWrite`, which the Teams sign-in does
+  not carry, so `chat_unpin_message_with_client` **refuses before any network**
+  and `Pins::unpin` removes the pin **locally** only. A suitably-scoped token
+  would change that one branch.
+- **Live pin read.** The chat-service thread-property shape is undocumented; the
+  parser is deliberately tolerant, but whether a real thread carries the pins
+  (and in which key) is unproven. The Graph fallback is expected to 403
+  (`Chat.Read` not granted) and is retained for a scoped token.
+
+**Impact:** folder correctness and the pin read/unpin are assumed from the
+vendored crate + stubs, not proven; the pin lane's *shape* is at least pinned
+offline, the folder lane's is not.
+
+**Mitigation:** keep both behind `ApiClient`/`Folders`/`Pins`; the folder service
+is **local-first** so the tabs and moves work offline regardless of the server;
+if the vendored crate ever exposes an injectable client/base for the folder lane
+(or the app routes it through `TeamsClient`), the stub tests can be added with no
+caller change.

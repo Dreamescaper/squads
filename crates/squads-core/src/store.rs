@@ -47,6 +47,9 @@
 //! * **v10** (B2a) — `chats.hidden` and `chats.server_muted`, the server-side
 //!   hide/mute state (the local `chats.muted` stays the notification-routing
 //!   truth). See ADR-038.
+//! * **v11** (B2b) — `chat_folders`, `pinned_messages` and `chats.folder_id`,
+//!   the chat-folder list, the pinned-message membership and the folder a chat
+//!   is filed under. See ADR-039.
 //!
 //! ## Who writes what
 //!
@@ -64,8 +67,10 @@
 //! with [`Store::upcoming_meetings`]. B2a's `Chats` service upserts a created
 //! chat and drops a left one (`delete_chat`), and mirrors the server mute/hide
 //! state with [`Store::set_chat_server_muted`] / [`Store::set_chat_hidden`]
-//! (the local `chats.muted` routing flag is unchanged). Nothing in this module
-//! talks to the network.
+//! (the local `chats.muted` routing flag is unchanged). B2b's `Folders`/`Pins`
+//! services cache folders with [`Store::replace_chat_folders`] (membership on
+//! `chats.folder_id`) and pins with [`Store::replace_chat_pins`] /
+//! [`Store::remove_pin`]. Nothing in this module talks to the network.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -77,8 +82,8 @@ use serde::{Deserialize, Serialize};
 use crate::auth::tokens::now_unix;
 use crate::error::{CoreError, Result};
 use crate::model::{
-    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, FileEntry, Meeting, Message, Reaction,
-    SendState, Team, TeamMember,
+    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, ChatFolder, FileEntry, Meeting,
+    Message, PinnedMessage, Reaction, SendState, Team, TeamMember,
 };
 
 /// Newest schema version this build knows how to create/migrate to.
@@ -96,7 +101,8 @@ use crate::model::{
 /// * **v9** (B1) — `messages(profile, timestamp)`, the message-search index.
 /// * **v10** (B2a) — `chats.hidden` and `chats.server_muted`, the server-side
 ///   hide/mute state (the local `chats.muted` remains the routing flag).
-pub const SCHEMA_VERSION: i32 = 10;
+/// * **v11** (B2b) — `chat_folders`, `pinned_messages` and `chats.folder_id`.
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// Timeout for a busy database before `SQLITE_BUSY` is surfaced.
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -309,6 +315,50 @@ CREATE INDEX IF NOT EXISTS idx_meetings_start
 const MIGRATION_V9_INDEX: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_messages_profile_time
     ON messages (profile, timestamp);
+"#;
+
+/// v11 schema: chat folders, pinned-message membership and the chat's folder
+/// (backlog item **B2b**). Plain `CREATE TABLE/INDEX IF NOT EXISTS`, so the
+/// migration is re-entrant; `chats.folder_id` is added separately in
+/// [`migrate_v11`] because `ALTER TABLE … ADD COLUMN` has no `IF NOT EXISTS`.
+///
+/// `chat_folders` is keyed `(id, profile)` (the store convention). The folder's
+/// **membership** is not duplicated here: it lives on `chats.folder_id`, a
+/// nullable column that models the at-most-one-movable-folder invariant the
+/// vendored `folder_move_actions` enforces. [`Store::chat_folders`] rebuilds
+/// each folder's `item_ids` from that column, so the two can never disagree.
+///
+/// `pinned_messages` is keyed `(chat_id, message_id, profile)` and stores the
+/// pin's **membership metadata** only (sender/preview/time/pinned-at/by and the
+/// Graph pin id); the message body is resolved from `messages` on read.
+const MIGRATION_V11_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS chat_folders (
+    id          TEXT NOT NULL,
+    profile     TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    folder_type TEXT NOT NULL DEFAULT '',
+    is_system   INTEGER NOT NULL DEFAULT 0,
+    position    INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (id, profile)
+);
+
+CREATE TABLE IF NOT EXISTS pinned_messages (
+    chat_id      TEXT NOT NULL,
+    message_id   TEXT NOT NULL,
+    profile      TEXT NOT NULL,
+    sender       TEXT,
+    preview      TEXT,
+    time         TEXT,
+    pinned_at    TEXT,
+    pinned_by    TEXT,
+    graph_pin_id TEXT,
+    updated_at   INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id, profile)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pinned_messages_chat
+    ON pinned_messages (profile, chat_id);
 "#;
 
 /// One local account record.
@@ -989,6 +1039,287 @@ impl Store {
             .optional()?
             .flatten();
         Ok(value.map(|v| v != 0))
+    }
+
+    // ----- chat folders (B2b) ---------------------------------------------
+
+    /// Replace the cached folder set for `profile` with `folders` and rebuild
+    /// every chat's folder membership from them (B2b, schema v11).
+    ///
+    /// The server always returns the **whole** folder list, so this is a
+    /// replace, not a merge: folder rows absent from `folders` are dropped, and
+    /// `chats.folder_id` is cleared and re-derived from each folder's
+    /// `item_ids`. A chat can be in at most one movable folder (the vendored
+    /// `folder_move_actions` enforces it), so a single nullable column is the
+    /// membership model; the folder's own `item_ids` are rebuilt on read from
+    /// that column (see [`Store::chat_folders`]), so the two cannot disagree.
+    /// Returns the number of folders written.
+    pub fn replace_chat_folders(&self, profile: &str, folders: &[ChatFolder]) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now_unix() as i64;
+        // Drop folder rows no longer present.
+        {
+            let keep: Vec<String> = folders.iter().map(|f| f.id.clone()).collect();
+            let mut stmt = tx.prepare("SELECT id FROM chat_folders WHERE profile = ?1")?;
+            let existing: Vec<String> = stmt
+                .query_map(params![profile], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            drop(stmt);
+            for id in existing {
+                if !keep.contains(&id) {
+                    tx.execute(
+                        "DELETE FROM chat_folders WHERE id = ?1 AND profile = ?2",
+                        params![id, profile],
+                    )?;
+                }
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO chat_folders
+                    (id, profile, name, folder_type, is_system, position, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id, profile) DO UPDATE SET
+                    name = excluded.name,
+                    folder_type = excluded.folder_type,
+                    is_system = excluded.is_system,
+                    position = excluded.position,
+                    updated_at = MAX(chat_folders.updated_at, excluded.updated_at)",
+            )?;
+            for (position, folder) in folders.iter().enumerate() {
+                stmt.execute(params![
+                    folder.id,
+                    profile,
+                    folder.name,
+                    folder.folder_type,
+                    folder.is_system as i64,
+                    position as i64,
+                    now
+                ])?;
+            }
+        }
+        // Rebuild membership: clear, then file each listed chat.
+        tx.execute(
+            "UPDATE chats SET folder_id = NULL WHERE profile = ?1",
+            params![profile],
+        )?;
+        for folder in folders {
+            for item in &folder.item_ids {
+                tx.execute(
+                    "UPDATE chats SET folder_id = ?1 WHERE id = ?2 AND profile = ?3",
+                    params![folder.id, item, profile],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(folders.len())
+    }
+
+    /// The cached folders for `profile`, in server order, each with its
+    /// `item_ids` rebuilt from `chats.folder_id` (B2b).
+    pub fn chat_folders(&self, profile: &str) -> Result<Vec<ChatFolder>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, folder_type, is_system
+             FROM chat_folders
+             WHERE profile = ?1
+             ORDER BY position ASC, id ASC",
+        )?;
+        let mut folders = stmt
+            .query_map(params![profile], |row| {
+                Ok(ChatFolder {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    folder_type: row.get(2)?,
+                    is_system: row.get::<_, i64>(3)? != 0,
+                    item_ids: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        // Rebuild each folder's membership from the chats' `folder_id` (one
+        // statement on the same connection; never re-lock — see ADR-012).
+        let mut items = conn.prepare(
+            "SELECT id FROM chats
+             WHERE profile = ?1 AND folder_id = ?2
+             ORDER BY last_message_time DESC, id ASC",
+        )?;
+        for folder in &mut folders {
+            let id = folder.id.clone();
+            folder.item_ids = items
+                .query_map(params![profile, id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+        }
+        Ok(folders)
+    }
+
+    /// One cached folder by id, with its `item_ids` rebuilt (B2b).
+    pub fn chat_folder(&self, profile: &str, id: &str) -> Result<Option<ChatFolder>> {
+        Ok(self
+            .chat_folders(profile)?
+            .into_iter()
+            .find(|folder| folder.id == id))
+    }
+
+    /// The ids of the chats filed under `folder_id` for `profile`, in the chat
+    /// list's recency order (B2b).
+    pub fn chats_in_folder(&self, profile: &str, folder_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM chats
+             WHERE profile = ?1 AND folder_id = ?2
+             ORDER BY last_message_time DESC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![profile, folder_id], |row| row.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for id in rows {
+            ids.push(id?);
+        }
+        Ok(ids)
+    }
+
+    /// Set (or clear) the folder a chat is filed under (B2b). Setting a folder
+    /// implicitly leaves any previous one (the at-most-one invariant). Returns
+    /// whether a matching `(id, profile)` chat row existed.
+    pub fn set_chat_folder(
+        &self,
+        profile: &str,
+        chat_id: &str,
+        folder_id: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE chats SET folder_id = ?1 WHERE id = ?2 AND profile = ?3",
+            params![folder_id, chat_id, profile],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The folder id one chat is filed under, if any (B2b).
+    pub fn chat_folder_id(&self, profile: &str, chat_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        let value = conn
+            .query_row(
+                "SELECT folder_id FROM chats WHERE id = ?1 AND profile = ?2",
+                params![chat_id, profile],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(value)
+    }
+
+    // ----- pinned messages (B2b) ------------------------------------------
+
+    /// Replace the cached pins for one chat with `pins` (B2b, schema v11).
+    ///
+    /// The server returns the chat's **whole** pin set, so this is a replace:
+    /// pins absent from `pins` are dropped and the rest are upserted. Only the
+    /// membership metadata is persisted ([`PinnedMessage::message`] is resolved
+    /// from `messages` on read). Returns the number of pins written.
+    pub fn replace_chat_pins(
+        &self,
+        profile: &str,
+        chat_id: &str,
+        pins: &[PinnedMessage],
+    ) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now_unix() as i64;
+        {
+            let keep: Vec<String> = pins.iter().map(|p| p.message_id.clone()).collect();
+            let mut stmt = tx.prepare(
+                "SELECT message_id FROM pinned_messages WHERE chat_id = ?1 AND profile = ?2",
+            )?;
+            let existing: Vec<String> = stmt
+                .query_map(params![chat_id, profile], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            drop(stmt);
+            for id in existing {
+                if !keep.contains(&id) {
+                    tx.execute(
+                        "DELETE FROM pinned_messages
+                         WHERE chat_id = ?1 AND message_id = ?2 AND profile = ?3",
+                        params![chat_id, id, profile],
+                    )?;
+                }
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO pinned_messages
+                    (chat_id, message_id, profile, sender, preview, time,
+                     pinned_at, pinned_by, graph_pin_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(chat_id, message_id, profile) DO UPDATE SET
+                    sender = excluded.sender,
+                    preview = excluded.preview,
+                    time = excluded.time,
+                    pinned_at = excluded.pinned_at,
+                    pinned_by = excluded.pinned_by,
+                    graph_pin_id = excluded.graph_pin_id,
+                    updated_at = MAX(pinned_messages.updated_at, excluded.updated_at)",
+            )?;
+            for pin in pins {
+                stmt.execute(params![
+                    chat_id,
+                    pin.message_id,
+                    profile,
+                    pin.sender,
+                    pin.preview,
+                    pin.time,
+                    pin.pinned_at,
+                    pin.pinned_by,
+                    pin.graph_pin_id,
+                    now
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(pins.len())
+    }
+
+    /// The cached pins for one chat, newest message first (B2b). The
+    /// [`PinnedMessage::message`] field is always `None` here — the service
+    /// resolves it from `messages`.
+    pub fn pinned_messages(&self, profile: &str, chat_id: &str) -> Result<Vec<PinnedMessage>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT message_id, sender, preview, time, pinned_at, pinned_by, graph_pin_id
+             FROM pinned_messages
+             WHERE profile = ?1 AND chat_id = ?2
+             ORDER BY time DESC, message_id ASC",
+        )?;
+        let rows = stmt.query_map(params![profile, chat_id], |row| {
+            Ok(PinnedMessage {
+                chat_id: chat_id.to_string(),
+                message_id: row.get(0)?,
+                sender: row.get(1)?,
+                preview: row.get(2)?,
+                time: row.get(3)?,
+                pinned_at: row.get(4)?,
+                pinned_by: row.get(5)?,
+                graph_pin_id: row.get(6)?,
+                message: None,
+            })
+        })?;
+        let mut pins = Vec::new();
+        for pin in rows {
+            pins.push(pin?);
+        }
+        Ok(pins)
+    }
+
+    /// Remove one pin from the cache (B2b). Returns whether a pin row existed.
+    pub fn remove_pin(&self, profile: &str, chat_id: &str, message_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let removed = conn.execute(
+            "DELETE FROM pinned_messages
+             WHERE chat_id = ?1 AND message_id = ?2 AND profile = ?3",
+            params![chat_id, message_id, profile],
+        )?;
+        Ok(removed > 0)
     }
 
     /// The timestamp of the message the chat was read up to, if the horizon
@@ -1685,6 +2016,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if current < 10 {
         migrate_v10(&tx)?;
     }
+    if current < 11 {
+        migrate_v11(&tx)?;
+    }
     // Record the version *after* the DDL inside the same transaction, so a
     // crash can never leave a version marker ahead of the schema.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1793,6 +2127,20 @@ fn migrate_v10(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     }
     if !column_exists(tx, "chats", "server_muted")? {
         tx.execute_batch("ALTER TABLE chats ADD COLUMN server_muted INTEGER;")?;
+    }
+    Ok(())
+}
+
+/// Apply the v11 additions: `chat_folders`, `pinned_messages` and
+/// `chats.folder_id` (B2b).
+///
+/// The two tables are `CREATE TABLE/INDEX IF NOT EXISTS`; `folder_id` is added
+/// with a guarded `ALTER TABLE` (SQLite has no `ADD COLUMN IF NOT EXISTS`), so
+/// the migration is re-entrant even if the version marker was reset.
+fn migrate_v11(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(MIGRATION_V11_TABLES)?;
+    if !column_exists(tx, "chats", "folder_id")? {
+        tx.execute_batch("ALTER TABLE chats ADD COLUMN folder_id TEXT;")?;
     }
     Ok(())
 }
@@ -3773,5 +4121,215 @@ mod tests {
         for query in ["%", "_", "\\", "😀", "café", "%%", "__", "\\\\", "a%b_c"] {
             let _ = store.search_messages("default", query, None, 10);
         }
+    }
+
+    // ----- B2b: folders & pins ----------------------------------------------
+
+    fn folder(id: &str, name: &str, items: &[&str]) -> ChatFolder {
+        ChatFolder {
+            id: id.into(),
+            name: name.into(),
+            folder_type: "UserCreated".into(),
+            is_system: false,
+            item_ids: items.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn pin(message_id: &str, time: Option<&str>) -> PinnedMessage {
+        PinnedMessage {
+            chat_id: "c1".into(),
+            message_id: message_id.into(),
+            sender: Some("Ava".into()),
+            preview: Some(format!("pinned {message_id}")),
+            time: time.map(str::to_string),
+            pinned_at: Some("2026-01-03T00:00:00Z".into()),
+            pinned_by: Some("Bo".into()),
+            graph_pin_id: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn chat_folders_round_trip_and_track_membership() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_chats(
+                "default",
+                &[
+                    chat("c1", "One", Some("2026-01-03T00:00:00Z")),
+                    chat("c2", "Two", Some("2026-01-02T00:00:00Z")),
+                    chat("c3", "Three", Some("2026-01-01T00:00:00Z")),
+                ],
+            )
+            .unwrap();
+
+        store
+            .replace_chat_folders(
+                "default",
+                &[
+                    folder("fav", "Favorites", &["c1"]),
+                    folder("work", "Work", &["c2", "c3"]),
+                ],
+            )
+            .unwrap();
+
+        let folders = store.chat_folders("default").unwrap();
+        assert_eq!(folders.len(), 2);
+        assert_eq!(folders[0].id, "fav");
+        assert_eq!(folders[0].name, "Favorites");
+        assert_eq!(folders[0].item_ids, vec!["c1"]);
+        // Order within a folder is recency (newest first).
+        assert_eq!(folders[1].item_ids, vec!["c2", "c3"]);
+
+        // Membership is on the chat row and a chat is in at most one folder.
+        assert_eq!(
+            store.chat_folder_id("default", "c2").unwrap().as_deref(),
+            Some("work")
+        );
+        assert_eq!(
+            store.chats_in_folder("default", "work").unwrap(),
+            vec!["c2", "c3"]
+        );
+
+        // A move updates membership and the folder reads follow.
+        assert!(
+            store
+                .set_chat_folder("default", "c1", Some("work"))
+                .unwrap()
+        );
+        let folders = store.chat_folders("default").unwrap();
+        assert_eq!(folders[0].item_ids, Vec::<String>::new());
+        assert_eq!(folders[1].item_ids, vec!["c1", "c2", "c3"]);
+        // Clearing removes it from every folder.
+        store.set_chat_folder("default", "c1", None).unwrap();
+        assert!(
+            store.chat_folders("default").unwrap()[1]
+                .item_ids
+                .iter()
+                .all(|id| id != "c1")
+        );
+
+        // Replacing drops folders absent from the new set.
+        store
+            .replace_chat_folders("default", &[folder("work", "Work", &["c2"])])
+            .unwrap();
+        let folders = store.chat_folders("default").unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].id, "work");
+        assert!(store.chat_folder("default", "fav").unwrap().is_none());
+        assert!(store.chat_folder("default", "work").unwrap().is_some());
+
+        // Profile isolation.
+        assert!(store.chat_folders("work").unwrap().is_empty());
+    }
+
+    #[test]
+    fn pinned_messages_round_trip_and_remove() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .replace_chat_pins(
+                "default",
+                "c1",
+                &[
+                    pin("m1", Some("2026-01-01T00:00:00Z")),
+                    pin("m2", Some("2026-01-02T00:00:00Z")),
+                ],
+            )
+            .unwrap();
+
+        let pins = store.pinned_messages("default", "c1").unwrap();
+        assert_eq!(pins.len(), 2);
+        // Newest message first.
+        assert_eq!(pins[0].message_id, "m2");
+        assert_eq!(pins[0].sender.as_deref(), Some("Ava"));
+        assert_eq!(pins[0].preview.as_deref(), Some("pinned m2"));
+        assert_eq!(pins[0].pinned_at.as_deref(), Some("2026-01-03T00:00:00Z"));
+        assert!(pins[0].message.is_none());
+
+        // Replace drops pins absent from the new set.
+        store
+            .replace_chat_pins("default", "c1", &[pin("m1", Some("2026-01-01T00:00:00Z"))])
+            .unwrap();
+        let pins = store.pinned_messages("default", "c1").unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].message_id, "m1");
+
+        // Remove one pin; a second remove is a no-op.
+        assert!(store.remove_pin("default", "c1", "m1").unwrap());
+        assert!(!store.remove_pin("default", "c1", "m1").unwrap());
+        assert!(store.pinned_messages("default", "c1").unwrap().is_empty());
+
+        // Profile isolation.
+        assert!(store.pinned_messages("work", "c1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn v10_database_upgrades_to_v11_adding_folders_and_pins() {
+        let path = temp_path("v10-to-v11");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            // Build a genuine v10 database: v1 DDL, the v2 column + read_state,
+            // the v3/v4/v6/v7 tables, the v5 mute column, the v8 identity
+            // columns, the v9 search index, the v10 hide/server-mute columns,
+            // version marker 10, and one chat.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN send_state TEXT NOT NULL DEFAULT 'sent';",
+            )
+            .unwrap();
+            conn.execute_batch(MIGRATION_V2_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V3_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V4_TABLES).unwrap();
+            conn.execute_batch("ALTER TABLE chats ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;")
+                .unwrap();
+            conn.execute_batch(MIGRATION_V6_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V7_TABLES).unwrap();
+            conn.execute_batch("ALTER TABLE accounts ADD COLUMN self_mri TEXT;")
+                .unwrap();
+            conn.execute_batch("ALTER TABLE accounts ADD COLUMN oid TEXT;")
+                .unwrap();
+            conn.execute_batch(MIGRATION_V9_INDEX).unwrap();
+            conn.execute_batch("ALTER TABLE chats ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;")
+                .unwrap();
+            conn.execute_batch("ALTER TABLE chats ADD COLUMN server_muted INTEGER;")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO chats (id, profile, name, is_group, updated_at)
+                 VALUES ('c1','default','One',0,1)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 10).unwrap();
+        }
+
+        let store = Store::open(&path).expect("open the v10 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        {
+            let conn = store.lock();
+            assert!(column_exists(&conn, "chats", "folder_id").unwrap());
+        }
+        // The pre-existing chat is unfiled; folders/pins start empty and are
+        // writable, and the chat is fileable.
+        assert_eq!(store.chat_folder_id("default", "c1").unwrap(), None);
+        assert!(store.chat_folders("default").unwrap().is_empty());
+        assert!(store.pinned_messages("default", "c1").unwrap().is_empty());
+        store
+            .replace_chat_folders("default", &[folder("fav", "Favorites", &["c1"])])
+            .unwrap();
+        store
+            .replace_chat_pins("default", "c1", &[pin("m1", None)])
+            .unwrap();
+
+        // Reopening again is a clean no-op and the state survives.
+        drop(store);
+        let store = Store::open(&path).expect("reopen v11 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            store.chat_folders("default").unwrap()[0].item_ids,
+            vec!["c1"]
+        );
+        assert_eq!(store.pinned_messages("default", "c1").unwrap().len(), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

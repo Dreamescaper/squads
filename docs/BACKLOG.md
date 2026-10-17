@@ -53,13 +53,13 @@ one opens the chat.
 
 ---
 
-## B2 — Chat management 🟡
+## B2 — Chat management ✅
 
 **Gap.** No way to start a chat, leave one, mute/hide server-side, use folders,
 or see pinned messages. (`api::chat` extras + `api::teams` member routes.)
 
 **Split into two items.** B2a (new chat, leave, mute/hide) is ✅; B2b (folders
-and pinned messages) remains.
+and pinned messages) is ✅.
 
 ### B2a — New chat, leave, mute/hide ✅
 
@@ -84,7 +84,18 @@ and muted/hidden rendering. See ADR-038 and PROGRESS (B2a).
   a chat context menu (mute / hide / leave), and muted/hidden rendering in the
   chat list.
 
-### B2b — Folders and pinned messages ⬜
+### B2b — Folders and pinned messages ✅
+
+**Landed.** `api` wrappers for `conversation_folders_data`,
+`conversation_folder_move_with_client`, `chat_pinned_messages_data` and
+`chat_unpin_message_with_client` (+ the pure folder/pin helpers re-exported);
+`model::{ChatFolder, PinnedMessage}`; a `Folders` and a `Pins` service;
+**schema v11** (`chat_folders`, `pinned_messages`, `chats.folder_id`); and the
+app's **folder tabs** (All + one per folder, with counts) filtering the chat
+list, a **Move to folder** context-menu row, and a **pinned-messages panel**
+(sender/preview/time) with jump-to-message and unpin. See ADR-039 and PROGRESS
+(B2b).
+
 - `core`: `conversation_folders_data`, `conversation_folder_move_with_client`,
   `chat_pinned_messages_data`, `chat_unpin_message_with_client`,
   `pick_pins`/`fill_pin_from_message`.

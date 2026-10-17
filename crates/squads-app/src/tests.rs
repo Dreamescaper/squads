@@ -15,7 +15,9 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 use squads_core::auth::MemoryTokenStore;
-use squads_core::model::{Channel, FileEntry, Identity, Meeting, Message, Person, SendState};
+use squads_core::model::{
+    Channel, ChatFolder, FileEntry, Identity, Meeting, Message, Person, PinnedMessage, SendState,
+};
 use squads_core::{AppDirs, Chat, Session, SessionState, Settings, Store, Team};
 
 use crate::app::{Action, Page, SquadsApp};
@@ -964,6 +966,148 @@ fn chat_context_menu_leave_confirms_first() {
             .iter()
             .any(|action| matches!(action, Action::ConfirmLeaveChat(id) if id == "c1")),
         "Confirm leave queues the leave; got {:?}",
+        harness.state().applied_actions()
+    );
+}
+
+// ----- B2b: folders & pinned messages ----------------------------------------
+
+fn folder(id: &str, name: &str, items: &[&str]) -> ChatFolder {
+    ChatFolder {
+        id: id.into(),
+        name: name.into(),
+        folder_type: "UserCreated".into(),
+        is_system: false,
+        item_ids: items.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[test]
+fn folder_tabs_filter_the_chat_list() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats(
+                "default",
+                &[chat("c1", "Alice"), chat("c2", "Bob"), chat("c3", "Carol")],
+            )
+            .expect("chats");
+        store
+            .replace_chat_folders(
+                "default",
+                &[
+                    folder("fav", "Favorites", &["c1"]),
+                    folder("work", "Work", &["c2"]),
+                ],
+            )
+            .expect("folders");
+    });
+    harness.run();
+
+    // The tabs render with their counts.
+    harness.get_by_label("All");
+    harness.get_by_label("Favorites (1)");
+    harness.get_by_label("Work (1)");
+
+    // Selecting a folder filters the list to its chats.
+    harness.get_by_label("Favorites (1)").click();
+    harness.run();
+    assert_eq!(harness.state().selected_folder(), Some("fav"));
+    assert!(harness.state().chat_in_selected_folder("c1"));
+    assert!(!harness.state().chat_in_selected_folder("c2"));
+    harness.get_by_label("Alice");
+    assert!(
+        harness.query_by_label("Bob").is_none(),
+        "a chat outside the folder is filtered out of the list"
+    );
+
+    // "All" restores every chat.
+    harness.get_by_label("All").click();
+    harness.run();
+    assert_eq!(harness.state().selected_folder(), None);
+    harness.get_by_label("Bob");
+    harness.get_by_label("Carol");
+}
+
+#[test]
+fn pinned_panel_renders_pins_and_unpin_removes_one() {
+    let (mut harness, store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+        store
+            .upsert_messages("default", &[message("c1", "m1", "Alice", "ship it", false)])
+            .expect("messages");
+        store
+            .replace_chat_pins(
+                "default",
+                "c1",
+                &[PinnedMessage {
+                    chat_id: "c1".into(),
+                    message_id: "m1".into(),
+                    sender: Some("Alice".into()),
+                    preview: Some("pinned note".into()),
+                    time: Some("2026-01-02T09:30:00Z".into()),
+                    pinned_at: None,
+                    pinned_by: None,
+                    graph_pin_id: None,
+                    message: None,
+                }],
+            )
+            .expect("pins");
+    });
+    harness.run();
+
+    // Open the chat and its info pane.
+    harness.get_by_label("Alice").click();
+    harness.run();
+    harness.get_by_label("Info").click();
+    harness.run();
+
+    // The pin renders (sender + preview) with its jump/unpin affordances.
+    harness.get_by_label("Pinned messages");
+    harness.get_by_label("pinned note");
+    harness.get_by_label("Go");
+    harness.get_by_label("Unpin");
+
+    // Unpin drops it locally.
+    harness.get_by_label("Unpin").click();
+    harness.run();
+    assert!(
+        harness.state().applied_actions().iter().any(
+            |action| matches!(action, Action::UnpinMessage { message_id, .. } if message_id == "m1")
+        ),
+        "expected an UnpinMessage action; got {:?}",
+        harness.state().applied_actions()
+    );
+    assert!(harness.state().pins().is_empty());
+    assert!(store.pinned_messages("default", "c1").unwrap().is_empty());
+    harness.get_by_label("No pinned messages.");
+}
+
+#[test]
+fn moving_the_selected_chat_into_a_folder_queues_the_action() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+        store
+            .replace_chat_folders("default", &[folder("work", "Work", &[])])
+            .expect("folders");
+    });
+    harness.run();
+
+    // The context menu offers the folder; picking it queues the move.
+    harness.get_by_label("...").click();
+    harness.run();
+    harness.get_by_label("Work").click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .applied_actions()
+            .iter()
+            .any(|action| matches!(action, Action::MoveChatToFolder { folder_id, .. } if folder_id == "work")),
+        "expected a MoveChatToFolder action; got {:?}",
         harness.state().applied_actions()
     );
 }

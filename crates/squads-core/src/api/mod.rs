@@ -72,6 +72,16 @@
 //! mute/hide ([`ApiClient::set_chat_muted`], [`ApiClient::set_chat_hidden`])
 //! write conversation properties; the roster ([`ApiClient::chat_members`]) is
 //! the chat-service thread members. See [`crate::Chats`].
+//!
+//! **Folders & pinned messages (B2b)** are two more lanes. Chat **folders**
+//! ([`ApiClient::conversation_folders`], [`ApiClient::move_chat_to_folder`])
+//! ride the **CSA** host with the skype token as a Bearer; the move is a
+//! hierarchy GET + a pure-edit POST. **Pins** ([`ApiClient::pinned_messages`])
+//! read the **chat-service** thread properties (the Graph `pinnedMessages`
+//! fallback needs `Chat.Read` and is expected to 403 live); unpinning
+//! ([`ApiClient::unpin_message`]) is a Graph `DELETE` the Teams token is not
+//! granted, so it refuses before any network. See [`crate::Folders`] /
+//! [`crate::Pins`].
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -151,6 +161,27 @@ pub use ost::api::{
     parse_created_chat, parse_graph_chat_members, parse_thread_members, thread_create_url,
 };
 
+/// Protocol types and pure helpers surfaced by the **B2b** folders & pinned
+/// messages (chat folders + server-side pins). Re-exported so
+/// [`Folders`](crate::Folders) / [`Pins`](crate::Pins) and the tests can pin the
+/// request/response shapes without reaching into the vendored crate.
+///
+/// **Folders** ride the CSA host (`conversation_folders_url`) with the skype
+/// token as a Bearer (the same host/token pair `csa_get` uses); the move is a
+/// GET (folder hierarchy version + membership) then a POST of the pure
+/// [`folder_move_actions`] / [`folder_move_body`] edits. **Pins** read the
+/// chat-service thread properties (`thread_pins_url`) and fall back to Graph
+/// `pinnedMessages` ([`graph_pins_path`]); the Graph read needs `Chat.Read`,
+/// which the Teams token lacks, so it is expected to 403 live. Unpinning is
+/// Graph `DELETE` ([`graph_unpin_path`]) and is **not granted** to the Teams
+/// token — [`chat_unpin_message_with_client`] refuses before any network.
+pub use ost::api::{
+    CHATSVCAGG_SCOPE, ConversationFolder, PinSource, PinnedRef, SYSTEM_FOLDER_TYPES,
+    conversation_folders_url, fill_pin_from_message, folder_move_actions, folder_move_body,
+    graph_pins_path, graph_unpin_path, parse_conversation_folders, parse_graph_pins,
+    parse_thread_pins, pick_pins, thread_pins_url,
+};
+
 use crate::auth::tokens::{StoredToken, TokenSet};
 use crate::error::Result;
 use crate::model::SharedLink;
@@ -222,6 +253,13 @@ pub fn media_auth_headers(url: &str, token: &str) -> Vec<(&'static str, String)>
 pub struct ApiClient {
     client: TeamsClient,
     region_gtms: serde_json::Value,
+    /// The skype token this client was built with, when one was available.
+    ///
+    /// The folder lane (B2b) posts to the CSA host with the skype token as a
+    /// Bearer (the vendored `conversation_folders_data` takes the bearer as a
+    /// parameter because it does not use the client transport); retaining it
+    /// here lets [`ApiClient::conversation_folders`] keep a no-argument shape.
+    skype_token: Option<String>,
     /// Number of high-level calls issued (list_chats etc.).
     requests: AtomicU64,
 }
@@ -236,9 +274,11 @@ impl ApiClient {
     /// region overrides). Offline: no request is made here.
     pub fn from_config(config: Config) -> Self {
         let region_gtms = config.get_region_gtms().unwrap_or(serde_json::Value::Null);
+        let skype_token = config.get_skype_token().map(|token| token.token);
         Self {
             client: TeamsClient::from_config(config),
             region_gtms,
+            skype_token,
             requests: AtomicU64::new(0),
         }
     }
@@ -1347,6 +1387,107 @@ impl ApiClient {
         tracing::debug!(count = members.len(), call, "listed chat members");
         Ok(members)
     }
+
+    // ----- B2b: folders & pinned messages ---------------------------------
+
+    /// The signed-in user's chat **folders** (Favorites + user-created; the
+    /// server-generated views are dropped by the vendored parser).
+    ///
+    /// Wraps the vendored `conversation_folders_data`, which posts to the CSA
+    /// host ([`conversation_folders_url`]) with the **skype token** as a Bearer
+    /// (the same host/token pair `csa_get` uses for the chat list). It is a
+    /// standalone `reqwest` call in the vendored crate, so this needs the token
+    /// retained on the client ([`ApiClient::skype_token`]); a client built
+    /// without one is refused before any network. See [`Folders`](crate::Folders).
+    pub async fn conversation_folders(&self) -> Result<Vec<ConversationFolder>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.conversation_folders",
+            call
+        );
+        let bearer = self
+            .skype_token
+            .as_deref()
+            .ok_or_else(|| crate::error::CoreError::NotSignedIn)?;
+        let folders = ost::api::conversation_folders_data(bearer)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = folders.len(), call, "listed conversation folders");
+        Ok(folders)
+    }
+
+    /// Move `chat_id` into `target` (a folder id; blank = out of every folder)
+    /// and return the folders after the move.
+    ///
+    /// Wraps the vendored `conversation_folder_move_with_client`: a fresh GET of
+    /// the folder hierarchy, one POST of the pure [`folder_move_actions`] /
+    /// [`folder_move_body`] edits, then a re-read. A blank chat id or a missing
+    /// skype token is refused before any network; the vendored call checks that
+    /// the answer shows the chat where it was asked to go.
+    pub async fn move_chat_to_folder(
+        &self,
+        chat_id: &str,
+        target: &str,
+    ) -> Result<Vec<ConversationFolder>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.move_chat_to_folder",
+            call
+        );
+        let bearer = self
+            .skype_token
+            .as_deref()
+            .ok_or(crate::error::CoreError::NotSignedIn)?;
+        let folders =
+            ost::api::conversation_folder_move_with_client(&self.client, bearer, chat_id, target)
+                .instrument(span)
+                .await?;
+        tracing::debug!(count = folders.len(), call, "moved chat to folder");
+        Ok(folders)
+    }
+
+    /// The server-side **pinned messages** of `chat_id`, with where they came
+    /// from.
+    ///
+    /// Wraps the vendored `chat_pinned_messages_data`: it reads the chat-service
+    /// thread properties (skypetoken) and returns chat-service pins. The Graph
+    /// `pinnedMessages` fallback needs `Chat.Read`, which the Teams token lacks
+    /// (expected 403 live), so in practice [`PinSource::ChatService`] is what
+    /// comes back. A blank/unsafe chat id is rejected before any network.
+    pub async fn pinned_messages(&self, chat_id: &str) -> Result<(PinSource, Vec<PinnedRef>)> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.pinned_messages", call);
+        let (source, pins) = ost::api::chat_pinned_messages_data(&self.client, chat_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = pins.len(), ?source, call, "listed pinned messages");
+        Ok((source, pins))
+    }
+
+    /// Unpin one message from `chat_id` on the server.
+    ///
+    /// Wraps the vendored `chat_unpin_message_with_client`, which **refuses
+    /// before any network**: Graph `DELETE /chats/{id}/pinnedMessages/{pinId}`
+    /// needs `Chat.ReadWrite`, which the Teams sign-in does not carry, and the
+    /// chat-service thread-property write has no verified unpin shape. A
+    /// blank/unsafe chat or pin id is rejected first. [`Pins::unpin`](crate::Pins::unpin)
+    /// therefore treats the server call as best-effort and still drops the pin
+    /// from the local cache.
+    pub async fn unpin_message(&self, chat_id: &str, message_id: &str) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.unpin_message", call);
+        ost::api::chat_unpin_message_with_client(&self.client, chat_id, message_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "unpinned message");
+        Ok(())
+    }
 }
 
 impl fmt::Debug for ApiClient {
@@ -2228,5 +2369,233 @@ mod tests {
         let unhide = hide_chat_properties(None);
         assert_eq!(unhide.len(), 1);
         assert!(unhide[0].1["unpinnedTime"].is_null());
+    }
+
+    // ----- B2b: folders & pinned messages ---------------------------------
+
+    #[tokio::test]
+    async fn conversation_folders_requires_a_token_and_makes_no_request() {
+        // A client with no skype token (the folder lane's bearer) is refused
+        // before any network — the vendored call needs the bearer explicitly.
+        let client = ApiClient::from_config(Config::default());
+        let err = client
+            .conversation_folders()
+            .await
+            .err()
+            .expect("no token = refused");
+        assert!(
+            matches!(err, crate::error::CoreError::NotSignedIn),
+            "expected NotSignedIn, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_messages_reads_the_chat_service_thread_properties() {
+        // The chat-service thread GET: a `properties` key whose name contains
+        // "pinned" carries the pin objects (sender/preview/time present, so the
+        // vendored fill-from-message pass is skipped).
+        let body = serde_json::json!({
+            "properties": {
+                "pinnedMessages": [
+                    {
+                        "messageId": "1700000000000",
+                        "sender": "Ava",
+                        "content": "<p>hello <b>there</b></p>",
+                        "originalarrivaltime": "2026-01-02T03:04:05Z",
+                        "pinnedBy": "Bo",
+                        "pinnedTime": "2026-01-03T00:00:00Z"
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let (base, seen, task) = http_stub(vec![StubResponse::ok(body)]).await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let (source, pins) = client
+            .pinned_messages("19:team@thread.v2")
+            .await
+            .expect("pins");
+        assert_eq!(source, PinSource::ChatService);
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].message_id, "1700000000000");
+        assert_eq!(pins[0].sender.as_deref(), Some("Ava"));
+        assert_eq!(pins[0].preview.as_deref(), Some("hello there"));
+        assert_eq!(pins[0].time.as_deref(), Some("2026-01-02T03:04:05Z"));
+        assert_eq!(pins[0].pinned_by.as_deref(), Some("Bo"));
+        assert_eq!(pins[0].pinned_at.as_deref(), Some("2026-01-03T00:00:00Z"));
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 1, "preview present, so no fill request");
+        assert!(
+            reqs[0].starts_with("GET /v1/threads/19:team@thread.v2?view=msnp24Equivalent "),
+            "unexpected request: {}",
+            reqs[0]
+        );
+        assert!(
+            reqs[0].contains("authentication: skypetoken=skype-token"),
+            "{}",
+            reqs[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn unpin_refuses_before_any_network() {
+        let (base, seen, task) = http_stub(vec![]).await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        // The Teams sign-in cannot unpin: the vendored call refuses first.
+        let err = client
+            .unpin_message("19:team@thread.v2", "1700000000000")
+            .await
+            .err()
+            .expect("unpin refused");
+        assert!(format!("{err:#}").contains("not available"), "{err:#}");
+        // A blank/unsafe id is rejected too.
+        let bad = client
+            .unpin_message("19:team@thread.v2", "a/b")
+            .await
+            .err()
+            .expect("bad pin id");
+        assert!(format!("{bad:#}").contains("bad chat or pin id"), "{bad:#}");
+
+        task.await.expect("stub drains");
+        assert!(
+            b2a_requests(&seen).is_empty(),
+            "no request of any kind reaches the wire"
+        );
+    }
+
+    #[test]
+    fn folder_pure_helpers_pin_the_request_shapes() {
+        // The folder list URL is the CSA host with both flags the web client
+        // sends.
+        let url = conversation_folders_url();
+        assert!(url.contains("/conversationFolders?"), "{url}");
+        assert!(
+            url.contains("supportsAdditionalSystemGeneratedFolders=true"),
+            "{url}"
+        );
+
+        // Parsing drops deleted + system-view folders, keeps Favorites and user
+        // folders, and honours `conversationFolderOrder`.
+        let payload = serde_json::json!({
+            "folderHierarchyVersion": 7,
+            "conversationFolderOrder": ["f1", "t~u~Favorites"],
+            "conversationFolders": [
+                {"id": "t~u~Favorites", "folderType": "Favorites",
+                 "conversationFolderItems": [{"conversationId": "48:notes"}]},
+                {"id": "f1", "name": "Work", "folderType": "UserCreated",
+                 "conversationFolderItems": [{"conversationId": "19:a@thread.v2"}]},
+                {"id": "q", "folderType": "QuickViews",
+                 "conversationFolderItems": [{"conversationId": "48:notes"}]},
+                {"id": "gone", "folderType": "UserCreated", "isDeleted": true,
+                 "conversationFolderItems": []}
+            ]
+        });
+        let folders = parse_conversation_folders(&payload);
+        assert_eq!(
+            folders.len(),
+            2,
+            "the QuickViews view and the deleted folder are dropped"
+        );
+        assert_eq!(folders[0].id, "f1", "the order list wins");
+        assert_eq!(folders[1].id, "t~u~Favorites");
+        assert!(parse_conversation_folders(&serde_json::json!({})).is_empty());
+
+        // The move computes the edits that leave `48:notes` in f1 only.
+        let (version, actions) = folder_move_actions(&payload, "48:notes", "f1").unwrap();
+        assert_eq!(version, 7);
+        assert!(actions.contains(&(
+            "RemoveItem",
+            "t~u~Favorites".to_string(),
+            "48:notes".to_string()
+        )));
+        assert!(actions.contains(&("AddItem", "f1".to_string(), "48:notes".to_string())));
+        // Moving to the folder it is already in is a no-op; an unknown target
+        // is an error.
+        assert!(
+            folder_move_actions(&payload, "48:notes", "t~u~Favorites")
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        assert!(folder_move_actions(&payload, "48:notes", "nope").is_err());
+        // A blank target removes the chat from every movable folder.
+        let (_, out) = folder_move_actions(&payload, "48:notes", "").unwrap();
+        assert_eq!(
+            out,
+            vec![(
+                "RemoveItem",
+                "t~u~Favorites".to_string(),
+                "48:notes".to_string()
+            )]
+        );
+
+        // The POST body carries the hierarchy version and the actions.
+        let body = folder_move_body(7, &[("AddItem", "f1".into(), "48:notes".into())]);
+        assert_eq!(body["folderHierarchyVersion"], 7);
+        assert_eq!(body["actions"][0]["action"], "AddItem");
+        assert_eq!(body["actions"][0]["folderId"], "f1");
+        assert_eq!(body["actions"][0]["itemId"], "48:notes");
+    }
+
+    #[test]
+    fn pin_parsing_handles_the_graph_and_thread_shapes() {
+        // Graph `pinnedMessages?$expand=message`: the message id, sender and
+        // preview come from the expanded message; the pin id is the DELETE key.
+        let graph = serde_json::json!({
+            "value": [
+                {"id": "pin-1", "message": {
+                    "id": "1700000000000",
+                    "createdDateTime": "2026-01-02T03:04:05Z",
+                    "from": {"user": {"displayName": "Ava"}},
+                    "body": {"content": "<p>hello <b>there</b></p>"}
+                }},
+                {"id": "pin-2", "message": {"id": "1700000000001", "deletedDateTime": "2026-01-01T00:00:00Z"}}
+            ]
+        });
+        let pins = parse_graph_pins(&graph).expect("graph pins");
+        assert_eq!(pins.len(), 1, "the deleted message is skipped");
+        assert_eq!(pins[0].message_id, "1700000000000");
+        assert_eq!(pins[0].sender.as_deref(), Some("Ava"));
+        assert_eq!(pins[0].preview.as_deref(), Some("hello there"));
+        assert_eq!(pins[0].graph_pin_id.as_deref(), Some("pin-1"));
+        // A Graph error body is an error, not an empty list.
+        assert!(parse_graph_pins(&serde_json::json!({"error": {"code": "Forbidden"}})).is_err());
+
+        // Thread pins: bare comma-separated ids and object entries both parse;
+        // duplicates collapse.
+        let thread = serde_json::json!({
+            "properties": {
+                "pinnedMessageIds": "1700000000000,1700000000001",
+                "somePinnedThing": [{"messageId": "1700000000000", "sender": "Ava"}]
+            }
+        });
+        let pins = parse_thread_pins(&thread);
+        let ids: Vec<_> = pins.iter().map(|p| p.message_id.as_str()).collect();
+        assert_eq!(ids, vec!["1700000000000", "1700000000001"]);
+        assert!(parse_thread_pins(&serde_json::json!({})).is_empty());
+
+        // The source precedence: non-empty chat-service pins win, else Graph.
+        let (source, _) = pick_pins(
+            Ok(vec![PinnedRef {
+                message_id: "1".into(),
+                ..Default::default()
+            }]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(source, PinSource::ChatService);
+        let (source, _) = pick_pins(
+            Ok(vec![]),
+            Some(Ok(vec![PinnedRef {
+                message_id: "2".into(),
+                ..Default::default()
+            }])),
+        )
+        .unwrap();
+        assert_eq!(source, PinSource::Graph);
     }
 }

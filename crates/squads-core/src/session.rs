@@ -36,11 +36,13 @@ use crate::calls::{CallCredentials, CallEndpoints, CallIdentity, CallService, Ca
 use crate::chats::Chats;
 use crate::error::{CoreError, Result};
 use crate::files::Files;
+use crate::folders::Folders;
 use crate::messaging::Messaging;
 use crate::model::Identity;
 use crate::notifications::{LogNotifier, Notifications, Notifier};
 use crate::paths::AppDirs;
 use crate::people::People;
+use crate::pins::Pins;
 use crate::presence::{Presence, presence_base_from_region};
 use crate::realtime::{RealtimeEvent, RealtimeService};
 use crate::search::Search;
@@ -389,6 +391,38 @@ impl Session {
     pub fn chats(&mut self) -> Result<Chats> {
         let client = self.api_arc()?;
         Ok(Chats::new(
+            self.profile.clone(),
+            Arc::clone(&self.store),
+            client,
+        ))
+    }
+
+    /// The B2b chat-folders service for this session.
+    ///
+    /// Shares the session's [`Store`] (the cached folders + `chats.folder_id`
+    /// membership) and the shared protocol client (the CSA folder read/move).
+    /// Requires a token set ([`CoreError::NotSignedIn`] otherwise); building is
+    /// offline. The returned [`Folders`] is stateless beyond the shared
+    /// store/client, so callers may build a fresh handle whenever they like.
+    pub fn folders(&mut self) -> Result<Folders> {
+        let client = self.api_arc()?;
+        Ok(Folders::new(
+            self.profile.clone(),
+            Arc::clone(&self.store),
+            client,
+        ))
+    }
+
+    /// The B2b pinned-messages service for this session.
+    ///
+    /// Shares the session's [`Store`] (the cached pins + the messages they
+    /// resolve against) and the shared protocol client (the chat-service thread
+    /// read). Requires a token set ([`CoreError::NotSignedIn`] otherwise);
+    /// building is offline. The returned [`Pins`] is stateless beyond the shared
+    /// store/client, so callers may build a fresh handle whenever they like.
+    pub fn pins(&mut self) -> Result<Pins> {
+        let client = self.api_arc()?;
+        Ok(Pins::new(
             self.profile.clone(),
             Arc::clone(&self.store),
             client,

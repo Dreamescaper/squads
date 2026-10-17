@@ -28,7 +28,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use squads_core::api::JoinTarget;
 use squads_core::model::{
-    CallLogEntry, Chat, FileEntry, Meeting, Message, Person, SearchHit, Team,
+    CallLogEntry, Chat, ChatFolder, FileEntry, Meeting, Message, Person, PinnedMessage, SearchHit,
+    Team,
 };
 use squads_core::{CallState, Channel, ContactPresence, Identity, RealtimeEvent, SignInProgress};
 
@@ -134,6 +135,15 @@ pub enum AppEvent {
     /// The local mute/hidden flags changed (B2a); the app re-derives them from
     /// the store so the list repaints.
     ChatFlagsChanged,
+    /// The chat folders were refreshed and cached (B2b).
+    FoldersLoaded(Vec<ChatFolder>),
+    /// The pinned messages of one chat were refreshed and cached (B2b).
+    PinsLoaded {
+        /// Owning conversation.
+        chat_id: String,
+        /// The cached pins, each with its message resolved when present.
+        pins: Vec<PinnedMessage>,
+    },
     /// Batch presence for a set of contacts. No producer is wired yet (the M11
     /// presence panel will emit it); the variant is part of the event vocabulary.
     #[allow(dead_code)]
@@ -174,6 +184,8 @@ impl AppEvent {
             AppEvent::ChatCreated(_) => "chat_created",
             AppEvent::ChatLeft(_) => "chat_left",
             AppEvent::ChatFlagsChanged => "chat_flags_changed",
+            AppEvent::FoldersLoaded(_) => "folders_loaded",
+            AppEvent::PinsLoaded { .. } => "pins_loaded",
             AppEvent::PresenceUpdated(_) => "presence_updated",
             AppEvent::Realtime(_) => "realtime",
             AppEvent::CallState(_) => "call_state",

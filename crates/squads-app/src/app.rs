@@ -30,9 +30,10 @@ use std::time::Duration;
 use squads_core::api::JoinTarget;
 use squads_core::model::{Channel, Identity, Meeting, Message, Person, SearchHit, SendState};
 use squads_core::{
-    Accent, AppDirs, Calendar, CallIdentity, CallLogEntry, CallService, CallState, Chat, Chats,
-    ContactPresence, FileEntry, Files, IncomingCall, MediaCache, Messaging, NotificationContext,
-    People, RealtimeEvent, Search, Session, Settings, SignInProgress, Store, Team, Teams, Theme,
+    Accent, AppDirs, Calendar, CallIdentity, CallLogEntry, CallService, CallState, Chat,
+    ChatFolder, Chats, ContactPresence, FileEntry, Files, Folders, IncomingCall, MediaCache,
+    Messaging, NotificationContext, People, PinnedMessage, Pins, RealtimeEvent, Search, Session,
+    Settings, SignInProgress, Store, Team, Teams, Theme,
 };
 
 use crate::runtime::{AppEvent, AppRuntime};
@@ -189,6 +190,26 @@ pub enum Action {
     CancelLeaveChat,
     /// Show/hide the collapsed hidden-chats section (B2a).
     ToggleShowHidden,
+    /// Refresh the chat folders from the service (B2b).
+    RefreshFolders,
+    /// Filter the chat list to one folder (B2b). An empty id selects "All".
+    SelectFolder(String),
+    /// Move the selected chat into a folder (B2b); a blank folder clears it.
+    MoveChatToFolder {
+        /// The chat to move.
+        chat_id: String,
+        /// The target folder id (blank = out of every folder).
+        folder_id: String,
+    },
+    /// Refresh the pinned messages of the selected chat (B2b).
+    RefreshPins,
+    /// Unpin one message from the selected chat (B2b).
+    UnpinMessage {
+        /// Owning conversation.
+        chat_id: String,
+        /// The pinned message id.
+        message_id: String,
+    },
     /// Refresh the upcoming meetings from the calendar service (M12).
     RefreshCalendar,
     /// Refresh the calendar **week** view (M12): the next 7 days.
@@ -436,6 +457,15 @@ pub struct SquadsApp {
     new_chat_topic: String,
     leave_confirm: Option<String>,
 
+    /// Folders & pins (B2b): the folder/pin service handles, the cached
+    /// folders, the selected folder tab (`None` = All), and the selected chat's
+    /// cached pins.
+    folders_svc: Option<Arc<Folders>>,
+    pins_svc: Option<Arc<Pins>>,
+    folders: Vec<ChatFolder>,
+    selected_folder: Option<String>,
+    pins: Vec<PinnedMessage>,
+
     /// Calendar (M12): the cached upcoming meetings, whether a fetch is in
     /// flight, the last resolved join target, the agenda/week toggle, and the
     /// "new meeting" form fields.
@@ -601,6 +631,11 @@ impl SquadsApp {
             new_chat_open: false,
             new_chat_topic: String::new(),
             leave_confirm: None,
+            folders_svc: None,
+            pins_svc: None,
+            folders: Vec::new(),
+            selected_folder: None,
+            pins: Vec::new(),
             meetings: Vec::new(),
             calendar_loading: false,
             join_target: None,
@@ -791,6 +826,44 @@ impl SquadsApp {
     /// The chat a leave is pending confirmation for, if any.
     pub fn leave_confirm(&self) -> Option<&str> {
         self.leave_confirm.as_deref()
+    }
+
+    /// The cached chat folders (B2b), in server order.
+    pub fn folders(&self) -> &[ChatFolder] {
+        &self.folders
+    }
+
+    /// The selected folder tab id, if any (`None` = "All") (B2b).
+    pub fn selected_folder(&self) -> Option<&str> {
+        self.selected_folder.as_deref()
+    }
+
+    /// How many chats are filed in `folder_id` (B2b).
+    pub fn folder_count(&self, folder_id: &str) -> usize {
+        self.folders
+            .iter()
+            .find(|folder| folder.id == folder_id)
+            .map(|folder| folder.item_ids.len())
+            .unwrap_or(0)
+    }
+
+    /// Whether `chat_id` is in the selected folder (or the selection is "All")
+    /// (B2b).
+    pub fn chat_in_selected_folder(&self, chat_id: &str) -> bool {
+        match self.selected_folder.as_deref() {
+            None => true,
+            Some(folder_id) => self
+                .folders
+                .iter()
+                .find(|folder| folder.id == folder_id)
+                .map(|folder| folder.item_ids.iter().any(|id| id == chat_id))
+                .unwrap_or(false),
+        }
+    }
+
+    /// The selected chat's cached pinned messages (B2b).
+    pub fn pins(&self) -> &[PinnedMessage] {
+        &self.pins
     }
 
     /// Test-only: seed the global file-search query and results (the headless
@@ -1535,6 +1608,131 @@ impl SquadsApp {
             .collect();
     }
 
+    // ----- B2b: folders & pins ---------------------------------------------
+
+    /// Paint the folder tabs from the store (offline), dropping a selection
+    /// that no longer names a folder.
+    fn reload_folders_from_store(&mut self) {
+        match self.store.chat_folders(&self.profile) {
+            Ok(folders) => self.folders = folders,
+            Err(e) => self.push_error(e),
+        }
+        if let Some(selected) = self.selected_folder.clone() {
+            if !self.folders.iter().any(|folder| folder.id == selected) {
+                self.selected_folder = None;
+            }
+        }
+    }
+
+    /// Fetch the folders from the service and repaint the tabs.
+    fn refresh_folders(&mut self) {
+        let Some(folders) = self.folders_svc.clone() else {
+            return;
+        };
+        self.runtime.spawn(async move {
+            match folders.folders().await {
+                Ok(list) => AppEvent::FoldersLoaded(list),
+                Err(e) => AppEvent::Error(format!("folders: {e}")),
+            }
+        });
+    }
+
+    /// Select a folder tab (empty id = "All") and repaint the list.
+    fn select_folder(&mut self, folder_id: String) {
+        self.selected_folder = if folder_id.trim().is_empty() {
+            None
+        } else {
+            Some(folder_id)
+        };
+    }
+
+    /// Move a chat into a folder (B2b): write the local membership immediately
+    /// so the tabs update offline, then run the server move on the backend
+    /// (best-effort — see `Folders`).
+    fn move_chat_to_folder(&mut self, chat_id: String, folder_id: String) {
+        let target = folder_id.trim().to_string();
+        let folder = if target.is_empty() {
+            None
+        } else {
+            Some(target.as_str())
+        };
+        let _ = self.store.set_chat_folder(&self.profile, &chat_id, folder);
+        self.reload_folders_from_store();
+        self.chat_menu = None;
+        if let Some(folders) = self.folders_svc.clone() {
+            self.runtime.spawn(async move {
+                match folders.move_to_folder(&chat_id, &target).await {
+                    Ok(list) => AppEvent::FoldersLoaded(list),
+                    Err(e) => AppEvent::Error(format!("move to folder: {e}")),
+                }
+            });
+        }
+    }
+
+    /// Paint the selected chat's pins from the store (offline).
+    fn reload_pins_from_store(&mut self) {
+        let Some(chat_id) = self.selected_chat.clone() else {
+            self.pins.clear();
+            return;
+        };
+        match self.store.pinned_messages(&self.profile, &chat_id) {
+            Ok(mut pins) => {
+                for pin in &mut pins {
+                    if let Ok(Some(message)) = self.store.message(&chat_id, &pin.message_id) {
+                        pin.message = Some(message);
+                    }
+                }
+                self.pins = pins;
+            }
+            Err(e) => self.push_error(e),
+        }
+    }
+
+    /// Fetch the selected chat's pins from the service.
+    fn refresh_pins(&mut self) {
+        let Some(chat_id) = self.selected_chat.clone() else {
+            return;
+        };
+        let Some(pins) = self.pins_svc.clone() else {
+            return;
+        };
+        self.runtime.spawn(async move {
+            match pins.pinned(&chat_id).await {
+                Ok(list) => AppEvent::PinsLoaded {
+                    chat_id,
+                    pins: list,
+                },
+                Err(e) => AppEvent::Error(format!("pins: {e}")),
+            }
+        });
+    }
+
+    /// Unpin one message: drop it from the local list immediately and run the
+    /// (best-effort) server unpin on the backend.
+    fn unpin_message(&mut self, chat_id: String, message_id: String) {
+        if let Err(e) = self.store.remove_pin(&self.profile, &chat_id, &message_id) {
+            self.push_error(e);
+        }
+        self.pins.retain(|pin| pin.message_id != message_id);
+        if let Some(pins) = self.pins_svc.clone() {
+            self.runtime.spawn(async move {
+                match pins.unpin(&chat_id, &message_id).await {
+                    Ok(()) => {
+                        // Re-read the local cache (the server unpin is
+                        // best-effort; the local removal is the source of
+                        // truth today — see `Pins`).
+                        let list = pins.cached_pinned(&chat_id).unwrap_or_default();
+                        AppEvent::PinsLoaded {
+                            chat_id,
+                            pins: list,
+                        }
+                    }
+                    Err(e) => AppEvent::Error(format!("unpin: {e}")),
+                }
+            });
+        }
+    }
+
     /// Re-install the theme from the current settings (after a preference
     /// change) and persist them.
     fn reinstall_theme(&mut self) {
@@ -1617,6 +1815,18 @@ impl SquadsApp {
         if self.chats_svc.is_none() {
             match self.session.chats() {
                 Ok(service) => self.chats_svc = Some(Arc::new(service)),
+                Err(e) => self.push_error(e),
+            }
+        }
+        if self.folders_svc.is_none() {
+            match self.session.folders() {
+                Ok(service) => self.folders_svc = Some(Arc::new(service)),
+                Err(e) => self.push_error(e),
+            }
+        }
+        if self.pins_svc.is_none() {
+            match self.session.pins() {
+                Ok(service) => self.pins_svc = Some(Arc::new(service)),
                 Err(e) => self.push_error(e),
             }
         }
@@ -1725,6 +1935,9 @@ impl SquadsApp {
         }
         // B2a: re-derive the local mute/hidden mirrors alongside the list.
         self.reload_chat_flags();
+        // B2b: the folder tabs' counts derive from the chat membership, so
+        // refresh them with the list (a cheap store read).
+        self.reload_folders_from_store();
     }
 
     fn reload_timeline(&mut self) {
@@ -1844,6 +2057,8 @@ impl SquadsApp {
             .store
             .files_for_chat(&self.profile, &chat_id)
             .unwrap_or_default();
+        // B2b: paint the selected chat's cached pins immediately (offline).
+        self.reload_pins_from_store();
 
         let Some(messaging) = self.messaging.clone() else {
             return;
@@ -2302,6 +2517,18 @@ impl SquadsApp {
                 });
             }
             AppEvent::ChatFlagsChanged => self.reload_chats_from_store(),
+            AppEvent::FoldersLoaded(folders) => {
+                if let Err(e) = self.store.replace_chat_folders(&self.profile, &folders) {
+                    self.push_error(e);
+                }
+                self.reload_folders_from_store();
+            }
+            AppEvent::PinsLoaded { chat_id, pins } => {
+                // Only apply a response for the chat that is still selected.
+                if self.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                    self.pins = pins;
+                }
+            }
             AppEvent::PresenceUpdated(list) => {
                 for presence in list {
                     self.presence.insert(presence.mri.clone(), presence);
@@ -2511,6 +2738,16 @@ impl SquadsApp {
             Action::ConfirmLeaveChat(chat_id) => self.confirm_leave_chat(chat_id),
             Action::CancelLeaveChat => self.leave_confirm = None,
             Action::ToggleShowHidden => self.show_hidden = !self.show_hidden,
+            Action::RefreshFolders => self.refresh_folders(),
+            Action::SelectFolder(folder_id) => self.select_folder(folder_id),
+            Action::MoveChatToFolder { chat_id, folder_id } => {
+                self.move_chat_to_folder(chat_id, folder_id)
+            }
+            Action::RefreshPins => self.refresh_pins(),
+            Action::UnpinMessage {
+                chat_id,
+                message_id,
+            } => self.unpin_message(chat_id, message_id),
             Action::RefreshCalendar => self.refresh_calendar(),
             Action::RefreshCalendarWeek => self.refresh_calendar_week(),
             Action::JoinMeeting { target, passcode } => self.join_meeting(target, passcode),
@@ -2695,6 +2932,11 @@ impl SquadsApp {
         self.new_chat_open = false;
         self.new_chat_topic.clear();
         self.leave_confirm = None;
+        self.folders_svc = None;
+        self.pins_svc = None;
+        self.folders.clear();
+        self.selected_folder = None;
+        self.pins.clear();
         self.meetings.clear();
         self.calendar_loading = false;
         self.join_target = None;

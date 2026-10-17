@@ -15,12 +15,14 @@ pub mod calls;
 pub mod chats;
 pub mod error;
 pub mod files;
+pub mod folders;
 pub mod media;
 pub mod messaging;
 pub mod model;
 pub mod notifications;
 pub mod paths;
 pub mod people;
+pub mod pins;
 pub mod presence;
 pub mod realtime;
 pub mod search;
@@ -41,12 +43,13 @@ pub use calls::{
 pub use chats::Chats;
 pub use error::{CoreError, Result};
 pub use files::Files;
+pub use folders::Folders;
 pub use media::{CachedMedia, MediaCache};
 pub use messaging::{HistoryPage, Messaging};
 pub use model::{
-    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, ChatMember, FileEntry, FileVersion,
-    Identity, Meeting, Message, Person, Reaction, Reactor, SearchHit, SendState, SharedLink, Team,
-    TeamMember, is_channel_conversation_id,
+    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, ChatFolder, ChatMember, FileEntry,
+    FileVersion, Identity, Meeting, Message, Person, PinnedMessage, Reaction, Reactor, SearchHit,
+    SendState, SharedLink, Team, TeamMember, is_channel_conversation_id, is_system_folder,
 };
 pub use notifications::{
     ActivityItem, LogNotifier, Notification, NotificationContext, NotificationKind, Notifications,
@@ -54,6 +57,7 @@ pub use notifications::{
 };
 pub use paths::AppDirs;
 pub use people::People;
+pub use pins::Pins;
 pub use presence::{
     Activity, Availability, ContactPresence, GraphBackend, OwnPresence, Presence, PresenceBackend,
     UnifiedBackend,

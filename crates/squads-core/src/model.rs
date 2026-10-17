@@ -15,7 +15,8 @@
 //! M6 adds [`Team::from_info`] / [`Channel::from_info`] /
 //! [`TeamMember::from_info`]; M7 adds [`FileEntry::from_shared`] /
 //! [`FileVersion::from_wire`]; M13 adds [`Identity::from_whoami`]; B3 adds
-//! [`Person::from_member`]; B2a adds [`ChatMember::from_info`].
+//! [`Person::from_member`]; B2a adds [`ChatMember::from_info`]; B2b adds
+//! [`ChatFolder::from_wire`] / [`PinnedMessage::from_wire`].
 //!
 //! ## Two facts you must orient on
 //!
@@ -34,9 +35,10 @@
 use serde::{Deserialize, Serialize};
 
 use ost::api::{
-    ChannelInfo, ChatInfo, ChatMemberInfo, FileVersion as WireFileVersion,
-    MeetingInfo as WireMeetingInfo, MessageInfo, ReactionCount, Reactor as WireReactor,
-    SharedFile as WireSharedFile, TeamInfo, TeamMemberInfo, UserInfo,
+    ChannelInfo, ChatInfo, ChatMemberInfo, ConversationFolder as WireConversationFolder,
+    FileVersion as WireFileVersion, MeetingInfo as WireMeetingInfo, MessageInfo, PinnedRef,
+    ReactionCount, Reactor as WireReactor, SharedFile as WireSharedFile, TeamInfo, TeamMemberInfo,
+    UserInfo,
 };
 
 /// Delivery state of a message we authored (milestone **M5**).
@@ -486,6 +488,142 @@ impl ChatMember {
 impl From<&ChatMemberInfo> for ChatMember {
     fn from(info: &ChatMemberInfo) -> Self {
         ChatMember::from_info(info)
+    }
+}
+
+// ----- folders & pins (B2b) -----------------------------------------------
+
+/// One chat **folder** (backlog item **B2b**).
+///
+/// Mirrors the vendored `ost::api::ConversationFolder` but is owned and
+/// protocol-independent. `item_ids` are the conversations the folder holds (in
+/// wire order); the [`Folders`](crate::Folders) service rebuilds them from the
+/// store's per-chat `folder_id` when it returns cached folders.
+///
+/// **System folders vs. user folders.** Teams returns both the folders a chat
+/// can be *moved into* (Favorites and user-created folders) and a set of
+/// server-generated **views** ([`SYSTEM_FOLDER_TYPES`](ost::api::SYSTEM_FOLDER_TYPES):
+/// RecentChats, TeamsAndChannels, QuickViews, MutedChats, MeetingChats,
+/// EngageCommunities) that are not move targets. The vendored parser already
+/// **drops** the views, so a parsed folder is normally `is_system == false`;
+/// [`is_system`](ChatFolder::is_system) is computed anyway (case-insensitively)
+/// so a hand-built or future folder is classified correctly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatFolder {
+    /// Server folder id (the move target; e.g. `t~u~Favorites`).
+    pub id: String,
+    /// Display name (the vendored parser falls back to the folder type).
+    pub name: String,
+    /// Server folder type (`Favorites`, `UserCreated`, …); `""` when unnamed.
+    pub folder_type: String,
+    /// Whether [`folder_type`](ChatFolder::folder_type) is one of the
+    /// server-generated views ([`SYSTEM_FOLDER_TYPES`](ost::api::SYSTEM_FOLDER_TYPES))
+    /// that a chat cannot be moved into.
+    pub is_system: bool,
+    /// Conversation ids in the folder (wire order; rebuilt from the store for
+    /// cached folders).
+    pub item_ids: Vec<String>,
+}
+
+impl ChatFolder {
+    /// Build a domain [`ChatFolder`] from a protocol `ConversationFolder`.
+    pub fn from_wire(folder: &WireConversationFolder) -> Self {
+        ChatFolder {
+            id: folder.id.clone(),
+            name: folder.name.clone(),
+            folder_type: folder.folder_type.clone(),
+            is_system: is_system_folder(&folder.folder_type),
+            item_ids: folder.item_ids.clone(),
+        }
+    }
+}
+
+impl From<&WireConversationFolder> for ChatFolder {
+    fn from(folder: &WireConversationFolder) -> Self {
+        ChatFolder::from_wire(folder)
+    }
+}
+
+/// Whether `folder_type` names a server-generated **view** (not a move target).
+///
+/// Case-insensitive, delegating to the vendored
+/// [`ost::api::SYSTEM_FOLDER_TYPES`] list. Pure and total.
+pub fn is_system_folder(folder_type: &str) -> bool {
+    ost::api::SYSTEM_FOLDER_TYPES
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(folder_type.trim()))
+}
+
+/// One server-side **pinned message** (backlog item **B2b**).
+///
+/// Built from a vendored `ost::api::PinnedRef`; `message` is attached by the
+/// [`Pins`](crate::Pins) service when the pinned message is also cached in the
+/// store (it is **not** persisted with the pin — the store keeps the pin
+/// membership fields only, and the message body is resolved on read).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedMessage {
+    /// Owning conversation.
+    pub chat_id: String,
+    /// Pinned message's server id (the jump target).
+    pub message_id: String,
+    /// Sender display name, when the wire named one.
+    pub sender: Option<String>,
+    /// One-line plain-text preview (HTML stripped), when available.
+    pub preview: Option<String>,
+    /// The pinned message's arrival time (ISO-8601), when available.
+    pub time: Option<String>,
+    /// When the message was pinned (ISO-8601), when the wire carries it.
+    pub pinned_at: Option<String>,
+    /// Who pinned it, when the wire carries it.
+    pub pinned_by: Option<String>,
+    /// Graph `pinnedChatMessageInfo` id, when this pin came from Graph (the
+    /// value Graph's unpin DELETE takes). `None` for chat-service pins.
+    pub graph_pin_id: Option<String>,
+    /// The cached [`Message`] when it is present in the store; `None` when the
+    /// pinned message is outside the cached window.
+    #[serde(default)]
+    pub message: Option<Message>,
+}
+
+impl PinnedMessage {
+    /// Build a domain [`PinnedMessage`] from a protocol `PinnedRef`, attaching
+    /// the owning `chat_id`. `message` starts `None` (see the type docs).
+    pub fn from_wire(chat_id: impl Into<String>, pin: &PinnedRef) -> Self {
+        PinnedMessage {
+            chat_id: chat_id.into(),
+            message_id: pin.message_id.clone(),
+            sender: pin.sender.clone(),
+            preview: pin.preview.clone(),
+            time: pin.time.clone(),
+            pinned_at: pin.pinned_at.clone(),
+            pinned_by: pin.pinned_by.clone(),
+            graph_pin_id: pin.graph_pin_id.clone(),
+            message: None,
+        }
+    }
+
+    /// Attach the cached message this pin refers to.
+    pub fn with_message(mut self, message: Message) -> Self {
+        self.message = Some(message);
+        self
+    }
+
+    /// A one-line preview: the wire preview, else the cached message's text,
+    /// else an empty string.
+    pub fn preview_text(&self) -> String {
+        if let Some(preview) = self.preview.as_deref().filter(|p| !p.trim().is_empty()) {
+            return preview.to_string();
+        }
+        self.message
+            .as_ref()
+            .map(|m| m.content.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl From<(&str, &PinnedRef)> for PinnedMessage {
+    fn from((chat_id, pin): (&str, &PinnedRef)) -> Self {
+        PinnedMessage::from_wire(chat_id, pin)
     }
 }
 
@@ -1696,5 +1834,89 @@ mod tests {
         theirs.sender_mri = "8:orgid:zzzz".into();
         theirs.mark_own(&identity.mri);
         assert!(!theirs.is_own);
+    }
+
+    // ----- B2b: folders & pins ----------------------------------------------
+
+    fn wire_folder(
+        id: &str,
+        name: &str,
+        folder_type: &str,
+        items: &[&str],
+    ) -> WireConversationFolder {
+        WireConversationFolder {
+            id: id.into(),
+            name: name.into(),
+            folder_type: folder_type.into(),
+            item_ids: items.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn chat_folder_converts_and_classifies_system_types() {
+        let folder = ChatFolder::from_wire(&wire_folder(
+            "t~u~Favorites",
+            "Favorites",
+            "Favorites",
+            &["19:a@thread.v2", "48:notes"],
+        ));
+        assert_eq!(folder.id, "t~u~Favorites");
+        assert_eq!(folder.name, "Favorites");
+        assert_eq!(folder.folder_type, "Favorites");
+        assert_eq!(folder.item_ids.len(), 2);
+        // Favorites is a move target, not a view.
+        assert!(!folder.is_system);
+        assert_eq!(
+            ChatFolder::from(&wire_folder("f", "Work", "UserCreated", &[])),
+            ChatFolder::from_wire(&wire_folder("f", "Work", "UserCreated", &[]))
+        );
+
+        // The server-generated views are system folders (case-insensitive).
+        assert!(is_system_folder("RecentChats"));
+        assert!(is_system_folder("quickviews"));
+        assert!(is_system_folder(" MutedChats "));
+        assert!(!is_system_folder("Favorites"));
+        assert!(!is_system_folder("UserCreated"));
+        assert!(!is_system_folder(""));
+    }
+
+    fn wire_pin(message_id: &str) -> PinnedRef {
+        PinnedRef {
+            message_id: message_id.into(),
+            sender: Some("Ava".into()),
+            preview: Some("hello".into()),
+            time: Some("2026-01-02T03:04:05Z".into()),
+            pinned_by: Some("Bo".into()),
+            pinned_at: Some("2026-01-03T00:00:00Z".into()),
+            graph_pin_id: None,
+        }
+    }
+
+    #[test]
+    fn pinned_message_converts_and_resolves_a_preview() {
+        let pin = PinnedMessage::from_wire("c1", &wire_pin("m1"));
+        assert_eq!(pin.chat_id, "c1");
+        assert_eq!(pin.message_id, "m1");
+        assert_eq!(pin.sender.as_deref(), Some("Ava"));
+        assert_eq!(pin.preview_text(), "hello");
+        assert!(pin.message.is_none());
+        assert_eq!(
+            PinnedMessage::from(("c1", &wire_pin("m1"))),
+            PinnedMessage::from_wire("c1", &wire_pin("m1"))
+        );
+
+        // With no wire preview, the cached message's text is the fallback.
+        let mut bare = wire_pin("m2");
+        bare.preview = None;
+        let with_message = PinnedMessage::from_wire("c1", &bare)
+            .with_message(Message::from_info("c1", &message_info()));
+        assert_eq!(with_message.preview_text(), "hello");
+        assert!(with_message.message.is_some());
+        assert_eq!(with_message.preview_text(), "hello");
+
+        // JSON round-trip (the store persists the membership columns).
+        let back: PinnedMessage =
+            serde_json::from_str(&serde_json::to_string(&pin).unwrap()).unwrap();
+        assert_eq!(back, pin);
     }
 }

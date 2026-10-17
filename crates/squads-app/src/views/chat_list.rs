@@ -13,6 +13,11 @@
 //!   reveals Mute/Unmute, Hide and Leave (Leave asks for confirmation first);
 //! * **muted** rows carry a small badge, **hidden** rows are collapsed out of
 //!   the list and can be shown again with the "Show hidden (N)" toggle.
+//!
+//! **B2b** adds the **folder tabs**: an "All" tab plus one tab per cached
+//! folder (with the number of chats it holds), which filters the list
+//! ([`Action::SelectFolder`]); and a **Move to folder** row in the context menu
+//! ([`Action::MoveChatToFolder`]).
 
 use egui::{RichText, Ui};
 
@@ -44,7 +49,12 @@ pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
                 if ui.button("Refresh chats").clicked() {
                     app.push_action(Action::RefreshChats);
                 }
+                if ui.button("Refresh folders").clicked() {
+                    app.push_action(Action::RefreshFolders);
+                }
             });
+            // Folder tabs (B2b): "All" plus one per cached folder, with counts.
+            folder_tabs(app, ui);
             // Hidden chats are collapsed; this re-shows them (B2a).
             if app.hidden_count() > 0 {
                 let label = if app.show_hidden() {
@@ -65,7 +75,11 @@ pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
             let visible: Vec<_> = app
                 .chats()
                 .iter()
-                .filter(|chat| !app.is_chat_hidden(&chat.id) && matches(chat))
+                .filter(|chat| {
+                    !app.is_chat_hidden(&chat.id)
+                        && matches(chat)
+                        && app.chat_in_selected_folder(&chat.id)
+                })
                 .cloned()
                 .collect();
             // Hidden rows are only listed when the section is expanded.
@@ -98,6 +112,41 @@ pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
                 }
             });
         });
+}
+
+/// The folder tab strip (B2b): "All" plus one tab per cached folder, with the
+/// number of chats each holds. Selecting a tab filters the list
+/// ([`Action::SelectFolder`]).
+fn folder_tabs(app: &mut SquadsApp, ui: &mut Ui) {
+    let folders: Vec<(String, String, usize)> = app
+        .folders()
+        .iter()
+        .map(|folder| {
+            (
+                folder.id.clone(),
+                folder.name.clone(),
+                app.folder_count(&folder.id),
+            )
+        })
+        .collect();
+    if folders.is_empty() {
+        return;
+    }
+    let selected = app.selected_folder().map(str::to_string);
+    ui.horizontal_wrapped(|ui| {
+        let all_selected = selected.is_none();
+        if ui.selectable_label(all_selected, "All").clicked() {
+            app.push_action(Action::SelectFolder(String::new()));
+        }
+        for (id, name, count) in folders {
+            let is_selected = selected.as_deref() == Some(id.as_str());
+            let label = format!("{name} ({count})");
+            if ui.selectable_label(is_selected, label).clicked() {
+                app.push_action(Action::SelectFolder(id));
+            }
+        }
+    });
+    ui.separator();
 }
 
 fn row(app: &mut SquadsApp, ui: &mut Ui, chat: &squads_core::Chat) {
@@ -194,4 +243,29 @@ fn chat_menu(
             app.push_action(Action::RequestLeaveChat(chat.id.clone()));
         }
     });
+    // Move to folder (B2b): one button per cached folder plus "No folder".
+    if !app.folders().is_empty() {
+        let folders: Vec<(String, String)> = app
+            .folders()
+            .iter()
+            .map(|folder| (folder.id.clone(), folder.name.clone()))
+            .collect();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Move to:").weak().small());
+            for (id, name) in folders {
+                if ui.button(name).clicked() {
+                    app.push_action(Action::MoveChatToFolder {
+                        chat_id: chat.id.clone(),
+                        folder_id: id,
+                    });
+                }
+            }
+            if ui.button("No folder").clicked() {
+                app.push_action(Action::MoveChatToFolder {
+                    chat_id: chat.id.clone(),
+                    folder_id: String::new(),
+                });
+            }
+        });
+    }
 }

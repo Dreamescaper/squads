@@ -1477,3 +1477,104 @@ from the list). Confirm the tenant agrees: the muted chat's `alerts` property is
 leave, mute/hide and roster shapes is unverified; the request shapes are pinned
 offline). B-007 (the roster is in-process only; the two new chat flags are the
 only added persisted state).
+
+---
+
+## B2b — Folders and pinned messages
+
+**Goal.** Finish chat management (**B2**): read and apply the signed-in user's
+chat **folders** (tab the chat list by folder, move a chat into one) and show a
+chat's **pinned messages** (list them, jump to one, unpin) — offline-testable
+where the vendored lane allows it, with the folder lane documented as
+unstubbable.
+
+**Landed.**
+
+- `api` (M2 module, extended) — typed, instrumented wrappers in the existing
+  `ApiClient` style (redacting `Debug`, request counter, `tracing` spans):
+  `conversation_folders()`, `move_chat_to_folder(chat_id, target)`,
+  `pinned_messages(chat_id)` and `unpin_message(chat_id, message_id)`. The
+  folder lane needs the bearer the vendored call takes as a parameter, so
+  `ApiClient` now retains the **skype token** it was built with (the same
+  host/token pair `csa_get` uses for the chat list) and refuses with
+  `NotSignedIn` when there is none. The B2b pure helpers/types are re-exported
+  (`conversation_folders_url`, `folder_move_actions`, `folder_move_body`,
+  `parse_conversation_folders`, `ConversationFolder`, `SYSTEM_FOLDER_TYPES`,
+  `CHATSVCAGG_SCOPE`; `thread_pins_url`, `graph_pins_path`, `graph_unpin_path`,
+  `parse_thread_pins`, `parse_graph_pins`, `pick_pins`, `fill_pin_from_message`,
+  `PinnedRef`, `PinSource`).
+- `model` — [`ChatFolder`](../crates/squads-core/src/model.rs)
+  (id/name/folder_type, `is_system` computed from `SYSTEM_FOLDER_TYPES`,
+  `item_ids`) and [`PinnedMessage`](../crates/squads-core/src/model.rs)
+  (chat_id/message_id/sender/preview/time/pinned_at/by/graph_pin_id, plus an
+  `Option<Message>` resolved from the store on read). `is_system_folder` is a
+  pure helper.
+- `store` — **schema v11**. `chat_folders(id, profile, name, folder_type,
+  is_system, position)`, `pinned_messages(chat_id, message_id, profile, …)` and
+  a nullable `chats.folder_id`; methods `replace_chat_folders`, `chat_folders`
+  (rebuilds each folder's `item_ids` from `chats.folder_id`), `chat_folder`,
+  `chats_in_folder`, `set_chat_folder`, `chat_folder_id`, `replace_chat_pins`,
+  `pinned_messages`, `remove_pin`. `SCHEMA_VERSION = 11`; the v10→v11 migration
+  is `CREATE TABLE/INDEX IF NOT EXISTS` + a guarded `ALTER TABLE`, forward-only
+  and re-entrant; `chats.muted`/`server_muted`/`hidden` are untouched.
+- `folders` (new) — the `Folders { profile, Arc<Store>, Arc<ApiClient> }`
+  service: `cached_folders` (local-only), `folders` (fetch + cache),
+  `resolve_folder` (id-or-type) and a **local-first** `move_to_folder` (the
+  membership is written immediately; the server move is best-effort). Redacting
+  `Debug`.
+- `pins` (new) — the `Pins { profile, Arc<Store>, Arc<ApiClient> }` service:
+  `cached_pinned` (local-only), `pinned` (fetch + cache + resolve the message),
+  `unpin` (drop the local pin; the always-refusing server call is best-effort).
+  Redacting `Debug`.
+- `session` — `Session::folders()` / `Session::pins()` mirror the other
+  services (share the store and the cached `Arc<ApiClient>`; offline to build;
+  `NotSignedIn` without tokens).
+- `crates/squads-app` — **folder tabs** in the chat list (All + one per cached
+  folder, with counts) that filter the list (`Action::SelectFolder`), a
+  **Move to folder** row in the B2a context menu (`Action::MoveChatToFolder`),
+  and a **pinned-messages panel** in the conversation info pane (sender,
+  preview, time) whose **Go** reuses B1's jump/highlight
+  (`Action::OpenSearchHit`) and whose **Unpin** removes the pin
+  (`Action::UnpinMessage`). The new bridge events are
+  `AppEvent::FoldersLoaded` / `AppEvent::PinsLoaded`; repaints happen only when
+  something changed (ADR-027).
+
+**Decisions.** **ADR-039** (folder membership as `chats.folder_id` + a
+pin-membership table, schema v11; the local-first folder move; the
+Graph-vs-thread pin sources and the unavailable server unpin).
+
+**Tests.** `cargo test -p squads-core` — **395** (B2a's 376 + **19** new: 2
+`model`, 3 `store` (folders round-trip + membership, pins round-trip + remove,
+the **v10→v11** migration), 5 `api` (folders token guard, the pins thread read,
+unpin refusal, the folder pure shapes, the Graph/thread pin parsers), 5 `folders`
+and 4 `pins`). `cargo test -p squads-app` — **35** (B2a's 32 + **3** new: folder
+tabs filter the list, the pinned panel renders and unpin removes, and the
+move-to-folder menu queues the action).
+`cargo test -p squads-protocol` still passes **377**. `cargo build --workspace`
+(default features) succeeds and `cargo fmt -p squads-core -p squads-app --
+--check` is clean. New coverage includes: the `ChatFolder`/`PinnedMessage`
+conversions + `is_system_folder`; the folder store round-trip, membership
+(one folder per chat), the folder move/clear and profile isolation; the pin
+round-trip/replace/remove; the **v10→v11** upgrade (a hand-built v10 database
+gains the tables + `folder_id`, is writable, and survives a reopen); the pins
+thread read against a local stub (request line + tolerant parse + the
+fill-from-message pass); unpin refusing before any network; the folder pure
+shapes (URL, parse, move actions, move body); the Graph-vs-thread pin parsers and
+`pick_pins` precedence; the `Folders` local-first move (and the token guard) and
+the `Pins` fetch/cache/resolve + unpin; and the headless folder-tab filtering and
+pinned-panel rendering/unpin.
+
+**How to verify manually** (real tenant; not runnable here): sign in, press
+**Refresh folders** and confirm the folder tabs appear with counts; pick a folder
+and confirm the chat list filters; open a chat's **"..."** menu and move it into
+a folder (the tab count changes); open a chat's **Info** pane and confirm the
+pinned messages list (sender, preview, time), that **Go** jumps to the message
+and highlights it, and that **Unpin** drops it. The folder read/move and the live
+pin shapes are unverified here — see **U-012**; the server unpin is unavailable
+with the Teams sign-in, so unpin is local-only.
+
+**Blockers.** **U-012** (the folder lane uses a fixed CSA URL + the process-wide
+HTTP client and **cannot be stubbed offline**, so only its pure shapes and the
+local-first move are tested; the live folder read/move, the live pin read and the
+unavailable server unpin are unverified). B-007 (folder names and pin previews
+join chat content in the unencrypted store).

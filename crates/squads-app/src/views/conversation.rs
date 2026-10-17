@@ -7,6 +7,10 @@
 //! Message bubbles render the sender, time, edited flag, reply context,
 //! reactions and the optimistic [`SendState`] styling (pending / failed with a
 //! retry button).
+//!
+//! **B2b** adds the **pinned-messages panel** to the info pane: the selected
+//! chat's pins (sender, preview, time) with a **Go** jump (reusing B1's
+//! highlight mechanism) and an **Unpin** action.
 
 use std::path::Path;
 
@@ -94,6 +98,8 @@ pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
                     }
                     ui.label(format!("Chat id: {chat_id}"));
                     ui.label(format!("Unread: {}", app.unread_count(&chat_id)));
+                    ui.separator();
+                    pinned_panel(app, ui, &chat_id);
                 });
         }
 
@@ -125,6 +131,68 @@ pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
                 }
             });
     });
+}
+
+/// The pinned-messages panel (B2b): the selected chat's cached pins, each with
+/// its sender, preview and time, a **Go** affordance (jump to the message via
+/// the B1 highlight mechanism) and an **Unpin** action.
+///
+/// The pins are painted from the store when the chat is selected (offline);
+/// **Refresh pins** re-fetches from the chat service. Both actions go through
+/// the normal Action pipeline — nothing here touches the network.
+fn pinned_panel(app: &mut SquadsApp, ui: &mut Ui, chat_id: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Pinned messages").strong());
+        if ui.small_button("Refresh pins").clicked() {
+            app.push_action(Action::RefreshPins);
+        }
+    });
+    let pins: Vec<(String, String, String, String)> = app
+        .pins()
+        .iter()
+        .map(|pin| {
+            let sender = pin
+                .sender
+                .clone()
+                .or_else(|| pin.message.as_ref().map(|m| m.sender_name.clone()))
+                .unwrap_or_default();
+            let preview = pin.preview_text();
+            let time = pin.time.as_deref().map(short_time).unwrap_or_default();
+            (pin.message_id.clone(), sender, preview, time)
+        })
+        .collect();
+    if pins.is_empty() {
+        ui.label(RichText::new("No pinned messages.").weak().small());
+        return;
+    }
+    for (message_id, sender, preview, time) in pins {
+        ui.horizontal(|ui| {
+            if !sender.is_empty() {
+                ui.label(RichText::new(&sender).small().strong());
+            }
+            if !time.is_empty() {
+                ui.label(RichText::new(time).weak().small());
+            }
+        });
+        if !preview.is_empty() {
+            ui.label(RichText::new(preview).small());
+        }
+        ui.horizontal(|ui| {
+            if ui.small_button("Go").clicked() {
+                app.push_action(Action::OpenSearchHit {
+                    chat_id: chat_id.to_string(),
+                    message_id: message_id.clone(),
+                });
+            }
+            if ui.small_button("Unpin").clicked() {
+                app.push_action(Action::UnpinMessage {
+                    chat_id: chat_id.to_string(),
+                    message_id: message_id.clone(),
+                });
+            }
+        });
+        ui.separator();
+    }
 }
 
 fn bubble(app: &mut SquadsApp, ui: &mut Ui, message: &Message, index: usize) {
