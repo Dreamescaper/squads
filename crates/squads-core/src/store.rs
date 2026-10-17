@@ -18,7 +18,7 @@
 //!
 //! ## Schema & migrations
 //!
-//! The schema version lives in `PRAGMA user_version`; this build knows **v2**.
+//! The schema version lives in `PRAGMA user_version`; this build knows **v3**.
 //! Migrations are forward-only and re-entrant: statements are `IF NOT EXISTS`
 //! (or guarded by a schema probe, for `ALTER TABLE`), so re-running is a no-op.
 //! A database whose `user_version` is **newer** than this build understands is
@@ -28,14 +28,18 @@
 //! * **v2** (M5) — `messages.send_state` (optimistic sends; existing rows
 //!   default to `sent`) and the `read_state` table (our own consumption
 //!   horizon). See ADR-014/ADR-015.
+//! * **v3** (M6) — `teams`, `channels`, `team_members` (the teams/channel
+//!   metadata cache). See ADR-017.
 //!
 //! ## Who writes what
 //!
 //! M3 provides the store API; **realtime write-through landed in M4** and M5's
 //! optimistic sends call the same idempotent [`Store::upsert_messages`] /
 //! [`Store::upsert_chats`] (keyed by server id) and read history through
-//! [`Store::messages`] / [`Store::messages_before`]. Nothing in this module
-//! talks to the network.
+//! [`Store::messages`] / [`Store::messages_before`]. M6's teams service caches
+//! team/channel/member metadata through [`Store::upsert_teams`],
+//! [`Store::upsert_channels`] and [`Store::upsert_team_members`]. Nothing in
+//! this module talks to the network.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -46,14 +50,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::tokens::now_unix;
 use crate::error::{CoreError, Result};
-use crate::model::{Chat, Message, Reaction, SendState};
+use crate::model::{Channel, Chat, Message, Reaction, SendState, Team, TeamMember};
 
 /// Newest schema version this build knows how to create/migrate to.
 ///
 /// * **v1** (M3) — accounts, chats, messages.
 /// * **v2** (M5) — `messages.send_state` for optimistic sends, and the
 ///   `read_state` table for our own read horizon.
-pub const SCHEMA_VERSION: i32 = 2;
+/// * **v3** (M6) — `teams`, `channels`, `team_members` for the teams service.
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Timeout for a busy database before `SQLITE_BUSY` is surfaced.
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -117,6 +122,47 @@ CREATE TABLE IF NOT EXISTS read_state (
     read_at    INTEGER NOT NULL,
     PRIMARY KEY (chat_id, profile)
 );
+"#;
+
+/// v3 schema: the teams/channel metadata cache (M6). Plain
+/// `CREATE TABLE IF NOT EXISTS`, so the migration is re-entrant.
+const MIGRATION_V3_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS teams (
+    id         TEXT NOT NULL,
+    profile    TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (id, profile)
+);
+
+CREATE TABLE IF NOT EXISTS channels (
+    id              TEXT NOT NULL,
+    team_id         TEXT NOT NULL,
+    profile         TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    description     TEXT,
+    membership_type TEXT,
+    web_url         TEXT,
+    is_channel      INTEGER NOT NULL DEFAULT 0,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (id, team_id)
+);
+
+CREATE TABLE IF NOT EXISTS team_members (
+    id           TEXT NOT NULL,
+    team_id      TEXT NOT NULL,
+    profile      TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    email        TEXT,
+    roles_json   TEXT NOT NULL DEFAULT '[]',
+    updated_at   INTEGER NOT NULL,
+    PRIMARY KEY (id, team_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_channels_team
+    ON channels (team_id);
+CREATE INDEX IF NOT EXISTS idx_team_members_team
+    ON team_members (team_id);
 "#;
 
 /// One local account record.
@@ -590,6 +636,197 @@ impl Store {
         Ok(message_id)
     }
 
+    // ----- teams, channels & members (M6) ----------------------------------
+
+    /// Insert or update teams for `profile`, keyed by `(id, profile)`.
+    ///
+    /// Idempotent: the same team id updates the row and `updated_at` advances
+    /// (never backwards). Returns the number of teams written.
+    pub fn upsert_teams(&self, profile: &str, teams: &[Team]) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now_unix() as i64;
+        let mut written = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO teams (id, profile, name, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id, profile) DO UPDATE SET
+                    name = excluded.name,
+                    updated_at = MAX(teams.updated_at, excluded.updated_at)",
+            )?;
+            for team in teams {
+                stmt.execute(params![team.id, profile, team.name, now])?;
+                written += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// List the cached teams for `profile`, name order (case-insensitive).
+    pub fn list_teams(&self, profile: &str) -> Result<Vec<Team>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name FROM teams
+             WHERE profile = ?1
+             ORDER BY name COLLATE NOCASE ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![profile], row_to_team)?;
+        let mut teams = Vec::new();
+        for team in rows {
+            teams.push(team?);
+        }
+        Ok(teams)
+    }
+
+    /// Insert or update channels, keyed by `(id, team_id)`.
+    ///
+    /// Idempotent. `profile` is a non-key column (matching `messages`): team and
+    /// channel ids are account-unique in practice (see U-001). Returns the
+    /// number of channels written.
+    pub fn upsert_channels(&self, profile: &str, channels: &[Channel]) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now_unix() as i64;
+        let mut written = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO channels
+                    (id, team_id, profile, name, description, membership_type,
+                     web_url, is_channel, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id, team_id) DO UPDATE SET
+                    profile = excluded.profile,
+                    name = excluded.name,
+                    description = excluded.description,
+                    membership_type = excluded.membership_type,
+                    web_url = excluded.web_url,
+                    is_channel = excluded.is_channel,
+                    updated_at = MAX(channels.updated_at, excluded.updated_at)",
+            )?;
+            for channel in channels {
+                stmt.execute(params![
+                    channel.id,
+                    channel.team_id,
+                    profile,
+                    channel.name,
+                    channel.description,
+                    channel.membership_type,
+                    channel.web_url,
+                    channel.is_channel as i64,
+                    now
+                ])?;
+                written += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// The cached channels of one team, name order (case-insensitive).
+    pub fn channels_for_team(&self, team_id: &str) -> Result<Vec<Channel>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, team_id, name, description, membership_type, web_url, is_channel
+             FROM channels
+             WHERE team_id = ?1
+             ORDER BY name COLLATE NOCASE ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![team_id], row_to_channel)?;
+        let mut channels = Vec::new();
+        for channel in rows {
+            channels.push(channel?);
+        }
+        Ok(channels)
+    }
+
+    /// Fetch one cached channel by `(team_id, id)`, or `None`.
+    pub fn channel(&self, team_id: &str, channel_id: &str) -> Result<Option<Channel>> {
+        let conn = self.lock();
+        let channel = conn
+            .query_row(
+                "SELECT id, team_id, name, description, membership_type, web_url, is_channel
+                 FROM channels WHERE team_id = ?1 AND id = ?2",
+                params![team_id, channel_id],
+                row_to_channel,
+            )
+            .optional()?;
+        Ok(channel)
+    }
+
+    /// Delete one cached channel (M6 `delete_channel`). Returns whether a row
+    /// existed. Team members are unaffected.
+    pub fn delete_channel(&self, profile: &str, team_id: &str, channel_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let removed = conn.execute(
+            "DELETE FROM channels WHERE id = ?1 AND team_id = ?2 AND profile = ?3",
+            params![channel_id, team_id, profile],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// Insert or update one team's roster, keyed by `(id, team_id)`.
+    ///
+    /// `roles` is stored as a JSON column (like `messages.reactions_json`).
+    /// Idempotent. Returns the number of members written.
+    pub fn upsert_team_members(
+        &self,
+        profile: &str,
+        team_id: &str,
+        members: &[TeamMember],
+    ) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now_unix() as i64;
+        let mut written = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO team_members
+                    (id, team_id, profile, display_name, email, roles_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id, team_id) DO UPDATE SET
+                    profile = excluded.profile,
+                    display_name = excluded.display_name,
+                    email = excluded.email,
+                    roles_json = excluded.roles_json,
+                    updated_at = MAX(team_members.updated_at, excluded.updated_at)",
+            )?;
+            for member in members {
+                let roles = serde_json::to_string(&member.roles).map_err(CoreError::from)?;
+                stmt.execute(params![
+                    member.id,
+                    team_id,
+                    profile,
+                    member.display_name,
+                    member.email,
+                    roles,
+                    now
+                ])?;
+                written += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// The cached roster of one team, display-name order (case-insensitive).
+    pub fn team_members(&self, team_id: &str) -> Result<Vec<TeamMember>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, display_name, email, roles_json
+             FROM team_members
+             WHERE team_id = ?1
+             ORDER BY display_name COLLATE NOCASE ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![team_id], row_to_team_member)?;
+        let mut members = Vec::new();
+        for member in rows {
+            members.push(member?);
+        }
+        Ok(members)
+    }
+
     /// Shared message query: rows come back newest-first; reverse for display.
     fn messages_query(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Message>> {
         let conn = self.lock();
@@ -652,6 +889,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if current < 2 {
         migrate_v2(&tx)?;
     }
+    if current < 3 {
+        migrate_v3(&tx)?;
+    }
     // Record the version *after* the DDL inside the same transaction, so a
     // crash can never leave a version marker ahead of the schema.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -672,6 +912,15 @@ fn migrate_v2(tx: &rusqlite::Transaction<'_>) -> Result<()> {
         )?;
     }
     tx.execute_batch(MIGRATION_V2_TABLES)?;
+    Ok(())
+}
+
+/// Apply the v3 additions: the `teams`, `channels` and `team_members` tables.
+///
+/// Every statement is `CREATE TABLE/INDEX IF NOT EXISTS`, so the migration is
+/// re-entrant even if the version marker was reset.
+fn migrate_v3(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(MIGRATION_V3_TABLES)?;
     Ok(())
 }
 
@@ -721,6 +970,35 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     })
 }
 
+fn row_to_team(row: &rusqlite::Row<'_>) -> rusqlite::Result<Team> {
+    Ok(Team {
+        id: row.get(0)?,
+        name: row.get(1)?,
+    })
+}
+
+fn row_to_channel(row: &rusqlite::Row<'_>) -> rusqlite::Result<Channel> {
+    Ok(Channel {
+        id: row.get(0)?,
+        team_id: row.get(1)?,
+        name: row.get(2)?,
+        description: row.get(3)?,
+        membership_type: row.get(4)?,
+        web_url: row.get(5)?,
+        is_channel: row.get::<_, i64>(6)? != 0,
+    })
+}
+
+fn row_to_team_member(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamMember> {
+    let roles_json: String = row.get(3)?;
+    Ok(TeamMember {
+        id: row.get(0)?,
+        display_name: row.get(1)?,
+        email: row.get(2)?,
+        roles: roles_from_json(&roles_json),
+    })
+}
+
 /// Serialize reactions for storage; the only fallible part of a message write.
 fn reactions_to_json(reactions: &[Reaction]) -> Result<String> {
     serde_json::to_string(reactions).map_err(CoreError::from)
@@ -730,6 +1008,12 @@ fn reactions_to_json(reactions: &[Reaction]) -> Result<String> {
 /// reactions" rather than failing the whole read — a message is still useful
 /// without its reactions.
 fn reactions_from_json(text: &str) -> Vec<Reaction> {
+    serde_json::from_str(text).unwrap_or_default()
+}
+
+/// Parse a stored roles blob. Like reactions, a corrupt blob degrades to "no
+/// roles" rather than failing the roster read.
+fn roles_from_json(text: &str) -> Vec<String> {
     serde_json::from_str(text).unwrap_or_default()
 }
 
@@ -1318,5 +1602,194 @@ mod tests {
             None,
             "other chats are unaffected"
         );
+    }
+
+    // ----- M6: teams, channels & members -----------------------------------
+
+    fn team(id: &str, name: &str) -> Team {
+        Team {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    fn channel(id: &str, team_id: &str, name: &str) -> Channel {
+        Channel {
+            id: id.into(),
+            team_id: team_id.into(),
+            name: name.into(),
+            description: Some("about".into()),
+            membership_type: Some("standard".into()),
+            web_url: Some(format!("https://teams.microsoft.com/l/channel/{id}")),
+            is_channel: crate::model::is_channel_conversation_id(id),
+        }
+    }
+
+    fn member(id: &str, name: &str) -> TeamMember {
+        TeamMember {
+            id: id.into(),
+            display_name: name.into(),
+            email: Some(format!("{id}@example.com")),
+            roles: vec!["owner".into()],
+        }
+    }
+
+    #[test]
+    fn v2_database_upgrades_to_v3_adding_team_tables() {
+        let path = temp_path("v2-to-v3");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            // Build a genuine v2 database: the v1 DDL, the v2 `send_state`
+            // column + `read_state` table, version marker 2.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN send_state TEXT NOT NULL DEFAULT 'sent';",
+            )
+            .unwrap();
+            conn.execute_batch(MIGRATION_V2_TABLES).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+
+        let store = Store::open(&path).expect("open the v2 database");
+        // Forward-only migration reached v3.
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        // The three v3 tables exist and are queryable (an empty result, not an
+        // error, proves the DDL landed).
+        assert!(store.list_teams("default").unwrap().is_empty());
+        assert!(store.channels_for_team("team-1").unwrap().is_empty());
+        assert!(store.team_members("team-1").unwrap().is_empty());
+        // They are usable: write then read back.
+        store.upsert_teams("default", &[team("t1", "One")]).unwrap();
+        assert_eq!(store.list_teams("default").unwrap().len(), 1);
+
+        // Reopening again is a clean no-op.
+        drop(store);
+        let store = Store::open(&path).expect("reopen v3 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.list_teams("default").unwrap().len(), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn teams_and_channels_round_trip_and_are_profile_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.list_teams("default").unwrap().is_empty());
+
+        store
+            .upsert_teams("default", &[team("t2", "Zeta"), team("t1", "Alpha")])
+            .unwrap();
+        // Name order (case-insensitive), and idempotent re-upsert updates.
+        let teams = store.list_teams("default").unwrap();
+        assert_eq!(
+            teams.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["t1", "t2"]
+        );
+        store
+            .upsert_teams("default", &[team("t1", "Alpha renamed")])
+            .unwrap();
+        assert_eq!(store.list_teams("default").unwrap().len(), 2);
+        assert_eq!(
+            store.list_teams("default").unwrap()[0].name,
+            "Alpha renamed"
+        );
+        // A different profile is isolated.
+        assert!(store.list_teams("work").unwrap().is_empty());
+
+        store
+            .upsert_channels(
+                "default",
+                &[
+                    channel("19:beta@thread.tacv2", "t1", "Beta"),
+                    channel("19:alpha@thread.tacv2", "t1", "Alpha"),
+                    channel("19:other@thread.tacv2", "t2", "Other"),
+                ],
+            )
+            .unwrap();
+        let t1 = store.channels_for_team("t1").unwrap();
+        assert_eq!(
+            t1.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["19:alpha@thread.tacv2", "19:beta@thread.tacv2"]
+        );
+        assert_eq!(t1[0].team_id, "t1");
+        assert!(t1[0].is_channel);
+        assert_eq!(store.channels_for_team("t2").unwrap().len(), 1);
+
+        // Re-upsert one channel: no duplicate, fields updated.
+        let mut renamed = channel("19:beta@thread.tacv2", "t1", "Beta renamed");
+        renamed.description = None;
+        store.upsert_channels("default", &[renamed]).unwrap();
+        assert_eq!(store.channels_for_team("t1").unwrap().len(), 2);
+        let beta = store
+            .channel("t1", "19:beta@thread.tacv2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(beta.name, "Beta renamed");
+        assert!(beta.description.is_none());
+
+        // Delete drops only the named channel.
+        assert!(
+            store
+                .delete_channel("default", "t1", "19:beta@thread.tacv2")
+                .unwrap()
+        );
+        assert_eq!(store.channels_for_team("t1").unwrap().len(), 1);
+        assert!(
+            !store
+                .delete_channel("default", "t1", "19:beta@thread.tacv2")
+                .unwrap()
+        );
+        // A wrong-profile delete reports a miss.
+        assert!(
+            !store
+                .delete_channel("work", "t1", "19:alpha@thread.tacv2")
+                .unwrap()
+        );
+        assert_eq!(store.channels_for_team("t1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn team_members_round_trip_roles_and_degrade_corrupt_json() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.team_members("t1").unwrap().is_empty());
+
+        let mut bob = member("M2", "Bob");
+        bob.roles = Vec::new();
+        bob.email = None;
+        store
+            .upsert_team_members("default", "t1", &[member("M1", "Alice"), bob])
+            .unwrap();
+        let roster = store.team_members("t1").unwrap();
+        assert_eq!(
+            roster.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["M1", "M2"]
+        );
+        assert!(roster[0].is_owner());
+        assert_eq!(roster[0].roles, vec!["owner".to_string()]);
+        assert!(!roster[1].is_owner());
+        assert!(roster[1].email.is_none());
+
+        // Idempotent re-upsert: same two rows, updated display name.
+        store
+            .upsert_team_members("default", "t1", &[member("M1", "Alice Smith")])
+            .unwrap();
+        assert_eq!(store.team_members("t1").unwrap().len(), 2);
+        assert_eq!(
+            store.team_members("t1").unwrap()[0].display_name,
+            "Alice Smith"
+        );
+
+        // A corrupt roles blob degrades to "no roles" rather than failing.
+        {
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE team_members SET roles_json = 'not json' WHERE id = 'M1'",
+                [],
+            )
+            .unwrap();
+        }
+        let roster = store.team_members("t1").unwrap();
+        assert_eq!(roster.len(), 2);
+        assert!(roster[0].roles.is_empty());
     }
 }

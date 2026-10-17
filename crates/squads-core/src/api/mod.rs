@@ -15,6 +15,30 @@
 //! stores the in-memory tokens and the shared HTTP pool is lazy. Network access
 //! happens on the first `list_chats` / `read_messages` call, which is why the
 //! exit-criterion test drives the real code path against a local TCP stub.
+//!
+//! ## Which surface serves which call (M5/M6)
+//!
+//! Teams spreads one logical operation across three hosts, and the wrappers
+//! keep that split explicit (see `docs/DECISIONS.md`, channel routing):
+//!
+//! - **Chat service** (`region_gtms.chatService`, `skypetoken`) — messages in
+//!   chats **and** channels: [`ApiClient::send_message`],
+//!   [`ApiClient::read_messages_page`], [`ApiClient::thread_reply`], reactions
+//!   and read receipts. Channel conversation ids (`19:…@thread.tacv2`) are
+//!   accepted by the same endpoints; a channel *thread reply* targets the
+//!   derived conversation `<channel>;messageid=<root>`.
+//! - **Graph** (`region_gtms.graphBase`, Graph token) — metadata reads
+//!   ([`ApiClient::list_teams`], [`ApiClient::list_team_members`],
+//!   [`ApiClient::team_thread_id`]) and channel **creation**
+//!   ([`ApiClient::create_channel`]).
+//! - **Middle tier** (`region_gtms.middleTier`, AAD bearer + `X-Skypetoken`) —
+//!   the writes Graph refuses: channel edit/delete
+//!   ([`ApiClient::update_channel`], [`ApiClient::delete_channel`]) and team
+//!   creation ([`ApiClient::create_team`]).
+//!
+//! Channel reactions and read receipts are **best-effort**: they ride separate
+//! Graph paths that are not live-verified, and the chat-service consumption
+//! horizon 403s on `tacv2` threads (see `docs/BLOCKERS.md`).
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +51,9 @@ use ost::config::Config;
 /// Protocol types surfaced by the M5 chat calls, re-exported so the UI and
 /// `messaging` do not need to reach into the vendored crate.
 pub use ost::api::{MessagesPage, ReadReceipt, SentMessage};
+
+/// Protocol types surfaced by the M6 teams/channel calls.
+pub use ost::api::{ChannelInfo, TeamCreateResult, TeamInfo, TeamMemberInfo};
 
 use crate::auth::tokens::{StoredToken, TokenSet};
 use crate::error::Result;
@@ -351,6 +378,191 @@ impl ApiClient {
             .await?;
         tracing::debug!(count = receipts.len(), call, "read receipts");
         Ok(receipts)
+    }
+
+    // ----- M6: teams & channels -------------------------------------------
+
+    /// List the joined teams and their channels (Graph `/me/joinedTeams`, then
+    /// `GET /teams/{id}/channels` per team — one call to this method issues one
+    /// request per team plus the listing).
+    ///
+    /// Channel-fetch errors degrade to an empty channel list per team (the
+    /// vendored behaviour), so a single inaccessible team never fails the list.
+    pub async fn list_teams(&self) -> Result<Vec<TeamInfo>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.list_teams", call);
+        let teams = ost::api::list_teams_data(&self.client)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = teams.len(), call, "listed teams");
+        Ok(teams)
+    }
+
+    /// List one team's roster (Graph `GET /teams/{id}/members`).
+    pub async fn list_team_members(&self, team_id: &str) -> Result<Vec<TeamMemberInfo>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.list_team_members",
+            call
+        );
+        let members = ost::api::list_team_members_data(&self.client, team_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = members.len(), call, "listed team members");
+        Ok(members)
+    }
+
+    /// The team thread id from a Graph `team` answer's `internalId` (pure pass
+    /// through to the vendored helper). `None` when the field is absent or not a
+    /// thread id.
+    pub fn team_internal_id(&self, value: &serde_json::Value) -> Option<String> {
+        ost::api::team_internal_id(value)
+    }
+
+    /// Resolve a team's **Teams thread id** (`19:…@thread…`) from the Graph
+    /// group id the listing uses. Thread ids pass through; group ids read Graph
+    /// `GET /teams/{id}?$select=internalId` (the vendored `team_thread_id`).
+    ///
+    /// This is the id the middle tier keys teams/channels by, so it is the
+    /// routing value the channel writes need.
+    pub async fn team_thread_id(&self, team_id: &str) -> Result<String> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.team_thread_id",
+            call
+        );
+        let thread = ost::api::team_thread_id(&self.client, team_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "resolved team thread id");
+        Ok(thread)
+    }
+
+    /// Create a channel in `team_id` (Graph `POST /teams/{id}/channels`).
+    ///
+    /// **Routing note:** the vendored `create_channel_data` posts to **Graph**;
+    /// unlike channel edit/delete it is not on the middle tier (see the module
+    /// docs and `docs/DECISIONS.md`, channel routing). The id may be a Graph
+    /// group id or a team thread id — the vendored call uses it verbatim.
+    pub async fn create_channel(
+        &self,
+        team_id: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<ChannelInfo> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.create_channel",
+            call
+        );
+        let channel = ost::api::create_channel_data(&self.client, team_id, name, description)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "created channel");
+        Ok(channel)
+    }
+
+    /// Rename a channel and/or change its description through the **middle
+    /// tier** (`PATCH …/beta/teams/{thread}/channels/{channel}`). `name`/
+    /// `description` are `Option` (only the given fields change); an empty
+    /// change is rejected by the vendored call before any network.
+    pub async fn update_channel(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.update_channel",
+            call
+        );
+        ost::api::update_channel_data(&self.client, team_id, channel_id, name, description)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "updated channel");
+        Ok(())
+    }
+
+    /// Delete one channel through the **middle tier**
+    /// (`DELETE …/beta/teams/{thread}/channels/{channel}`). The General channel
+    /// is refused by the vendored call before any network.
+    pub async fn delete_channel(&self, team_id: &str, channel_id: &str) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.delete_channel",
+            call
+        );
+        ost::api::delete_channel_data(&self.client, team_id, channel_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "deleted channel");
+        Ok(())
+    }
+
+    /// Create one (private) team through the **middle tier**
+    /// (`POST …/beta/teams/create`), then read it back from Graph. Returns the
+    /// created team with its channels plus the vendored poll telemetry.
+    pub async fn create_team(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<TeamCreateResult> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.create_team", call);
+        let result = ost::api::create_team_data(&self.client, name, description)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "created team");
+        Ok(result)
+    }
+
+    /// Post a reply into a channel's thread (reply chain under `root_id`).
+    ///
+    /// This is **not** the quote-reply path: the vendored
+    /// `thread_reply_with_client_id` posts the plain send body (carrying
+    /// `client_message_id`) to the thread conversation
+    /// `<channel_id>;messageid=<root_id>` on the chat service. Chat/group ids
+    /// are rejected by the vendored call before any network.
+    pub async fn thread_reply(
+        &self,
+        channel_id: &str,
+        root_id: &str,
+        text: &str,
+        client_message_id: &str,
+    ) -> Result<SentMessage> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.thread_reply",
+            len = text.len(),
+            call
+        );
+        let sent = ost::api::thread_reply_with_client_id(
+            &self.client,
+            channel_id,
+            root_id,
+            text,
+            client_message_id,
+        )
+        .instrument(span)
+        .await?;
+        tracing::debug!(has_id = sent.id.is_some(), call, "sent thread reply");
+        Ok(sent)
     }
 }
 

@@ -141,7 +141,7 @@ Documentation is updated continuously:
 - [x] M3 — Local persistence & offline cache
 - [x] M4 — Realtime (Trouter)
 - [x] M5 — Messaging
-- [ ] M6 — Teams & channels
+- [x] M6 — Teams & channels
 - [ ] M7 — Files
 - [ ] M8 — Presence & notifications
 - [ ] M9 — Audio/video calls

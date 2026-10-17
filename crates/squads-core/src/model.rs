@@ -29,7 +29,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use ost::api::{ChatInfo, MessageInfo, ReactionCount, Reactor as WireReactor};
+use ost::api::{
+    ChannelInfo, ChatInfo, MessageInfo, ReactionCount, Reactor as WireReactor, TeamInfo,
+    TeamMemberInfo,
+};
 
 /// Delivery state of a message we authored (milestone **M5**).
 ///
@@ -170,6 +173,135 @@ impl From<&WireReactor> for Reactor {
             id: r.id.clone(),
             name: r.name.clone(),
         }
+    }
+}
+
+/// Whether `id` names a channel conversation (milestone **M6**).
+///
+/// Delegates to the vendored [`ost::api::is_channel_conversation_id`]: a channel
+/// thread id starts with `19:` and ends with `@thread.tacv2` (modern) or
+/// `@thread.skype` (legacy). Group chats (`@thread.v2`), meetings and 1:1s are
+/// **not** channels. Pure, so it is trivially testable.
+pub fn is_channel_conversation_id(id: &str) -> bool {
+    ost::api::is_channel_conversation_id(id)
+}
+
+/// A team the signed-in user has joined (milestone **M6**).
+///
+/// `id` is the **Graph group id** the `/me/joinedTeams` listing uses. Channel
+/// routing needs the *Teams* thread id (`19:…@thread…`) instead; that is
+/// resolved on demand with [`Teams::team_internal_id`](crate::teams::Teams) or
+/// the vendored `team_thread_id` (see `docs/DECISIONS.md`, channel routing).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Team {
+    /// Graph group id of the team.
+    pub id: String,
+    /// Display name (`displayName`, falling back to the id).
+    pub name: String,
+}
+
+impl Team {
+    /// Build a domain [`Team`] from a protocol `TeamInfo`.
+    pub fn from_info(info: &TeamInfo) -> Self {
+        Team {
+            id: info.id.clone(),
+            name: info.name.clone(),
+        }
+    }
+}
+
+impl From<&TeamInfo> for Team {
+    fn from(info: &TeamInfo) -> Self {
+        Team::from_info(info)
+    }
+}
+
+/// One channel inside a team (milestone **M6**).
+///
+/// The first six fields mirror `ost::api::ChannelInfo`; `team_id` is attached by
+/// the caller (the wire `ChannelInfo` does not carry it) and `is_channel` is
+/// derived from the id with [`is_channel_conversation_id`] — a channel that is
+/// not a `@thread.tacv2`/`@thread.skype` conversation (an unusual/legacy id)
+/// still lists, but `is_channel` is `false` so callers do not mistake it for a
+/// channel *conversation* they can post into.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Channel {
+    /// Channel thread id (`19:…@thread.tacv2`).
+    pub id: String,
+    /// Owning team's Graph group id.
+    pub team_id: String,
+    /// Display name (`displayName`, falling back to the id).
+    pub name: String,
+    /// Graph `description`, when set.
+    pub description: Option<String>,
+    /// Graph `membershipType` (`standard`/`private`/`shared`).
+    pub membership_type: Option<String>,
+    /// Graph `webUrl` (open-in-browser deep link).
+    pub web_url: Option<String>,
+    /// Local: whether [`Channel::id`] is a channel conversation id (see above).
+    pub is_channel: bool,
+}
+
+impl Channel {
+    /// Build a domain [`Channel`] from a protocol `ChannelInfo`, attaching the
+    /// owning `team_id` and deriving `is_channel` from the id.
+    pub fn from_info(team_id: impl Into<String>, info: &ChannelInfo) -> Self {
+        Channel {
+            id: info.id.clone(),
+            team_id: team_id.into(),
+            name: info.name.clone(),
+            description: info.description.clone(),
+            membership_type: info.membership_type.clone(),
+            web_url: info.web_url.clone(),
+            is_channel: is_channel_conversation_id(&info.id),
+        }
+    }
+}
+
+impl From<(&str, &ChannelInfo)> for Channel {
+    fn from((team_id, info): (&str, &ChannelInfo)) -> Self {
+        Channel::from_info(team_id, info)
+    }
+}
+
+/// One team roster entry (milestone **M6**).
+///
+/// Mirrors `ost::api::TeamMemberInfo`. `id` is the **membership** id (the DELETE
+/// target), not the user id; `roles` carries Graph role names and contains
+/// `"owner"` for team owners. The owner flag is derivable from `roles` and is
+/// deliberately not duplicated here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMember {
+    /// Membership id (not the user id).
+    pub id: String,
+    /// Display name (`displayName`, falling back to the membership id).
+    pub display_name: String,
+    /// Email address, when Graph named one.
+    pub email: Option<String>,
+    /// Graph role names (`["owner"]` for owners, empty for members).
+    pub roles: Vec<String>,
+}
+
+impl TeamMember {
+    /// Build a domain [`TeamMember`] from a protocol `TeamMemberInfo`.
+    pub fn from_info(info: &TeamMemberInfo) -> Self {
+        TeamMember {
+            id: info.id.clone(),
+            display_name: info.display_name.clone(),
+            email: info.email.clone(),
+            roles: info.roles.clone(),
+        }
+    }
+
+    /// Whether this member holds the `owner` role.
+    pub fn is_owner(&self) -> bool {
+        self.roles.iter().any(|r| r == "owner")
+    }
+}
+
+impl From<&TeamMemberInfo> for TeamMember {
+    fn from(info: &TeamMemberInfo) -> Self {
+        TeamMember::from_info(info)
     }
 }
 
@@ -511,5 +643,91 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: Message = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, msg);
+    }
+
+    // ----- M6: teams, channels, members -------------------------------------
+
+    #[test]
+    fn team_and_member_convert_from_protocol_types() {
+        let team = Team::from_info(&TeamInfo {
+            id: "group-1".into(),
+            name: "Engineering".into(),
+            channels: Vec::new(),
+        });
+        assert_eq!(team.id, "group-1");
+        assert_eq!(team.name, "Engineering");
+
+        let member = TeamMember::from_info(&TeamMemberInfo {
+            id: "M1".into(),
+            display_name: "Alice".into(),
+            user_id: Some("oid-1".into()),
+            email: Some("alice@example.com".into()),
+            roles: vec!["owner".into()],
+            is_owner: true,
+        });
+        assert_eq!(member.id, "M1");
+        assert_eq!(member.display_name, "Alice");
+        assert_eq!(member.email.as_deref(), Some("alice@example.com"));
+        assert_eq!(member.roles, vec!["owner".to_string()]);
+        assert!(member.is_owner());
+
+        let plain = TeamMember::from_info(&TeamMemberInfo {
+            id: "M2".into(),
+            display_name: "Bob".into(),
+            user_id: None,
+            email: None,
+            roles: Vec::new(),
+            is_owner: false,
+        });
+        assert!(!plain.is_owner());
+        assert!(plain.email.is_none());
+    }
+
+    #[test]
+    fn channel_from_info_attaches_team_and_derives_is_channel() {
+        let info = ChannelInfo {
+            id: "19:general@thread.tacv2".into(),
+            name: "General".into(),
+            description: Some("Team-wide".into()),
+            membership_type: Some("standard".into()),
+            web_url: Some("https://teams.microsoft.com/l/channel/x".into()),
+        };
+        let channel = Channel::from_info("group-1", &info);
+        assert_eq!(channel.id, "19:general@thread.tacv2");
+        assert_eq!(channel.team_id, "group-1");
+        assert_eq!(channel.name, "General");
+        assert_eq!(channel.description.as_deref(), Some("Team-wide"));
+        assert_eq!(channel.membership_type.as_deref(), Some("standard"));
+        assert_eq!(
+            channel.web_url.as_deref(),
+            Some("https://teams.microsoft.com/l/channel/x")
+        );
+        assert!(channel.is_channel);
+        // The tuple `From` impl delegates to `from_info`.
+        assert_eq!(Channel::from(("group-1", &info)), channel);
+
+        // A rare non-channel id still lists but is not classified as a channel
+        // conversation.
+        let odd = ChannelInfo {
+            id: "19:legacy@thread.v2".into(),
+            name: "Legacy".into(),
+            description: None,
+            membership_type: None,
+            web_url: None,
+        };
+        assert!(!Channel::from_info("group-1", &odd).is_channel);
+    }
+
+    #[test]
+    fn channel_classification_matches_teams_shapes() {
+        assert!(is_channel_conversation_id("19:abc@thread.tacv2"));
+        assert!(is_channel_conversation_id("19:abc@thread.skype"));
+        assert!(is_channel_conversation_id("  19:abc@thread.tacv2  "));
+        // Group chats, 1:1s and meetings are not channels.
+        assert!(!is_channel_conversation_id("19:abc@thread.v2"));
+        assert!(!is_channel_conversation_id("19:abc@unq.gbl.spaces"));
+        assert!(!is_channel_conversation_id("19:team@thread.v2"));
+        assert!(!is_channel_conversation_id(""));
+        assert!(!is_channel_conversation_id("not-a-thread"));
     }
 }

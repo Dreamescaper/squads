@@ -545,4 +545,108 @@ is cheap and is already the offline-first path.
 - If a future requirement needs server-exact paging across restarts, the cursor
   can be persisted behind the existing `Messaging` API without changing callers.
 
+---
+
+## ADR-017 — Teams/channel metadata in a schema-v3 side cache
+
+**Status:** accepted (M6)
+
+**Context.** M6 needs to browse joined teams, their channels and rosters, and
+cache them for an instant, offline-capable M10 browser. Two shapes were
+possible: (a) reuse `chats` for channels (a channel *is* a conversation), or
+(b) add dedicated tables. Reusing `chats` would conflate the chat list with the
+channel list (different ordering, no team grouping, different write paths), and
+channels/teams carry metadata `chats` does not (team ownership, channel
+membership type / web url, roster roles).
+
+**Decision.** Add a **schema v3** with three tables — `teams(id, profile)`,
+`channels(id, team_id)` (plus the `profile` and `is_channel` columns) and
+`team_members(id, team_id)` (plus `profile` and `roles_json`) — with the batch
+upserts and ordered queries listed in PROGRESS (M6). IDs are the wire ids
+(Graph group id for a team, `19:…@thread.tacv2` for a channel, the membership id
+for a roster entry). Migration v2→v3 is `CREATE TABLE/INDEX IF NOT EXISTS`
+(re-entrant); `SCHEMA_VERSION` is 3 and a newer `user_version` remains a hard
+error. `roles` round-trips as a JSON column with the same
+corrupt-blob-degrades-to-empty rule as message reactions.
+
+**Consequences.**
+
+- The channel browser reads entirely from the store; `list_teams` is the only
+  network path and it write-throughs teams **and** their channels in one pass
+  (the Graph listing carries channels inline).
+- `channels` and `team_members` are keyed by their owning id but carry a
+  `profile` column, matching the M3 `messages` convention; profile-scoped reads
+  are not (yet) enforced for them, mirroring the documented U-001 assumption
+  that conversation/team ids are account-unique.
+- No encryption change: team/channel/member metadata joins chat content in the
+  plaintext store (B-007).
+- The service is free to add a `teams`/`channels` UI flag later without a new
+  table, exactly as `chats.unread`/`pinned` remain local-only.
+
+---
+
+## ADR-018 — Channel routing: chat service for messages, Graph for metadata, middle tier for the writes Graph refuses
+
+**Status:** accepted (M6)
+
+**Context.** A channel looks like a chat (it is a conversation id), but Teams
+splits channel operations across three hosts, and the native chat service does
+not uniformly accept channel-shaped calls:
+
+- **Messages** (history, top-level posts, thread replies) live on the native
+  chat service (`ng.msg`, `skypetoken`) — the same endpoints as chats. The
+  vendored crate already routes a channel *thread reply* to the derived
+  conversation `<channelId>;messageid=<rootId>` (the reply-chain shape the
+  server stamps on replies), rejects non-channel ids, and accepts a
+  `clientmessageid` for idempotency.
+- **Metadata** (joined teams, channels, rosters, the team `internalId`) is
+  **Graph**.
+- **Writes Graph refuses** with the first-party token — channel edit/delete and
+  team creation — go to the **apps-platform middle tier**, shaped like the Teams
+  web client's own requests (vendor §GRAPHSWEEP3). Channel **creation** is the
+  exception: the vendored `create_channel_data` still posts to Graph
+  (`POST /teams/{id}/channels`).
+
+Reimplementing any of these in `squads-core` would violate ADR-001 and duplicate
+fragile, reverse-engineered shapes.
+
+**Decision.** `squads-core` **wraps** the vendored calls and makes the routing
+explicit at the `ApiClient` / `Teams` boundary:
+
+1. **Chat service** — `ApiClient::{send_message, read_messages_page,
+   thread_reply}`; `Teams::{open_channel, load_older_channel, post_to_channel,
+   reply_in_thread}` reuse [`Messaging`] / `thread_reply_with_client_id`
+   unchanged. Channel conversation ids are accepted as-is.
+2. **Graph** — `ApiClient::{list_teams, list_team_members, team_thread_id,
+   create_channel}`.
+3. **Middle tier** — `ApiClient::{update_channel, delete_channel, create_team}`;
+   a group id is resolved to the team thread id first (Graph `internalId`), and
+   the channel writes are keyed by that thread id.
+
+The **thread-reply conversation mapping** is documented, not hidden: a channel
+reply is stored under the derived conversation `<channel_id>;messageid=<root_id>`
+with the root echoed in `Message::reply_to`; the UI must group replies by that
+thread id, not the channel id. `Teams::thread_conversation` exposes the mapping
+so callers cannot drift.
+
+**Consequences.**
+
+- Every routing decision is testable offline: the write tests point `graphBase`
+  and `middleTier` at the same local stub and assert the exact method/path/auth
+  (`/me/joinedTeams`, `/beta/teams/{thread}/channels/{channel}` with AAD bearer +
+  `X-Skypetoken`, `/beta/teams/create`, and the chat-service
+  `<channel>;messageid=<root>` reply URL).
+- **Channel reactions and read receipts are not wired.** The chat-service
+  reaction path 404s on channel threads and its consumption horizon 403s; the
+  alternative Graph reaction paths are unverified live. They are deferred to a
+  live-verified follow-up and recorded as **U-003**.
+- **`create_channel` rides Graph**, not the middle tier, because that is what the
+  vendored helper does; if Graph refuses it with the Teams token, routing it
+  through the middle tier is a contained change in `ApiClient::create_channel`
+  (the milestone brief expected the middle tier — this is a vendor-vs-brief
+  discrepancy, recorded in U-003).
+- If the vendored crate later moves channel creation to the middle tier, the
+  wrapper picks up the change with no caller impact.
+
+
 

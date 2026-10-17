@@ -33,6 +33,7 @@ use crate::messaging::Messaging;
 use crate::paths::AppDirs;
 use crate::realtime::{RealtimeEvent, RealtimeService};
 use crate::store::Store;
+use crate::teams::Teams;
 
 /// High-level state of the local client, independent of rendering.
 ///
@@ -231,6 +232,23 @@ impl Session {
     pub fn messaging(&mut self) -> Result<Messaging> {
         let client = self.api_arc()?;
         Ok(Messaging::new(
+            self.profile.clone(),
+            Arc::clone(&self.store),
+            client,
+        ))
+    }
+
+    /// The M6 teams & channels service for this session.
+    ///
+    /// Shares the session's [`Store`] and protocol client (the same
+    /// `Arc<ApiClient>` [`Session::messaging`] hands out). Requires a token set
+    /// ([`CoreError::NotSignedIn`] otherwise); building is offline. Like
+    /// [`Session::messaging`], the returned [`Teams`] owns its own in-memory
+    /// channel-history cursors, so callers that page a channel should keep the
+    /// handle they get back.
+    pub fn teams(&mut self) -> Result<Teams> {
+        let client = self.api_arc()?;
+        Ok(Teams::new(
             self.profile.clone(),
             Arc::clone(&self.store),
             client,
@@ -857,6 +875,34 @@ mod tests {
             "building the service is offline"
         );
         // The session's cached client is the same one the service holds.
+        assert!(session.has_api());
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp2).ok();
+    }
+
+    #[test]
+    fn teams_requires_tokens_and_shares_the_store_and_client() {
+        let (tmp, dirs_a) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs_a, "default", store).expect("session");
+        // No tokens yet: building the service must fail cleanly, no network.
+        let err = session.teams().unwrap_err();
+        assert!(matches!(err, CoreError::NotSignedIn), "got {err:?}");
+
+        let (tmp2, dirs2) = dirs();
+        let store2 = Arc::new(MemoryTokenStore::new());
+        store2.save("work", &sample_set()).unwrap();
+        let mut session = Session::with_store(dirs2, "work", store2).expect("session");
+        session.restore().expect("restore");
+
+        let teams = session.teams().expect("teams");
+        assert_eq!(teams.profile(), "work");
+        assert!(Arc::ptr_eq(teams.store(), session.store()));
+        assert_eq!(
+            teams.client().request_count(),
+            0,
+            "building the service is offline"
+        );
         assert!(session.has_api());
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&tmp2).ok();

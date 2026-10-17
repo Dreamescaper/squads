@@ -204,6 +204,51 @@ vendored crate + stubs, not proven; channel messaging needs M6 routing.
 slot in channel routing; M8 consumes `read_state`; the deterministic stub tests
 pin the exact request shapes so a regression in formatting is caught.
 
+### U-003 — M6 teams/channels aspects not exercised offline
+
+M6's teams/channel calls are thin wrappers over the vendored crate, tested
+offline against local TCP stubs (method/path/auth/body + store effects). The
+following cannot be exercised here (B-002 — no live tenant):
+
+- **Channel reactions and read receipts are best-effort and not wired.** The
+  chat-service reaction endpoint (`/messages/{id}/reactions`) **404s** on channel
+  threads and the consumption-horizon call (`/v1/threads/{id}/consumptionhorizons`)
+  **403s** (`AclCheckFailed`); the alternative Graph `setReaction`/`unsetReaction`
+  paths the vendor added are **NOT verified live** (auth was down when they
+  landed). M6 therefore exposes **no** channel react/mark-read: chats keep the M5
+  [`Messaging`] paths. Wiring channel reactions/receipts needs a signed-in probe
+  to settle the Graph-vs-chat-service id mapping and the scope grant.
+- **`create_channel` rides Graph, not the middle tier.** The vendored
+  `create_channel_data` posts to Graph (`POST /teams/{id}/channels`, body
+  `displayName` + optional `description`); like the channel edit/delete routes it
+  is *not* live-verified and may surface a 403 (the Teams first-party token's
+  `Channel.Create` grant is unconfirmed). The milestone brief listed it among the
+  middle-tier writes, but the vendored helper uses Graph; `ApiClient::create_channel`
+  wraps the helper as-is. If Graph refuses it live, routing it through the middle
+  tier is a contained change (see ADR-018).
+- **Write acceptance for channel/team writes.** The exact server acceptance of
+  the Graph create, the middle-tier `PATCH`/`DELETE …/beta/teams/{thread}/channels/{channel}`
+  bodies and `POST …/beta/teams/create` — in particular that the middle tier keys
+  the delete on the URL and that the create answer carries `value.siteInfo.groupId` —
+  is assumed from the vendored crate + stubs, not proven. The stub tests pin the
+  request shapes so a regression is caught.
+- **Thread-reply reconciliation.** `reply_in_thread` stores the reply under the
+  derived conversation `<channel>;messageid=<root>`; the realtime `NewMessage`
+  for a channel reply would presumably arrive on that conversation, but the
+  live `conversationLink`/id mapping is unverified. A pending→sent realtime race
+  can still create a duplicate row until a resync (same shape as U-002).
+- **Roster/owner semantics.** `TeamMember.id` is the **membership** id, not the
+  user id; the owner flag is derived from `roles` containing `"owner"`. Both come
+  straight from the vendored parser and are not validated against a live roster.
+
+**Impact:** channel write correctness and the channel reaction/receipt story are
+assumed from the vendored crate + stubs.
+
+**Mitigation:** keep the writes behind `ApiClient`/`Teams`; the deterministic stub
+tests pin the exact paths/bodies/auth so a regression is caught; wire channel
+reactions/receipts in a live-verified follow-up (candidate for M8, alongside
+presence/notifications).
+
 ## Deferred work
 
 ### D-001 — Third-party Teams app hosting (TeamsJS/web frames)

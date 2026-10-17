@@ -12,7 +12,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started · ⛔ blocked (see [BLO
 | M3 | Local persistence & offline cache | ✅ | UI-free `model`; bundled-SQLite `Store` (`user_version` migrations, idempotent upserts, per-chat paging); JSON `Settings` with atomic saves; `Session` owns the store. |
 | M4 | Realtime (Trouter) | ✅ | Wrap the vendored Trouter loop; `RealtimeEvent` decode; `EventBus` broadcast fan-out; collector write-through; `Session::start_realtime`/`subscribe`. |
 | M5 | Messaging | ✅ | `api` chat wrappers (page/send/reply/edit/delete/react/receipts); offline-first `Messaging` (open/load_older, optimistic `SendState` send + idempotent retry); shared `text` module; schema **v2** (`send_state`, `read_state`); `Session::messaging()`. |
-| M6 | Teams & channels | ⬜ | |
+| M6 | Teams & channels | ✅ | `api` teams wrappers (list teams/members, thread reply, channel/team writes); `model::{Team,Channel,TeamMember}`; schema **v3** (`teams`,`channels`,`team_members`); offline-first `Teams` (metadata cache, channel history via `Messaging`, optimistic channel post + thread reply); `Session::teams()`. |
 | M7 | Files | ⬜ | |
 | M8 | Presence & notifications | ⬜ | |
 | M9 | Audio/video calls | ⬜ | |
@@ -387,3 +387,103 @@ agree.
 **Blockers.** **U-002** (untested live: real send/edit/react/mark-read, and the
 channel-vs-chat reaction/receipt differences). B-007 (chat/message content is
 still stored unencrypted at rest — the v2 columns add no new exposure).
+
+---
+
+## M6 — Teams & channels
+
+**Goal.** Turn the M2 client + M3 store into the teams/channels service the M10
+browser drives: joined teams, channels, rosters, channel history, optimistic
+channel posts and thread replies, and team/channel writes routed to the surface
+that actually serves them (chat service / Graph / middle tier) — all testable
+offline against local TCP stubs.
+
+**Landed.**
+
+- `api` (M2 module, extended) — typed, instrumented wrappers over the vendored
+  teams/channel calls, in the existing `ApiClient` style (redacting `Debug`,
+  request counter, `tracing` spans): `list_teams` (Graph `/me/joinedTeams` +
+  per-team channel fetch), `list_team_members`, `team_internal_id` (pure
+  delegate) / `team_thread_id` (Graph `internalId` resolution),
+  `create_channel` (Graph), `update_channel` / `delete_channel` (middle tier),
+  `create_team` (middle tier), and `thread_reply` (chat service). Protocol types
+  `TeamInfo` / `ChannelInfo` / `TeamMemberInfo` / `TeamCreateResult` are
+  re-exported. The module docs now classify **which host serves which call**.
+- `model` — `Team { id, name }`, `Channel { id, team_id, name, description,
+  membership_type, web_url, is_channel }` (`Channel::from_info(team_id, &info)`
+  / `From<(&str, &ChannelInfo)>`), `TeamMember { id, display_name, email, roles }`
+  (`is_owner()`), and `is_channel_conversation_id(id)` (delegates to the vendored
+  classifier). `Channel::is_channel` is derived from the id so a rare
+  non-`tacv2`/`skype` id still lists but is not treated as a channel
+  conversation.
+- `store` — **schema v3**. `teams(id, profile)` name-keyed, `channels(id,
+  team_id)` (+ `profile`, `is_channel`) and `team_members(id, team_id)` (+
+  `profile`, `roles_json`), with `upsert_teams` / `list_teams` /
+  `upsert_channels` / `channels_for_team` / `channel` / `delete_channel` /
+  `upsert_team_members` / `team_members`. Upserts are idempotent and
+  `updated_at` only advances; a corrupt `roles_json` degrades to "no roles".
+  `SCHEMA_VERSION = 3`; the v2→v3 migration is `CREATE TABLE/INDEX IF NOT
+  EXISTS`, so it is re-entrant, and the "newer version is a hard error"
+  behaviour is unchanged.
+- `teams` — the offline-first service `Teams { profile, Arc<Store>,
+  Arc<ApiClient>, Messaging }`:
+  - `cached_teams` / `list_teams` (fetch Graph, upsert teams **and** their
+    channels, return cached), `cached_channels` / `channels`, `members` /
+    `cached_members`.
+  - `open_channel(channel_id, limit)` / `load_older_channel(channel_id)` —
+    reuse `Messaging` (channel conversation ids go through the same chat-service
+    endpoints as chats); the `Teams` handle holds one `Messaging` so the paging
+    cursor survives between `open_channel` and `load_older_channel`.
+  - `post_to_channel` — optimistic, reuses `Messaging::send_text`.
+  - `reply_in_thread(channel_id, root_id, text)` — mints a `client_message_id`,
+    upserts a `Pending` row under the derived thread conversation
+    `<channel>;messageid=<root>` **before** the POST, calls the vendored
+    `thread_reply_with_client_id`, then re-keys to the server id and marks
+    `Sent` (or `Failed`, retained, on error). `thread_conversation` exposes the
+    mapping.
+  - `create_channel` (Graph, caches the returned channel), `update_channel`
+    (middle tier, refreshes the cached row from the change args),
+    `delete_channel` (middle tier, drops the cached row), `create_team` (middle
+    tier, caches the new team + channels).
+- `session` — `Session::teams()` mirrors `Session::messaging()`: shares the
+  session's store and `Arc<ApiClient>`, offline to build, `NotSignedIn` without
+  tokens.
+
+**Decisions.** **ADR-017** (schema v3: teams/channels/team_members), **ADR-018**
+(channel routing — chat service for messages, Graph for metadata, middle tier
+for the writes Graph refuses; and the thread-reply conversation mapping
+`<channel>;messageid=<root>`).
+
+**Tests.** `cargo test -p squads-core` — **166** offline unit tests (146 from
+M1–M5 + 20 new: 3 `model`, 3 `store`, 13 `teams`, 1 `session`). `cargo test -p
+squads-protocol` still passes **377**. New coverage includes: `list_teams`
+parsing + caching teams and channels into the store (stub `/me/joinedTeams` +
+`/teams/{id}/channels`); `channels` refresh; member parsing incl. owner roles +
+caching; `open_channel`/`load_older_channel` paging through the chat service;
+`post_to_channel` optimistic pending→sent + exact RichText request shape;
+`reply_in_thread` hitting the thread-reply path (URL **and** body carry the root
+id) with the optimistic pending row stored under the thread conversation and the
+same pending→sent re-key, plus a failure leaving a `Failed` row; `create_channel`
+on Graph; `update_channel`/`delete_channel` PATCH/DELETE on the middle-tier base
+(percent-encoded `/beta/teams/{thread}/channels/{channel}`, AAD bearer +
+`X-Skypetoken`, never the Graph token); `create_team` POSTing the web body to
+`/beta/teams/create`; the **v2→v3 upgrade** (open a hand-built v2 database →
+reopen → the three tables exist and are writable); and the
+`is_channel_conversation_id` classification.
+
+**How to verify manually** (real tenant; not runnable here): sign in, build
+`session.teams()`, `list_teams()` and confirm the teams/channels appear and are
+cached (`cached_teams()` in a fresh process, no network); `members(team)` shows
+owners; `open_channel(id, 50)`/`load_older_channel(id)` page history;
+`post_to_channel` posts a top-level message and the bubble goes pending → sent;
+`reply_in_thread(channel, root, text)` posts into the thread (the reply's
+`conversationLink` must be `<channel>;messageid=<root>`) and renders under the
+thread, not the channel root. Then `create_channel`, `update_channel`,
+`delete_channel` and `create_team` and confirm the tenant agrees.
+
+**Blockers.** **U-003** (untested live: channel reactions/receipts are
+best-effort and **not wired**; `create_channel` rides Graph in the vendored
+crate, not the middle tier; the exact middle-tier/Graph write acceptance is
+unproven). B-007 (channel/team metadata joins chat content in the unencrypted
+store).
+
