@@ -30,7 +30,7 @@ use std::time::Duration;
 use squads_core::api::JoinTarget;
 use squads_core::model::{Channel, Identity, Meeting, Message, Person, SearchHit, SendState};
 use squads_core::{
-    Accent, AppDirs, Calendar, CallIdentity, CallLogEntry, CallService, CallState, Chat,
+    Accent, AppDirs, Calendar, CallIdentity, CallLogEntry, CallService, CallState, Chat, Chats,
     ContactPresence, FileEntry, Files, IncomingCall, MediaCache, Messaging, NotificationContext,
     People, RealtimeEvent, Search, Session, Settings, SignInProgress, Store, Team, Teams, Theme,
 };
@@ -170,6 +170,25 @@ pub enum Action {
     ClearPeopleSelection,
     /// Open/close the reusable people-picker overlay (B3).
     TogglePeoplePicker,
+    /// Open the people picker in **"new chat"** mode (B2a): picking one person
+    /// creates a 1:1, several create a group.
+    NewChat,
+    /// Create the chat from the current people-picker selection (B2a).
+    CreateChat,
+    /// Open/close a chat's context menu (B2a).
+    ToggleChatMenu(String),
+    /// Mute/unmute one chat (B2a): the local routing flag plus the server write.
+    ToggleChatMuted(String),
+    /// Hide/unhide one chat (B2a): the local flag plus the server write.
+    ToggleChatHidden(String),
+    /// Ask to leave a chat (opens the confirmation) (B2a).
+    RequestLeaveChat(String),
+    /// Confirm leaving a chat (B2a).
+    ConfirmLeaveChat(String),
+    /// Cancel a pending leave (B2a).
+    CancelLeaveChat,
+    /// Show/hide the collapsed hidden-chats section (B2a).
+    ToggleShowHidden,
     /// Refresh the upcoming meetings from the calendar service (M12).
     RefreshCalendar,
     /// Refresh the calendar **week** view (M12): the next 7 days.
@@ -404,6 +423,19 @@ pub struct SquadsApp {
     people_picker_open: bool,
     focus_people_search: bool,
 
+    /// Chat management (B2a): the create/leave/mute/hide service handle, the
+    /// local flag mirrors (recomputed with the chat list), the collapsed
+    /// hidden-section toggle, the open context menu, the new-chat flow state,
+    /// and the pending leave confirmation.
+    chats_svc: Option<Arc<Chats>>,
+    muted_ids: HashSet<String>,
+    hidden_ids: HashSet<String>,
+    show_hidden: bool,
+    chat_menu: Option<String>,
+    new_chat_open: bool,
+    new_chat_topic: String,
+    leave_confirm: Option<String>,
+
     /// Calendar (M12): the cached upcoming meetings, whether a fetch is in
     /// flight, the last resolved join target, the agenda/week toggle, and the
     /// "new meeting" form fields.
@@ -561,6 +593,14 @@ impl SquadsApp {
             people_loading: false,
             people_picker_open: false,
             focus_people_search: false,
+            chats_svc: None,
+            muted_ids: HashSet::new(),
+            hidden_ids: HashSet::new(),
+            show_hidden: false,
+            chat_menu: None,
+            new_chat_open: false,
+            new_chat_topic: String::new(),
+            leave_confirm: None,
             meetings: Vec::new(),
             calendar_loading: false,
             join_target: None,
@@ -700,6 +740,57 @@ impl SquadsApp {
     /// Take the one-shot people-picker focus request.
     pub fn take_people_focus(&mut self) -> bool {
         std::mem::take(&mut self.focus_people_search)
+    }
+
+    // ----- B2a: new chat & chat management ----------------------------------
+
+    /// Whether the people picker is in "new chat" mode.
+    pub fn new_chat_open(&self) -> bool {
+        self.new_chat_open
+    }
+
+    /// The new-chat group topic.
+    ///
+    /// The picker edits it through [`new_chat_topic_mut`](SquadsApp::new_chat_topic_mut);
+    /// the getter is used by the headless tests.
+    #[cfg(test)]
+    pub(crate) fn new_chat_topic(&self) -> &str {
+        &self.new_chat_topic
+    }
+
+    /// Mutable new-chat group topic (the picker edits it).
+    pub fn new_chat_topic_mut(&mut self) -> &mut String {
+        &mut self.new_chat_topic
+    }
+
+    /// Whether one chat is muted (the local routing flag, M8/B2a).
+    pub fn is_chat_muted(&self, chat_id: &str) -> bool {
+        self.muted_ids.contains(chat_id)
+    }
+
+    /// Whether one chat is hidden (B2a).
+    pub fn is_chat_hidden(&self, chat_id: &str) -> bool {
+        self.hidden_ids.contains(chat_id)
+    }
+
+    /// Whether the collapsed hidden-chats section is shown.
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
+    }
+
+    /// How many chats are hidden.
+    pub fn hidden_count(&self) -> usize {
+        self.hidden_ids.len()
+    }
+
+    /// The chat whose context menu is open, if any.
+    pub fn chat_menu(&self) -> Option<&str> {
+        self.chat_menu.as_deref()
+    }
+
+    /// The chat a leave is pending confirmation for, if any.
+    pub fn leave_confirm(&self) -> Option<&str> {
+        self.leave_confirm.as_deref()
     }
 
     /// Test-only: seed the global file-search query and results (the headless
@@ -1314,6 +1405,136 @@ impl SquadsApp {
         }
     }
 
+    // ----- B2a: new chat & chat management ----------------------------------
+
+    /// Open the people picker in **"new chat"** mode with a clean selection.
+    fn open_new_chat(&mut self) {
+        self.people_selected.clear();
+        self.people_query.clear();
+        self.people_results.clear();
+        self.people_loading = false;
+        self.new_chat_topic.clear();
+        self.new_chat_open = true;
+        self.people_picker_open = true;
+        self.focus_people_search = true;
+    }
+
+    /// Create a chat from the picker selection: one person → a 1:1, several →
+    /// a group with the topic. The picker closes either way.
+    fn create_chat(&mut self) {
+        let people = self.people_selected.clone();
+        if people.is_empty() {
+            self.toasts.push(Toast {
+                text: "Pick at least one person to start a chat.".into(),
+                error: false,
+            });
+            return;
+        }
+        let topic = self.new_chat_topic.trim().to_string();
+        self.people_picker_open = false;
+        self.new_chat_open = false;
+        if people.len() == 1 {
+            self.create_one_to_one(people[0].clone());
+        } else {
+            self.create_group(topic, people);
+        }
+    }
+
+    /// Create a 1:1 chat with `person` (their Graph id is the create call's
+    /// user ref) and open it on success.
+    fn create_one_to_one(&mut self, person: Person) {
+        let Some(chats) = self.chats_svc.clone() else {
+            return;
+        };
+        self.runtime.spawn(async move {
+            match chats.new_one_to_one(&person.id).await {
+                Ok(chat) => AppEvent::ChatCreated(chat),
+                Err(e) => AppEvent::Error(format!("new chat: {e}")),
+            }
+        });
+    }
+
+    /// Create a group chat with `people` and an optional `topic`.
+    fn create_group(&mut self, topic: String, people: Vec<Person>) {
+        let Some(chats) = self.chats_svc.clone() else {
+            return;
+        };
+        let ids: Vec<String> = people.iter().map(|p| p.id.clone()).collect();
+        let topic = if topic.is_empty() { None } else { Some(topic) };
+        self.runtime.spawn(async move {
+            match chats.new_group(topic.as_deref(), &ids).await {
+                Ok(chat) => AppEvent::ChatCreated(chat),
+                Err(e) => AppEvent::Error(format!("new group: {e}")),
+            }
+        });
+    }
+
+    /// Toggle one chat's mute: the **local** routing flag (M8) is written
+    /// synchronously — immediate and offline — and the **server** write is
+    /// best-effort on the backend (B2a/ADR-038). The service re-affirms the
+    /// local flag and records the server state.
+    fn toggle_chat_muted(&mut self, chat_id: String) {
+        let muted = !self.is_chat_muted(&chat_id);
+        let _ = self.store.set_chat_muted(&self.profile, &chat_id, muted);
+        self.reload_chat_flags();
+        if let Some(chats) = self.chats_svc.clone() {
+            self.runtime.spawn(async move {
+                match chats.set_muted(&chat_id, muted).await {
+                    Ok(()) => AppEvent::ChatFlagsChanged,
+                    Err(e) => AppEvent::Error(format!("mute: {e}")),
+                }
+            });
+        }
+    }
+
+    /// Toggle one chat's hidden flag (local immediate, server best-effort).
+    fn toggle_chat_hidden(&mut self, chat_id: String) {
+        let hidden = !self.is_chat_hidden(&chat_id);
+        let _ = self.store.set_chat_hidden(&self.profile, &chat_id, hidden);
+        self.reload_chat_flags();
+        if let Some(chats) = self.chats_svc.clone() {
+            self.runtime.spawn(async move {
+                match chats.set_hidden(&chat_id, hidden).await {
+                    Ok(()) => AppEvent::ChatFlagsChanged,
+                    Err(e) => AppEvent::Error(format!("hide: {e}")),
+                }
+            });
+        }
+    }
+
+    /// Confirm leaving `chat_id`: remove it from the server roster and drop it
+    /// from the local list.
+    fn confirm_leave_chat(&mut self, chat_id: String) {
+        self.leave_confirm = None;
+        self.chat_menu = None;
+        let Some(chats) = self.chats_svc.clone() else {
+            return;
+        };
+        self.runtime.spawn(async move {
+            match chats.leave(&chat_id).await {
+                Ok(()) => AppEvent::ChatLeft(chat_id),
+                Err(e) => AppEvent::Error(format!("leave: {e}")),
+            }
+        });
+    }
+
+    /// Recompute the local mute/hidden mirrors from the store (called with the
+    /// chat list, never per frame).
+    fn reload_chat_flags(&mut self) {
+        self.muted_ids = self
+            .store
+            .muted_chats(&self.profile)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        self.hidden_ids = self
+            .store
+            .hidden_chats(&self.profile)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    }
+
     /// Re-install the theme from the current settings (after a preference
     /// change) and persist them.
     fn reinstall_theme(&mut self) {
@@ -1390,6 +1611,12 @@ impl SquadsApp {
         if self.people_svc.is_none() {
             match self.session.people() {
                 Ok(service) => self.people_svc = Some(Arc::new(service)),
+                Err(e) => self.push_error(e),
+            }
+        }
+        if self.chats_svc.is_none() {
+            match self.session.chats() {
+                Ok(service) => self.chats_svc = Some(Arc::new(service)),
                 Err(e) => self.push_error(e),
             }
         }
@@ -1496,6 +1723,8 @@ impl SquadsApp {
                 }
             }
         }
+        // B2a: re-derive the local mute/hidden mirrors alongside the list.
+        self.reload_chat_flags();
     }
 
     fn reload_timeline(&mut self) {
@@ -2045,6 +2274,34 @@ impl SquadsApp {
                 }
                 self.people_loading = false;
             }
+            AppEvent::ChatCreated(chat) => {
+                if let Err(e) = self
+                    .store
+                    .upsert_chats(&self.profile, std::slice::from_ref(&chat))
+                {
+                    self.push_error(e);
+                }
+                self.people_selected.clear();
+                self.new_chat_open = false;
+                self.reload_chats_from_store();
+                // Open the new conversation (B2a).
+                self.select_chat(chat.id);
+                self.page = Page::Chats;
+            }
+            AppEvent::ChatLeft(chat_id) => {
+                self.reload_chats_from_store();
+                if self.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                    self.selected_chat = None;
+                    self.timeline.clear();
+                    self.has_older = false;
+                    self.files.clear();
+                }
+                self.toasts.push(Toast {
+                    text: "Left the chat.".into(),
+                    error: false,
+                });
+            }
+            AppEvent::ChatFlagsChanged => self.reload_chats_from_store(),
             AppEvent::PresenceUpdated(list) => {
                 for presence in list {
                     self.presence.insert(presence.mri.clone(), presence);
@@ -2231,11 +2488,29 @@ impl SquadsApp {
             Action::TogglePersonSelected(person) => self.toggle_person_selected(person),
             Action::ClearPeopleSelection => self.people_selected.clear(),
             Action::TogglePeoplePicker => {
+                // The generic toggle is browse-only (B3): clear new-chat mode so
+                // it cannot leak in from a previous New chat (B2a).
+                self.new_chat_open = false;
                 self.people_picker_open = !self.people_picker_open;
                 if self.people_picker_open {
                     self.focus_people_search = true;
                 }
             }
+            Action::NewChat => self.open_new_chat(),
+            Action::CreateChat => self.create_chat(),
+            Action::ToggleChatMenu(chat_id) => {
+                self.chat_menu = if self.chat_menu.as_deref() == Some(chat_id.as_str()) {
+                    None
+                } else {
+                    Some(chat_id)
+                };
+            }
+            Action::ToggleChatMuted(chat_id) => self.toggle_chat_muted(chat_id),
+            Action::ToggleChatHidden(chat_id) => self.toggle_chat_hidden(chat_id),
+            Action::RequestLeaveChat(chat_id) => self.leave_confirm = Some(chat_id),
+            Action::ConfirmLeaveChat(chat_id) => self.confirm_leave_chat(chat_id),
+            Action::CancelLeaveChat => self.leave_confirm = None,
+            Action::ToggleShowHidden => self.show_hidden = !self.show_hidden,
             Action::RefreshCalendar => self.refresh_calendar(),
             Action::RefreshCalendarWeek => self.refresh_calendar_week(),
             Action::JoinMeeting { target, passcode } => self.join_meeting(target, passcode),
@@ -2333,6 +2608,11 @@ impl SquadsApp {
                 // The people picker closes but keeps its selection, so a caller
                 // can still read the picked people (B3).
                 self.people_picker_open = false;
+                // The chat context menu / new-chat / leave-confirm overlays too
+                // (B2a).
+                self.chat_menu = None;
+                self.new_chat_open = false;
+                self.leave_confirm = None;
                 self.show_info = false;
             }
             Action::OpenSettings => self.dispatch(Action::SetPage(Page::Settings)),
@@ -2407,6 +2687,14 @@ impl SquadsApp {
         self.people_selected.clear();
         self.people_loading = false;
         self.people_picker_open = false;
+        self.chats_svc = None;
+        self.muted_ids.clear();
+        self.hidden_ids.clear();
+        self.show_hidden = false;
+        self.chat_menu = None;
+        self.new_chat_open = false;
+        self.new_chat_topic.clear();
+        self.leave_confirm = None;
         self.meetings.clear();
         self.calendar_loading = false;
         self.join_target = None;

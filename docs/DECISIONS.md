@@ -1632,3 +1632,99 @@ store and the UI must not touch (the M3 model rule).
   persisted; a search hit is in-process only (B-007 still covers the files cache).
 - B2a's dependency is a **one-accessor contract**, so the picker can be reused
   (e.g. an "add member" flow) without touching `squads-core`.
+
+---
+
+## ADR-038 — Chat creation/leave via the chat service, the server-vs-local mute reconciliation, and schema v10
+
+**Status:** accepted (B2a)
+
+**Context.** Backlog item **B2a** adds chat management: start a 1:1 or group
+chat, leave one, write the per-user **server** mute/hide state, and read a chat's
+roster. Three questions had to be settled: **where creation/leave write**, how
+the new **server mute/hide** relates to the M8 **local** mute, and where the
+state lives.
+
+Teams splits these writes and the native surfaces differ from the obvious Graph
+ones:
+
+- **Creation.** Graph `POST /me/chats` answers **405** (not a create endpoint)
+  and Graph `POST /chats` needs `Chat.Create`, which the Teams first-party token
+  lacks (**403** live — the vendored crate documents both). The vendored
+  `create_one_to_one_chat_data` / `create_group_chat_data` therefore ride the
+  **chat service**: a 1:1 is the derived `19:<lo>_<hi>@unq.gbl.spaces` thread
+  (OstMac §106), probed and created with `uniquerosterthread`/`fixedRoster`
+  properties; a group is a `POST /v1/threads` whose id comes from the response
+  `Location`.
+- **Leave.** The vendored `leave_chat_with_client` deletes the signed-in user's
+  own MRI from the thread roster (`DELETE /v1/threads/{id}/members/{mri}`).
+- **Mute/hide.** Mute is the per-user conversation property `alerts`
+  (`"false"` = muted); hide is the `unpinnedTime` (now in ms) +
+  `historyHiddenTime` pair, with unhide writing a `null` `unpinnedTime`. Graph
+  `hideForUser`/`unhideForUser` need `Chat.ReadWrite`, which the token lacks.
+- **Local mute already exists.** M8 persists `chats.muted` and
+  [`route`](../crates/squads-core/src/notifications.rs) honours it — it is the
+  **notification-routing source of truth** (ADR-021), and B2a must not break it.
+
+**Decision.**
+
+1. **Wrap the vendored chat-service writes.** `ApiClient` gains
+   `create_one_to_one_chat`, `create_group_chat`, `leave_chat`,
+   `set_chat_muted`, `set_chat_hidden` and `chat_members` (over
+   `create_one_to_one_chat_data` / `create_group_chat_data` /
+   `leave_chat_with_client` / `set_chat_muted_with_client` /
+   `set_chat_hidden_with_client` / `list_chat_members_data`). The pure
+   write-shape helpers are re-exported so the paths/bodies are pinned offline.
+2. **A dedicated `Chats` service**, not an extension of `Messaging`. Creation and
+   leave mutate the **chat list** (upsert/delete), which is not `Messaging`'s
+   job; `Chats { profile, Arc<Store>, Arc<ApiClient> }` mirrors the
+   `People`/`Files` shape and keeps the store effect in one place. `new_one_to_one`
+   / `new_group` map the created [`ChatInfo`] into the owned `Chat` and upsert
+   it; `leave` calls the server and then `delete_chat` (dropping its messages);
+   `members` maps the roster into a new [`ChatMember`] model.
+3. **A `ChatMember` model, not `Person`.** A roster entry is keyed by the
+   chat-service **MRI** (`8:orgid:<guid>` — the leave target and the message
+   `from` identity), carries **roles**/owner, and often has no name; the
+   directory `Person` (Graph user id, email, job title) is a different thing.
+   `ChatMember` gets its own type with a documented reason.
+4. **The server-vs-local mute reconciliation.** `Chats::set_muted` writes the
+   **local** flag first (`chats.muted`, immediate, offline — routing stays
+   correct) and then attempts the **server** `alerts` write. On success it records
+   the server state in a new `chats.server_muted` column; on failure it logs and
+   **keeps the local flag** (the server write is best-effort). `set_hidden`
+   mirrors this with `chats.hidden`. Both return `Ok(())` once the local state is
+   written, so an **offline toggle still takes effect locally** — the documented
+   trade-off. The app writes the local flag synchronously (the routing truth) and
+   runs the server write on the backend, publishing `AppEvent::ChatFlagsChanged`.
+5. **Schema v10.** `chats.hidden` (`INTEGER NOT NULL DEFAULT 0`) and
+   `chats.server_muted` (**nullable** `INTEGER`; `NULL` = unknown, distinct from
+   a confirmed `0`) via guarded `ALTER TABLE`s. `SCHEMA_VERSION = 10`;
+   forward-only, re-entrant, a newer `user_version` is still a hard error.
+6. **The app's entry points.** A **New chat** button opens B3's people picker in
+   "new chat" mode (one person → 1:1; several → a topic prompt + group); a chat
+   **context menu** ("...") offers Mute/Unmute, Hide and Leave (Leave confirms
+   first). Muted rows badge; hidden rows collapse into a "Show hidden (N)"
+   section. B3's Search-page "Find people" entry point is **kept** (browse); the
+   picker now has two callers, which is exactly the contract ADR-037 designed.
+
+**Consequences.**
+
+- Creating/leaving/roster-writing is fully offline-testable: the exact
+  method/path/auth/body of every shape is pinned by local TCP stubs (the 1:1
+  resolve+probe(+create), the group `POST /v1/threads` + `Location`, the leave
+  `DELETE .../members/{mri}`, the `alerts` and `unpinnedTime`/`historyHiddenTime`
+  PUTs, the roster `GET`), and the store round-trips plus the **v9→v10**
+  migration are tested.
+- **M8 routing is unchanged**: `chats.muted` is still the only flag `route`
+  reads; the server state is a separate, best-effort mirror. A mute set in
+  another client is still not observed here (the vendored chat list's
+  `properties.alerts` is not yet read back into `chats.muted`) — a documented
+  gap.
+- **The live acceptance is unverified** (U-011): whether the live chat service
+  accepts the 1:1/group create bodies, the leave DELETE, the mute/hide property
+  writes and the roster shape is assumed from the vendored crate + stubs; a
+  protocol change upstream is inherited because nothing is reimplemented.
+- No encryption change: the two flags join the chat row in the plaintext store;
+  the roster is in-process only (B-007 still applies).
+- B2b (folders, pinned messages) is a separate, additive change to the same
+  `api`/`store`/app surfaces.

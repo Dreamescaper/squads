@@ -658,3 +658,37 @@ on a particular result count.
 contained; the deterministic stub tests pin the exact paths/headers so a
 regression is caught; the pure path builders and parsers are re-exported and
 unit-tested.
+
+### U-011 — B2a chat management not exercised offline (live acceptance unverified)
+
+B2a's chat-service writes are thin wrappers over the vendored crate, tested
+offline against local TCP stubs (method/path/auth/body + store effects), and its
+mute/hide reconciliation is a documented local-flag-plus-best-effort-server
+policy. The following cannot be exercised here (B-002 — no live tenant):
+
+- **Live 1:1/group creation.** Whether the live chat service accepts the derived
+  1:1 thread probe + unique-roster create (`POST /v1/threads` with
+  `uniquerosterthread`/`fixedRoster`), and the group create body, and whether the
+  response `Location` always carries a decodable `19:…@thread…` id, is assumed
+  from the vendored crate + stubs. The vendored code documents that Graph's
+  `POST /me/chats` (`405`) and `POST /chats` (`Chat.Create`, `403`) do **not**
+  work with the Teams token, which is why creation rides the chat service.
+- **Live leave.** Whether the roster `DELETE .../v1/threads/{id}/members/{mri}`
+  removes the signed-in user from the thread (and that the own MRI derived from
+  whoami is exactly the roster's `id`) is unproven.
+- **Live mute/hide.** Whether the chat service accepts the `alerts`
+  (`"false"`/`"true"`) and `unpinnedTime`/`historyHiddenTime` conversation-property
+  writes, and whether a mute/hide set here is reflected by another client, is
+  assumed from the vendored crate + stubs. **The server state is never read back
+  into `chats.muted`** (the vendored chat list's `properties.alerts` is not
+  parsed into the store), so a mute set in another client is not observed here.
+- **Live roster.** Whether the chat-service thread roster carries the shapes we
+  parse (`members[].id` MRI, `role`, optional `friendlyName`) and whether the
+  Graph name fill resolves are unproven; a named roster needs no Graph fill.
+
+**Impact:** chat-management write correctness is assumed from the vendored crate
++ stubs, not proven; the local mute/hidden flags are the only verified state.
+
+**Mitigation:** keep every call behind `ApiClient`/`Chats` so a live fix is
+contained; the deterministic stub tests pin the exact paths/bodies/auth so a
+regression is caught; the local flags remain the routing truth regardless.

@@ -793,3 +793,177 @@ fn files_page_search_renders_global_results_and_downloads() {
         harness.state().applied_actions()
     );
 }
+
+// ----- B2a: new chat & chat management ---------------------------------------
+
+#[test]
+fn new_chat_flow_selects_a_person_and_creates() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+    });
+    harness.run();
+
+    // The chat list has a New chat entry point (B2a) that opens the picker in
+    // new-chat mode.
+    harness.get_by_label("New chat").click();
+    harness.run();
+    assert!(
+        harness.state().new_chat_open(),
+        "New chat opens the picker in new-chat mode"
+    );
+    assert!(harness.state().people_picker_open());
+
+    // Seed directory results (headless has no directory service) and pick one.
+    harness.state_mut().set_people_results(
+        "ava",
+        vec![person("u1", "Ava Lindqvist", Some("ava@contoso.com"))],
+    );
+    harness.run();
+    harness
+        .get_by_label("Ava Lindqvist <ava@contoso.com>")
+        .click();
+    harness.run();
+    assert_eq!(harness.state().selected_people().len(), 1);
+
+    // Create chat queues the create action and closes the picker.
+    harness.get_by_label("Create chat").click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .applied_actions()
+            .iter()
+            .any(|action| matches!(action, Action::CreateChat)),
+        "expected a CreateChat action; got {:?}",
+        harness.state().applied_actions()
+    );
+    assert!(
+        !harness.state().people_picker_open(),
+        "the picker closes after creating"
+    );
+    assert!(!harness.state().new_chat_open());
+}
+
+#[test]
+fn new_chat_group_reveals_a_topic_field() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+    });
+    harness.run();
+    harness.get_by_label("New chat").click();
+    harness.run();
+
+    harness.state_mut().set_people_results(
+        "a",
+        vec![
+            person("u1", "Ava Lindqvist", Some("ava@contoso.com")),
+            person("u2", "Tom Becker", None),
+        ],
+    );
+    harness.run();
+    harness
+        .get_by_label("Ava Lindqvist <ava@contoso.com>")
+        .click();
+    harness.run();
+    harness.get_by_label("Tom Becker").click();
+    harness.run();
+    assert_eq!(harness.state().selected_people().len(), 2);
+
+    // 2+ people reveal the group topic field, which the view edits in place.
+    harness.get_by_label("Group topic").click();
+    harness.run();
+    harness.get_by_label("Group topic").type_text("Launch");
+    harness.run();
+    assert_eq!(harness.state().new_chat_topic(), "Launch");
+}
+
+#[test]
+fn chat_context_menu_mute_toggles_state() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+    });
+    harness.run();
+
+    // The "⋯" affordance opens Alice's context menu.
+    harness.get_by_label("...").click();
+    harness.run();
+    assert_eq!(harness.state().chat_menu(), Some("c1"));
+
+    // Mute toggles the local routing flag (and the menu offers Unmute).
+    harness.get_by_label("Mute").click();
+    harness.run();
+    assert!(
+        harness.state().is_chat_muted("c1"),
+        "Mute sets the local flag"
+    );
+    harness.get_by_label("Unmute").click();
+    harness.run();
+    assert!(!harness.state().is_chat_muted("c1"));
+}
+
+#[test]
+fn hiding_a_chat_collapses_it_and_it_can_be_shown_again() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+    });
+    harness.run();
+    harness.get_by_label("...").click();
+    harness.run();
+    harness.get_by_label("Hide").click();
+    harness.run();
+    assert!(harness.state().is_chat_hidden("c1"));
+
+    // The row is collapsed; the show-hidden toggle appears.
+    harness.get_by_label("Show hidden (1)").click();
+    harness.run();
+    assert!(harness.state().show_hidden());
+    // The hidden row is listed again with an Unhide affordance.
+    harness.get_by_label("Unhide");
+    harness.get_by_label("Unhide").click();
+    harness.run();
+    assert!(!harness.state().is_chat_hidden("c1"));
+}
+
+#[test]
+fn chat_context_menu_leave_confirms_first() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+    });
+    harness.run();
+    harness.get_by_label("...").click();
+    harness.run();
+    harness.get_by_label("Leave").click();
+    harness.run();
+
+    // Leave asks first: nothing is left until the confirmation.
+    assert_eq!(harness.state().leave_confirm(), Some("c1"));
+    assert!(
+        !harness
+            .state()
+            .applied_actions()
+            .iter()
+            .any(|action| matches!(action, Action::ConfirmLeaveChat(_))),
+        "Leave must not leave without confirmation"
+    );
+    harness.get_by_label("Confirm leave").click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .applied_actions()
+            .iter()
+            .any(|action| matches!(action, Action::ConfirmLeaveChat(id) if id == "c1")),
+        "Confirm leave queues the leave; got {:?}",
+        harness.state().applied_actions()
+    );
+}

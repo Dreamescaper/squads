@@ -1,22 +1,22 @@
 # Project status — one screen
 
 > Snapshot for the **M13 (Self identity + inline media)** milestone plus backlog
-> items **B1 (Message search)** and **B3 (File & people search)**. The detailed
-> per-milestone history is in [`PROGRESS.md`](PROGRESS.md); constraints are in
-> [`BLOCKERS.md`](BLOCKERS.md).
+> items **B1 (Message search)**, **B3 (File & people search)** and **B2a (New
+> chat, leave, mute/hide)**. The detailed per-milestone history is in
+> [`PROGRESS.md`](PROGRESS.md); constraints are in [`BLOCKERS.md`](BLOCKERS.md).
 
 ## Where the project is
 
 All fourteen planned milestones (**M0–M13**) are implemented, plus backlog items
-**B1 (message search)** and **B3 (file & people search)**. The workspace
-builds device- and network-free with default features, and the test suite passes
-offline:
+**B1 (message search)**, **B3 (file & people search)** and **B2a (new chat,
+leave, mute/hide)**. The workspace builds device- and network-free with default
+features, and the test suite passes offline:
 
 | Crate | Role | Tests |
 |---|---|---|
 | `squads-protocol` (vendored `ost`, lib `ost`) | protocol core (auth, api, trouter, calling) | 377 (unchanged) |
-| `squads-core` | session, store, settings, realtime, services | 353 |
-| `squads-app` (`squads` binary) | egui UI | 27 |
+| `squads-core` | session, store, settings, realtime, services | 376 |
+| `squads-app` (`squads` binary) | egui UI | 32 |
 
 `cargo build --workspace` and `cargo build --workspace --release` both succeed.
 
@@ -28,7 +28,7 @@ and real signing/notarization are still manual (B-013, `PACKAGING.md` §6).
 
 **What works (verified here, offline):** workspace + CI config; the full auth
 token model and device-code flow; the session/client facade and region routing;
-the SQLite store with migrations v1→v9; realtime decode/fan-out/write-through;
+the SQLite store with migrations v1→v10; realtime decode/fan-out/write-through;
 messaging (optimistic sends, paging, edit/delete/react/receipts); teams &
 channels; files (Graph list/upload/download/links/versions); presence and
 notification routing; call signalling/media primitives/loopback/call log; the
@@ -37,8 +37,10 @@ signed-in identity (whoami → `mark_own` on server history and realtime) and th
 inline-media cache with timeline image rendering; **local-first message search**
 (schema-v9 index, `Search` service, the **Search** page and jump-to-message —
 B1); **Graph file & people search** (single-window drive search on the Files
-page, a `People` service, and a reusable multi-select **people picker** whose
-`selected_people()` B2a will consume — B3); the egui shell and every
+page, a `People` service, and a reusable multi-select **people picker** —
+B3); **chat management** (new 1:1/group chat via the picker, leave with
+confirmation, server mute/hide reconciled with the local routing flag, a chat
+context menu and muted/hidden rendering — B2a); the egui shell and every
 screen; M11 keyboard shortcuts, expanded settings, light theme + accents, and
 headless UI tests.
 
@@ -46,9 +48,10 @@ headless UI tests.
 network write shape (U-002…U-006), the calendar's live Graph acceptance and the
 browser-only join-by-id fallback (U-007), the live whoami and media-host
 acceptance (U-008), the optional Graph message-search fallback (expected to 403
-— U-009), the unified presence token audience (B-009), desktop
-notifications and quiet hours (B-010), real call media (B-011), and the UI's
-actual pixels (B-012). See [`BLOCKERS.md`](BLOCKERS.md).
+— U-009), the live Graph drive/people search (U-010), the live chat-service
+create/leave/mute/hide/roster acceptance (U-011), the unified presence token
+audience (B-009), desktop notifications and quiet hours (B-010), real call media
+(B-011), and the UI's actual pixels (B-012). See [`BLOCKERS.md`](BLOCKERS.md).
 
 **Deferred:** encryption at rest (B-007), the realtime call-frame producer
 (B-008), the attachment picker UI (B-012), the browser PKCE loopback listener
@@ -95,6 +98,7 @@ Newest last; full text in [`DECISIONS.md`](DECISIONS.md).
 - **ADR-035** — Inline media: `text::image_urls` + a deterministic `MediaCache` + `egui_extras` image loading.
 - **ADR-036** — Message search is local-first (schema-v9 index), with the Graph server path as an optional, expected-to-403 fallback.
 - **ADR-037** — File/people search wrappers, a schema-free `People` service, and the people-picker contract B2a consumes.
+- **ADR-038** — Chat creation/leave via the chat service, the server-vs-local mute reconciliation, and schema v10.
 
 ## Open blockers (summary)
 
@@ -107,10 +111,11 @@ media cache unencrypted), **B-008** (call frames filtered from the hub; global
 hub; reconnect token staleness), **B-009** (unified presence token unverified),
 **B-010** (desktop notifications / quiet hours), **B-011** (live calls + real
 media), **B-012** (UI verified by wiring, not pixels; attachment picker stub),
-and unverified aspects **U-001…U-010** (U-007: live calendar acceptance and the
+and unverified aspects **U-001…U-011** (U-007: live calendar acceptance and the
 browser-only join-by-id fallback; U-008: live whoami and media-host acceptance;
 U-009: the optional Graph message-search fallback, expected to 403; U-010: live
-Graph drive/people search acceptance and the delegated scopes).
+Graph drive/people search acceptance and the delegated scopes; U-011: live
+chat-service create/leave/mute/hide/roster acceptance).
 
 ## How to verify by hand
 
@@ -119,8 +124,8 @@ Graph drive/people search acceptance and the delegated scopes).
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --workspace                 # default features, no device/network
-cargo test -p squads-core               # 353
-cargo test -p squads-app                # 27 (headless egui_kittest)
+cargo test -p squads-core               # 376
+cargo test -p squads-app                # 32 (headless egui_kittest)
 cargo test -p squads-protocol           # 377
 cargo fmt -p squads-core -p squads-app -- --check
 cargo clippy -p squads-core -p squads-app --all-targets
@@ -144,7 +149,11 @@ cargo build --workspace --release
    OneDrive results render and download; clear it to return to the chat's files.
    On **Search**, press **Find people**, search a colleague's name and select one
    or several (B3).
-6. Follow the per-milestone "How to verify manually" steps in
+6. Press **New chat**, search a colleague and select one (a 1:1 opens) or two or
+   more (type a **Group topic** and Create). Open a chat's **"..."** menu and
+   **Mute** it (a badge appears), **Hide** it (it collapses into the "Show
+   hidden" section and can be unhidden), and **Leave** it (confirm) — B2a.
+7. Follow the per-milestone "How to verify manually" steps in
    [`PROGRESS.md`](PROGRESS.md) for the network features (needs a real tenant).
 
 ### Release/packaging

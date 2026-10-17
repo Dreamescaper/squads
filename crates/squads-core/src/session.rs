@@ -33,6 +33,7 @@ use crate::auth::store::{DEFAULT_PROFILE, FileTokenStore, TokenStore};
 use crate::auth::tokens::{TokenSet, now_unix};
 use crate::calendar::Calendar;
 use crate::calls::{CallCredentials, CallEndpoints, CallIdentity, CallService, CallSignaller};
+use crate::chats::Chats;
 use crate::error::{CoreError, Result};
 use crate::files::Files;
 use crate::messaging::Messaging;
@@ -376,6 +377,22 @@ impl Session {
     pub fn people(&mut self) -> Result<People> {
         let client = self.api_arc()?;
         Ok(People::new(self.profile.clone(), client))
+    }
+
+    /// The B2a chat-management service for this session.
+    ///
+    /// Shares the session's [`Store`] (the chat list + local flags) and the
+    /// shared protocol client (create/leave/mute/hide/roster writes). Requires a
+    /// token set ([`CoreError::NotSignedIn`] otherwise); building is offline. The
+    /// returned [`Chats`] is stateless beyond the shared store/client, so callers
+    /// may build a fresh handle whenever they like.
+    pub fn chats(&mut self) -> Result<Chats> {
+        let client = self.api_arc()?;
+        Ok(Chats::new(
+            self.profile.clone(),
+            Arc::clone(&self.store),
+            client,
+        ))
     }
 
     /// The B1 message-search service for this session.
@@ -1254,6 +1271,38 @@ mod tests {
             "building the service is offline"
         );
         assert!(session.has_api());
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp2).ok();
+    }
+
+    // ----- B2a: chat management ----------------------------------------------
+
+    #[test]
+    fn chats_requires_tokens_and_shares_the_store_and_client() {
+        let (tmp, dirs_a) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs_a, "default", store).expect("session");
+        // No tokens yet: building the service must fail cleanly, no network.
+        let err = session.chats().unwrap_err();
+        assert!(matches!(err, CoreError::NotSignedIn), "got {err:?}");
+
+        let (tmp2, dirs2) = dirs();
+        let store2 = Arc::new(MemoryTokenStore::new());
+        store2.save("work", &sample_set()).unwrap();
+        let mut session = Session::with_store(dirs2, "work", store2).expect("session");
+        session.restore().expect("restore");
+
+        let chats = session.chats().expect("chats");
+        assert_eq!(chats.profile(), "work");
+        assert!(
+            Arc::ptr_eq(chats.store(), session.store()),
+            "the service shares the session store"
+        );
+        assert_eq!(
+            chats.client().request_count(),
+            0,
+            "building the service is offline"
+        );
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&tmp2).ok();
     }

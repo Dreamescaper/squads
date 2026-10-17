@@ -53,15 +53,28 @@ one opens the chat.
 
 ---
 
-## B2 — Chat management ⬜
+## B2 — Chat management 🟡
 
 **Gap.** No way to start a chat, leave one, mute/hide server-side, use folders,
 or see pinned messages. (`api::chat` extras + `api::teams` member routes.)
 
-**Split into two items.**
+**Split into two items.** B2a (new chat, leave, mute/hide) is ✅; B2b (folders
+and pinned messages) remains.
 
-### B2a — New chat, leave, mute/hide ⬜
-**Depends on B3** (the people picker) — B3 is processed first.
+### B2a — New chat, leave, mute/hide ✅
+
+**Landed.** `api` wrappers for `create_one_to_one_chat_data`,
+`create_group_chat_data`, `leave_chat_with_client`,
+`set_chat_muted_with_client`, `set_chat_hidden_with_client` and
+`list_chat_members_data` (+ the pure write-shape helpers); a `model::ChatMember`
+roster type; a `Chats` service (`new_one_to_one` / `new_group` / `leave` /
+`set_muted` / `set_hidden` / `members`); **schema v10** (`chats.hidden` +
+`chats.server_muted`, the server mute/hide state, while M8's local `chats.muted`
+stays the routing flag); and the app's **New chat** flow (via B3's people
+picker), a chat **context menu** (Mute/Unmute, Hide, Leave-with-confirmation)
+and muted/hidden rendering. See ADR-038 and PROGRESS (B2a).
+
+**Depends on B3** (the people picker) — B3 landed first.
 - `core`: wrappers for `create_one_to_one_chat_data`, `create_group_chat_data`,
   `leave_chat_with_client`, `set_chat_muted_with_client`,
   `set_chat_hidden_with_client`, `alerts_body`/`alerts_muted`, and chat roster

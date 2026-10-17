@@ -22,10 +22,11 @@
 //! The search is **Graph** and single-window (Graph caps at 25 people), so the
 //! list is a single bounded page rather than an infinite scroll.
 //!
-//! The overlay is a no-op while closed, so it is safe to call every frame. It is
-//! reachable now from the **Search** page's "Find people" button (and via
-//! [`Action::TogglePeoplePicker`]), which is what exercises it until B2a wires
-//! it into the new-chat flow.
+//! The overlay is a no-op while closed, so it is safe to call every frame. It
+//! has two entry points: the **Search** page's "Find people" button (B3, browse)
+//! and the chat list's **New chat** button (B2a, create — which sets
+//! [`SquadsApp::new_chat_open`](crate::app::SquadsApp::new_chat_open) and shows
+//! the topic field + **Create chat** button).
 
 use egui::{Align2, Context, RichText, TextEdit, Window};
 
@@ -37,21 +38,29 @@ pub fn show(app: &mut SquadsApp, ctx: &Context) {
         return;
     }
 
+    let new_chat = app.new_chat_open();
     let mut toggle: Option<squads_core::model::Person> = None;
     let mut clear = false;
     let mut close = false;
+    let mut create = false;
 
-    Window::new("People picker")
+    let title = if new_chat {
+        "New chat"
+    } else {
+        "People picker"
+    };
+    Window::new(title)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_TOP, [0.0, 96.0])
         .default_width(420.0)
         .show(ctx, |ui| {
-            ui.label(
-                RichText::new("Find people to start a chat with.")
-                    .weak()
-                    .small(),
-            );
+            let hint = if new_chat {
+                "Find people to start a chat with. One person starts a 1:1; several start a group."
+            } else {
+                "Find people to start a chat with."
+            };
+            ui.label(RichText::new(hint).weak().small());
 
             let label = ui.label("Search people");
             let response = ui.add(
@@ -85,6 +94,18 @@ pub fn show(app: &mut SquadsApp, ctx: &Context) {
                 });
             }
 
+            // In new-chat mode a group (2+ people) gets a topic (B2a).
+            if new_chat && selected.len() > 1 {
+                ui.add_space(4.0);
+                let label = ui.label("Group topic");
+                let response = ui.add(
+                    TextEdit::singleline(app.new_chat_topic_mut())
+                        .hint_text("Topic (optional)")
+                        .desired_width(f32::INFINITY),
+                );
+                response.labelled_by(label.id);
+            }
+
             ui.add_space(4.0);
             if app.people_loading() {
                 ui.horizontal(|ui| {
@@ -111,6 +132,15 @@ pub fn show(app: &mut SquadsApp, ctx: &Context) {
 
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                if new_chat {
+                    let enabled = !app.selected_people().is_empty();
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Create chat"))
+                        .clicked()
+                    {
+                        create = true;
+                    }
+                }
                 if ui.button("Clear").clicked() {
                     clear = true;
                 }
@@ -122,6 +152,9 @@ pub fn show(app: &mut SquadsApp, ctx: &Context) {
 
     if let Some(person) = toggle {
         app.push_action(Action::TogglePersonSelected(person));
+    }
+    if create {
+        app.push_action(Action::CreateChat);
     }
     if clear {
         app.push_action(Action::ClearPeopleSelection);

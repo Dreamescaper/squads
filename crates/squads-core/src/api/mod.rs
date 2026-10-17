@@ -62,6 +62,16 @@
 //! ([`FIND_MAX_LIMIT`]). [`crate::Files::search_files`] and
 //! [`crate::People::search`] map the wire rows into
 //! [`FileEntry`](crate::model::FileEntry) / [`Person`](crate::model::Person).
+//!
+//! **Chat management (B2a)** creates/leaves chats and writes the per-user
+//! mute/hide properties. 1:1 and group creation ride the **chat service**
+//! ([`ApiClient::create_one_to_one_chat`], [`ApiClient::create_group_chat`]) —
+//! Graph `POST /me/chats` answers `405` and Graph `POST /chats` needs
+//! `Chat.Create`, which the Teams token lacks. Leaving
+//! ([`ApiClient::leave_chat`]) removes the own MRI from the thread roster;
+//! mute/hide ([`ApiClient::set_chat_muted`], [`ApiClient::set_chat_hidden`])
+//! write conversation properties; the roster ([`ApiClient::chat_members`]) is
+//! the chat-service thread members. See [`crate::Chats`].
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -125,6 +135,20 @@ pub use ost::api::{
 pub use ost::api::{
     FIND_MAX_LIMIT, clamp_limit, drive_search_path, parse_drive_search_response,
     parse_people_search_response, people_search_path,
+};
+
+/// Protocol types and pure helpers surfaced by the **B2a** chat management
+/// (create 1:1 / group, leave, server mute/hide, roster). Re-exported so
+/// [`Chats`](crate::Chats) and the tests can pin the request/response shapes
+/// without reaching into the vendored crate. The write shapes are the vendored
+/// ones: 1:1/group creation ride the **chat service** (`POST /v1/threads`),
+/// leave removes the own MRI from the thread roster, and mute/hide write the
+/// per-user conversation properties (`alerts`, `unpinnedTime`).
+pub use ost::api::{
+    ChatMemberInfo, RosterSource, alerts_body, alerts_muted, alerts_url, chat_members_path,
+    conversation_property_url, created_thread_id, group_chat_create_body, group_chat_members,
+    hide_chat_properties, leave_member_url, one_to_one_create_body, one_to_one_create_path,
+    parse_created_chat, parse_graph_chat_members, parse_thread_members, thread_create_url,
 };
 
 use crate::auth::tokens::{StoredToken, TokenSet};
@@ -1193,6 +1217,136 @@ impl ApiClient {
         tracing::debug!(count = people.len(), call, "searched people");
         Ok(people)
     }
+
+    // ----- B2a: chat management (create / leave / mute / hide / roster) ----
+
+    /// Create (or re-open) the **1:1** chat with `user_id` (a Graph/AAD id or
+    /// UPN).
+    ///
+    /// Wraps the vendored `create_one_to_one_chat_data`: both AAD ids resolve to
+    /// the derived `19:<lo>_<hi>@unq.gbl.spaces` thread id (OstMac §106), an
+    /// existing thread re-opens after a probe `GET`, and a first contact creates
+    /// the unique-roster 1:1 on the **chat service** (`POST /v1/threads`).
+    /// Graph `POST /me/chats` answers `405` and Graph `POST /chats` needs
+    /// `Chat.Create`, which the Teams token lacks. A blank ref, or the
+    /// signed-in user, is rejected before any create.
+    pub async fn create_one_to_one_chat(&self, user_id: &str) -> Result<ChatInfo> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.create_one_to_one_chat",
+            call
+        );
+        let chat = ost::api::create_one_to_one_chat_data(&self.client, user_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "created/re-opened 1:1 chat");
+        Ok(chat)
+    }
+
+    /// Create a **group** chat with `member_ids` (Graph/AAD ids or UPNs) plus
+    /// the signed-in user, with an optional `topic`, on the **chat service**
+    /// (`POST /v1/threads`, skypetoken).
+    ///
+    /// Wraps the vendored `create_group_chat_data`: UPNs resolve to object ids
+    /// through Graph (`User.ReadBasic.All`), the creator is added first and
+    /// every peer `Admin`, a blank topic is omitted, and at least one peer is
+    /// required (checked before any network). The new thread id comes from the
+    /// response `Location` header.
+    pub async fn create_group_chat(
+        &self,
+        topic: Option<&str>,
+        member_ids: &[String],
+    ) -> Result<ChatInfo> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.create_group_chat",
+            members = member_ids.len(),
+            call
+        );
+        let chat = ost::api::create_group_chat_data(&self.client, member_ids, topic)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "created group chat");
+        Ok(chat)
+    }
+
+    /// Leave `chat_id` by removing the signed-in user from the thread roster
+    /// (`DELETE .../v1/threads/{id}/members/{mri}`, chat service).
+    ///
+    /// Wraps the vendored `leave_chat_with_client`: the own MRI resolves through
+    /// whoami (`8:orgid:<oid>`); an empty chat id is rejected before any
+    /// network. Best-effort server-side — see [`Chats::leave`](crate::Chats::leave)
+    /// for the store effect.
+    pub async fn leave_chat(&self, chat_id: &str) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.leave_chat", call);
+        ost::api::leave_chat_with_client(&self.client, chat_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "left chat");
+        Ok(())
+    }
+
+    /// Mute or unmute `chat_id` for the signed-in user (the server-side
+    /// `alerts` conversation property: `"false"` = muted).
+    ///
+    /// This is the **server** half of B2a's mute; the local routing flag stays
+    /// [`Store::set_chat_muted`](crate::Store::set_chat_muted) (see
+    /// [`Chats::set_muted`](crate::Chats::set_muted)).
+    pub async fn set_chat_muted(&self, chat_id: &str, muted: bool) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span =
+            tracing::debug_span!(target: "squads_core::api", "api.set_chat_muted", muted, call);
+        ost::api::set_chat_muted_with_client(&self.client, chat_id, muted)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "set chat mute");
+        Ok(())
+    }
+
+    /// Hide or unhide `chat_id` for the signed-in user (the `unpinnedTime` /
+    /// `historyHiddenTime` conversation properties the web client writes; hide
+    /// stamps the current time, unhide writes `null`).
+    ///
+    /// This is the **server** half of B2a's hide; the local flag stays
+    /// [`Store::set_chat_hidden`](crate::Store::set_chat_hidden).
+    pub async fn set_chat_hidden(&self, chat_id: &str, hidden: bool) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span =
+            tracing::debug_span!(target: "squads_core::api", "api.set_chat_hidden", hidden, call);
+        ost::api::set_chat_hidden_with_client(&self.client, chat_id, hidden)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "set chat hidden");
+        Ok(())
+    }
+
+    /// The roster of `chat_id`: the chat-service thread members (MRIs,
+    /// friendly names when the service has them, `Admin`/`User` roles), with
+    /// blank names filled from Graph.
+    ///
+    /// Wraps the vendored `list_chat_members_data` and drops its roster-source
+    /// tag (the vendored Graph `GET /chats/{id}/members` lane is gone: the
+    /// Teams token lacks `ChatMember.Read`). A blank id is rejected before any
+    /// network; a failure surfaces the chat-service error rather than an empty
+    /// roster.
+    pub async fn chat_members(&self, chat_id: &str) -> Result<Vec<ChatMemberInfo>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.chat_members", call);
+        let (_source, members) = ost::api::list_chat_members_data(&self.client, chat_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = members.len(), call, "listed chat members");
+        Ok(members)
+    }
 }
 
 impl fmt::Debug for ApiClient {
@@ -1719,5 +1873,360 @@ mod tests {
         assert!(media_auth_headers("https://media.giphy.com/abc.gif", "T").is_empty());
         // An evil look-alike never gets the token.
         assert!(media_auth_headers("https://asm.skype.com.evil.com/x", "T").is_empty());
+    }
+
+    // ----- B2a: chat management -------------------------------------------
+
+    /// The AAD object id `aad_object_id` resolves "me" to in the 1:1/group
+    /// stubs (the peer is already a GUID, so it needs no lookup).
+    const ME_GUID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const PEER_GUID: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+    fn b2a_tokens(base: &str) -> TokenSet {
+        fresh_tokens(serde_json::json!({
+            "graphBase": base,
+            "chatService": base
+        }))
+    }
+
+    fn b2a_requests(seen: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    #[tokio::test]
+    async fn create_one_to_one_reopens_the_derived_thread() {
+        // `GET /me?$select=id` resolves "me"; the derived thread probe answers
+        // 200, so the existing 1:1 re-opens with no create.
+        let (base, seen, task) = http_stub(vec![
+            StubResponse::ok(serde_json::json!({ "id": ME_GUID }).to_string()),
+            StubResponse::ok("{}"),
+        ])
+        .await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let chat = client
+            .create_one_to_one_chat(PEER_GUID)
+            .await
+            .expect("create 1:1");
+        // The derived id is the sorted, lowercased pair.
+        assert_eq!(chat.id, format!("19:{ME_GUID}_{PEER_GUID}@unq.gbl.spaces"));
+        assert!(!chat.is_group);
+        assert_eq!(client.request_count(), 1, "one high-level call");
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 2, "resolve me, then probe the thread");
+        assert!(
+            reqs[0].starts_with("GET /me?$select=id "),
+            "unexpected request: {}",
+            reqs[0]
+        );
+        assert!(
+            reqs[0].contains("authorization: Bearer graph-token"),
+            "{}",
+            reqs[0]
+        );
+        assert!(
+            reqs[1].starts_with(&format!(
+                "GET /v1/threads/19:{ME_GUID}_{PEER_GUID}@unq.gbl.spaces?view=msnp24Equivalent "
+            )),
+            "unexpected request: {}",
+            reqs[1]
+        );
+        assert!(
+            reqs[1].contains("authentication: skypetoken=skype-token"),
+            "{}",
+            reqs[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_one_to_one_creates_a_missing_thread() {
+        // Probe 404 → create on the chat service; the Location echoes the
+        // derived thread.
+        let (base, seen, task) = http_stub(vec![
+            StubResponse::ok(serde_json::json!({ "id": ME_GUID }).to_string()),
+            StubResponse::status(404),
+            StubResponse::status(201),
+        ])
+        .await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let chat = client
+            .create_one_to_one_chat(PEER_GUID)
+            .await
+            .expect("create 1:1");
+        assert_eq!(chat.id, format!("19:{ME_GUID}_{PEER_GUID}@unq.gbl.spaces"));
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 3, "resolve me, probe, create");
+        assert!(
+            reqs[2].starts_with("POST /v1/threads "),
+            "unexpected request: {}",
+            reqs[2]
+        );
+        // The create body carries both orgid members and the unique-roster
+        // properties.
+        assert!(
+            reqs[2].contains(&format!("8:orgid:{ME_GUID}")),
+            "{}",
+            reqs[2]
+        );
+        assert!(
+            reqs[2].contains(&format!("8:orgid:{PEER_GUID}")),
+            "{}",
+            reqs[2]
+        );
+        assert!(
+            reqs[2].contains("\"uniquerosterthread\":\"true\""),
+            "{}",
+            reqs[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_group_posts_members_and_topic_and_reads_the_location() {
+        let location = format!("/v1/threads/19%3A{ME_GUID}_{PEER_GUID}%40thread.v2?foo=1");
+        let (base, seen, task) = http_stub(vec![
+            StubResponse::ok(serde_json::json!({ "id": ME_GUID }).to_string()),
+            StubResponse::ok_location(location, "{}"),
+        ])
+        .await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let chat = client
+            .create_group_chat(Some("Launch"), &[PEER_GUID.to_string()])
+            .await
+            .expect("create group");
+        assert!(chat.is_group);
+        assert_eq!(chat.name, "Launch");
+        assert_eq!(chat.id, format!("19:{ME_GUID}_{PEER_GUID}@thread.v2"));
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 2, "resolve me, then create");
+        assert!(
+            reqs[1].starts_with("POST /v1/threads "),
+            "unexpected request: {}",
+            reqs[1]
+        );
+        // The creator first, then the peer, all Admin; the topic is carried.
+        assert!(
+            reqs[1].contains(&format!("8:orgid:{ME_GUID}")),
+            "{}",
+            reqs[1]
+        );
+        assert!(
+            reqs[1].contains(&format!("8:orgid:{PEER_GUID}")),
+            "{}",
+            reqs[1]
+        );
+        assert!(reqs[1].contains("\"role\":\"Admin\""), "{}", reqs[1]);
+        assert!(reqs[1].contains("\"topic\":\"Launch\""), "{}", reqs[1]);
+    }
+
+    #[tokio::test]
+    async fn leave_deletes_the_own_member_from_the_roster() {
+        let (base, seen, task) = http_stub(vec![
+            StubResponse::ok(serde_json::json!({ "id": ME_GUID }).to_string()),
+            StubResponse::status(204),
+        ])
+        .await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        client
+            .leave_chat("19:team@thread.v2")
+            .await
+            .expect("leave chat");
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 2, "whoami then delete");
+        assert!(
+            reqs[1].starts_with(&format!(
+                "DELETE /v1/threads/19:team@thread.v2/members/8:orgid:{ME_GUID} "
+            )),
+            "unexpected request: {}",
+            reqs[1]
+        );
+        assert!(
+            reqs[1].contains("authentication: skypetoken=skype-token"),
+            "{}",
+            reqs[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_chat_muted_writes_the_alerts_property() {
+        let (base, seen, task) =
+            http_stub(vec![StubResponse::status(200), StubResponse::status(200)]).await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        client
+            .set_chat_muted("19:team@thread.v2", true)
+            .await
+            .expect("mute");
+        client
+            .set_chat_muted("19:team@thread.v2", false)
+            .await
+            .expect("unmute");
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 2);
+        assert!(
+            reqs[0].starts_with(
+                "PUT /v1/users/ME/conversations/19:team@thread.v2/properties?name=alerts "
+            ),
+            "unexpected request: {}",
+            reqs[0]
+        );
+        // Muted chats carry `"false"` (the server stores strings).
+        assert!(reqs[0].contains("\"alerts\":\"false\""), "{}", reqs[0]);
+        assert!(reqs[1].contains("\"alerts\":\"true\""), "{}", reqs[1]);
+    }
+
+    #[tokio::test]
+    async fn set_chat_hidden_writes_the_visibility_properties() {
+        let (base, seen, task) = http_stub(vec![
+            StubResponse::status(200),
+            StubResponse::status(200),
+            StubResponse::status(200),
+        ])
+        .await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        client
+            .set_chat_hidden("19:team@thread.v2", true)
+            .await
+            .expect("hide");
+        client
+            .set_chat_hidden("19:team@thread.v2", false)
+            .await
+            .expect("unhide");
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 3, "hide writes two properties, unhide one");
+        assert!(
+            reqs[0].starts_with(
+                "PUT /v1/users/ME/conversations/19:team@thread.v2/properties?name=unpinnedTime "
+            ),
+            "unexpected request: {}",
+            reqs[0]
+        );
+        assert!(reqs[0].contains("\"unpinnedTime\":"), "{}", reqs[0]);
+        assert!(
+            reqs[1].starts_with(
+                "PUT /v1/users/ME/conversations/19:team@thread.v2/properties?name=historyHiddenTime "
+            ),
+            "unexpected request: {}",
+            reqs[1]
+        );
+        // Unhide writes a null `unpinnedTime` and nothing else.
+        assert!(reqs[2].contains("\"unpinnedTime\":null"), "{}", reqs[2]);
+    }
+
+    #[tokio::test]
+    async fn chat_members_parses_the_thread_roster() {
+        let body = serde_json::json!({
+            "members": [
+                {"id": format!("8:orgid:{ME_GUID}"), "role": "Admin", "friendlyName": "Me"},
+                {"id": format!("8:orgid:{PEER_GUID}"), "role": "User", "friendlyName": "Ava"}
+            ]
+        })
+        .to_string();
+        let (base, seen, task) = http_stub(vec![StubResponse::ok(body)]).await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let members = client
+            .chat_members("19:team@thread.v2")
+            .await
+            .expect("roster");
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].mri, format!("8:orgid:{ME_GUID}"));
+        assert_eq!(members[0].user_id.as_deref(), Some(ME_GUID));
+        assert_eq!(members[0].display_name, "Me");
+        assert!(members[0].is_owner, "Admin is the owner");
+        assert_eq!(members[1].display_name, "Ava");
+        assert!(!members[1].is_owner);
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 1, "a named roster needs no Graph fill");
+        assert!(
+            reqs[0].starts_with("GET /v1/threads/19:team@thread.v2/members "),
+            "unexpected request: {}",
+            reqs[0]
+        );
+    }
+
+    #[test]
+    fn created_chat_parsing_pins_the_vendored_shapes() {
+        // The 1:1 Graph `POST /me/chats` response (no topic → empty name).
+        let one = parse_created_chat(&serde_json::json!({ "id": "19:one@unq.gbl.spaces" }))
+            .expect("parse 1:1");
+        assert_eq!(one.id, "19:one@unq.gbl.spaces");
+        assert_eq!(one.name, "");
+        assert!(!one.is_group);
+        let named =
+            parse_created_chat(&serde_json::json!({ "id": "19:g@thread.v2", "topic": "T" }))
+                .expect("parse group");
+        assert_eq!(named.name, "T");
+
+        // The thread id from a chat-service create `Location`.
+        assert_eq!(
+            created_thread_id(Some(
+                "https://emea.ng.msg.teams.microsoft.com/v1/threads/19%3Aabc%40thread.v2?x=1"
+            ))
+            .as_deref(),
+            Some("19:abc@thread.v2")
+        );
+        assert_eq!(created_thread_id(Some("https://x/notathread")), None);
+        assert_eq!(created_thread_id(None), None);
+    }
+
+    #[test]
+    fn chat_write_pure_helpers_pin_the_request_shapes() {
+        assert_eq!(one_to_one_create_path(), "/me/chats");
+        let body = one_to_one_create_body(PEER_GUID);
+        assert_eq!(body["chatType"], "oneOnOne");
+        assert_eq!(
+            body["members"][0]["user@odata.bind"],
+            format!("https://graph.microsoft.com/v1.0/users('{PEER_GUID}')")
+        );
+        assert_eq!(
+            chat_members_path("19:x@thread.v2"),
+            "/chats/19:x@thread.v2/members"
+        );
+        assert_eq!(
+            leave_member_url("https://chat", "19:x", "8:orgid:me"),
+            "https://chat/v1/threads/19:x/members/8:orgid:me"
+        );
+        assert_eq!(
+            alerts_url("https://chat", "19:x"),
+            "https://chat/v1/users/ME/conversations/19:x/properties?name=alerts"
+        );
+        assert_eq!(alerts_body(true)["alerts"], "false");
+        assert_eq!(alerts_body(false)["alerts"], "true");
+        assert_eq!(
+            alerts_muted(&serde_json::json!({ "alerts": "false" })),
+            Some(true)
+        );
+        assert_eq!(
+            alerts_muted(&serde_json::json!({ "alerts": "true" })),
+            Some(false)
+        );
+        assert_eq!(alerts_muted(&serde_json::json!({})), None);
+        // Hide writes `unpinnedTime` + `historyHiddenTime`; unhide only nulls
+        // `unpinnedTime`.
+        let hide = hide_chat_properties(Some(1234));
+        assert_eq!(hide.len(), 2);
+        assert_eq!(hide[1].0, "historyHiddenTime");
+        assert_eq!(hide[1].1["historyHiddenTime"], "1234");
+        let unhide = hide_chat_properties(None);
+        assert_eq!(unhide.len(), 1);
+        assert!(unhide[0].1["unpinnedTime"].is_null());
     }
 }

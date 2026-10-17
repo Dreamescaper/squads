@@ -14,7 +14,8 @@
 //! [`Message::from_info`] / `From<&ost::api::MessageInfo>`.
 //! M6 adds [`Team::from_info`] / [`Channel::from_info`] /
 //! [`TeamMember::from_info`]; M7 adds [`FileEntry::from_shared`] /
-//! [`FileVersion::from_wire`]; M13 adds [`Identity::from_whoami`].
+//! [`FileVersion::from_wire`]; M13 adds [`Identity::from_whoami`]; B3 adds
+//! [`Person::from_member`]; B2a adds [`ChatMember::from_info`].
 //!
 //! ## Two facts you must orient on
 //!
@@ -33,9 +34,9 @@
 use serde::{Deserialize, Serialize};
 
 use ost::api::{
-    ChannelInfo, ChatInfo, FileVersion as WireFileVersion, MeetingInfo as WireMeetingInfo,
-    MessageInfo, ReactionCount, Reactor as WireReactor, SharedFile as WireSharedFile, TeamInfo,
-    TeamMemberInfo, UserInfo,
+    ChannelInfo, ChatInfo, ChatMemberInfo, FileVersion as WireFileVersion,
+    MeetingInfo as WireMeetingInfo, MessageInfo, ReactionCount, Reactor as WireReactor,
+    SharedFile as WireSharedFile, TeamInfo, TeamMemberInfo, UserInfo,
 };
 
 /// Delivery state of a message we authored (milestone **M5**).
@@ -417,6 +418,74 @@ impl Person {
 impl From<&TeamMemberInfo> for Person {
     fn from(info: &TeamMemberInfo) -> Self {
         Person::from_member(info)
+    }
+}
+
+// ----- chat roster (B2a) --------------------------------------------------
+
+/// One member of a **chat** roster (backlog item **B2a**).
+///
+/// Built from the vendored `ost::api::ChatMemberInfo` the chat-service thread
+/// roster (`GET /v1/threads/{id}/members`) and the Graph `conversationMember`
+/// projection both produce. A roster entry is **not** a directory [`Person`]:
+/// its identity is the chat-service **MRI** (`8:orgid:<guid>`, the value the
+/// leave path deletes and the message `from` link carries), it carries
+/// roster **roles** and an owner flag, and the chat service often has no
+/// display name (the vendored call fills blanks from Graph). So it gets its own
+/// type; [`Person`] remains the directory-search shape the people picker uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMember {
+    /// Chat-service identity (`8:orgid:<guid>`); the leave target.
+    pub mri: String,
+    /// Graph/AAD user id (the guid part of [`mri`](ChatMember::mri)), when the
+    /// wire named one (the presence key).
+    pub id: Option<String>,
+    /// Display name; empty when the roster carried none and the Graph fill
+    /// failed (the row then falls back to the email or a placeholder).
+    pub display_name: String,
+    /// Email, when the Graph fill resolved one.
+    pub email: Option<String>,
+    /// Roster role names, lowercased (`["admin"]`/`["user"]` from the chat
+    /// service, `["owner"]`/`["member"]` from Graph).
+    pub roles: Vec<String>,
+    /// Whether the wire marked this member an owner (`Admin` role on the chat
+    /// service, `owner` on Graph).
+    pub is_owner: bool,
+}
+
+impl ChatMember {
+    /// Build a domain [`ChatMember`] from a protocol `ChatMemberInfo`.
+    pub fn from_info(info: &ChatMemberInfo) -> Self {
+        ChatMember {
+            mri: info.mri.clone(),
+            id: info.user_id.clone(),
+            display_name: info.display_name.clone(),
+            email: info.email.clone(),
+            roles: info.roles.clone(),
+            is_owner: info.is_owner,
+        }
+    }
+
+    /// A short `"Name <email>"` label for a roster row (the email is omitted
+    /// when unknown; the MRI is shown when there is no name at all).
+    pub fn label(&self) -> String {
+        let name = self.display_name.trim();
+        if !name.is_empty() {
+            match self.email.as_deref().filter(|e| !e.trim().is_empty()) {
+                Some(email) => format!("{name} <{email}>"),
+                None => name.to_string(),
+            }
+        } else if let Some(email) = self.email.as_deref().filter(|e| !e.trim().is_empty()) {
+            email.to_string()
+        } else {
+            self.mri.clone()
+        }
+    }
+}
+
+impl From<&ChatMemberInfo> for ChatMember {
+    fn from(info: &ChatMemberInfo) -> Self {
+        ChatMember::from_info(info)
     }
 }
 
@@ -1268,6 +1337,57 @@ mod tests {
         assert_eq!(person.label(), "Tom Becker");
         let back: Person = serde_json::from_str(&serde_json::to_string(&person).unwrap()).unwrap();
         assert_eq!(back, person);
+    }
+
+    // ----- B2a: chat roster -------------------------------------------------
+
+    #[test]
+    fn chat_member_converts_from_a_roster_entry_and_labels() {
+        let info = ChatMemberInfo {
+            mri: "8:orgid:u1".into(),
+            user_id: Some("u1".into()),
+            display_name: "Ava Lindqvist".into(),
+            email: Some("ava@contoso.com".into()),
+            roles: vec!["admin".into()],
+            is_owner: true,
+        };
+        let member = ChatMember::from_info(&info);
+        assert_eq!(member.mri, "8:orgid:u1");
+        assert_eq!(member.id.as_deref(), Some("u1"));
+        assert_eq!(member.display_name, "Ava Lindqvist");
+        assert_eq!(member.email.as_deref(), Some("ava@contoso.com"));
+        assert!(member.is_owner);
+        assert_eq!(member.label(), "Ava Lindqvist <ava@contoso.com>");
+        // The `From` impl delegates to `from_info`.
+        assert_eq!(ChatMember::from(&info), member);
+        // A roster entry round-trips through serde (the store's JSON rule).
+        let back: ChatMember =
+            serde_json::from_str(&serde_json::to_string(&member).unwrap()).unwrap();
+        assert_eq!(back, member);
+    }
+
+    #[test]
+    fn chat_member_label_falls_back_to_email_then_mri() {
+        // No name, an email → the email.
+        let email_only = ChatMember::from_info(&ChatMemberInfo {
+            mri: "8:orgid:u2".into(),
+            user_id: Some("u2".into()),
+            display_name: String::new(),
+            email: Some("tom@contoso.com".into()),
+            roles: Vec::new(),
+            is_owner: false,
+        });
+        assert_eq!(email_only.label(), "tom@contoso.com");
+        // Neither → the MRI, never an empty label.
+        let bare = ChatMember::from_info(&ChatMemberInfo {
+            mri: "8:orgid:u3".into(),
+            user_id: Some("u3".into()),
+            display_name: "  ".into(),
+            email: None,
+            roles: Vec::new(),
+            is_owner: false,
+        });
+        assert_eq!(bare.label(), "8:orgid:u3");
     }
 
     #[test]

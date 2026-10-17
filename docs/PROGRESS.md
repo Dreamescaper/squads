@@ -1384,3 +1384,96 @@ acceptance — the actual response shapes and whether the Teams first-party Grap
 token carries the delegated `Files.Read`/`User.ReadBasic.All` scopes for these
 routes — is unverified; the request shapes are pinned offline). B-007 (directory
 names/emails are transient in-process only; nothing new is persisted).
+
+---
+
+## B2a — New chat, leave, mute/hide
+
+**Goal.** Let the user **start** a chat (1:1 or group), **leave** one, and write
+the per-user **server** mute/hide state, with a chat context menu and
+muted/hidden rendering in the chat list — all offline-testable against local TCP
+stubs. B2a consumes B3's people picker and reconciles its server mute/hide with
+M8's **local** mute flag.
+
+**Landed.**
+
+- `api` (M2 module, extended) — typed, instrumented wrappers in the existing
+  `ApiClient` style (redacting `Debug`, request counter, `tracing` spans):
+  `create_one_to_one_chat(user_id)` (`create_one_to_one_chat_data`),
+  `create_group_chat(topic, member_ids)` (`create_group_chat_data`),
+  `leave_chat(chat_id)` (`leave_chat_with_client`), `set_chat_muted(chat_id,
+  muted)` (`set_chat_muted_with_client`), `set_chat_hidden(chat_id, hidden)`
+  (`set_chat_hidden_with_client`) and `chat_members(chat_id)`
+  (`list_chat_members_data`). The pure write-shape helpers and the roster types
+  are re-exported (`one_to_one_create_path`/`one_to_one_create_body`,
+  `group_chat_create_body`/`thread_create_url`/`group_chat_members`/
+  `created_thread_id`, `parse_created_chat`, `chat_members_path`/
+  `parse_thread_members`/`parse_graph_chat_members`, `alerts_url`/`alerts_body`/
+  `alerts_muted`, `conversation_property_url`/`hide_chat_properties`,
+  `leave_member_url`, `ChatMemberInfo`, `RosterSource`). Creation and leave ride
+  the **chat service** (Graph `POST /me/chats` answers `405` and `POST /chats`
+  needs `Chat.Create`).
+- `model` — [`ChatMember`](../crates/squads-core/src/model.rs) (`mri`, `id`,
+  `display_name`, `email`, `roles`, `is_owner`), `ChatMember::from_info` /
+  `From<&ChatMemberInfo>` and a `label()` helper. A dedicated type rather than
+  [`Person`]: a roster entry is keyed by the chat-service **MRI** (the leave
+  target and the message `from` identity), carries roles/owner, and may have no
+  name — none of which the directory `Person` models (documented on the type).
+- `store` — **schema v10**. `chats.hidden` (INTEGER NOT NULL DEFAULT 0) and
+  `chats.server_muted` (nullable INTEGER; `NULL` = unknown, distinct from a
+  confirmed `0`), guarded `ALTER TABLE` migrations (re-entrant; a newer
+  `user_version` is still a hard error). Methods `set_chat_hidden` /
+  `is_chat_hidden` / `hidden_chats` and `set_chat_server_muted` / `server_muted`.
+  M8's `chats.muted` is **untouched** and remains the notification-routing flag.
+- `chats` (new) — the `Chats { profile, Arc<Store>, Arc<ApiClient> }` service:
+  `new_one_to_one` / `new_group` (create, map to [`Chat`], upsert into the store),
+  `leave` (server leave then drop the cached chat + messages), `set_muted` /
+  `set_hidden` (local flag first, best-effort server write; see below), and
+  `members` (map the roster into [`ChatMember`]s). Redacting `Debug`.
+- `session` — `Session::chats()` mirrors the other services (shares the store and
+  the cached `Arc<ApiClient>`; offline to build; `NotSignedIn` without tokens).
+- `crates/squads-app` — the **New chat** flow and the chat **context menu**:
+  - a **New chat** button in the chat list opens B3's people picker in "new chat"
+    mode (`Action::NewChat`); picking one person creates a 1:1, several reveal a
+    **Group topic** field and create a group (`Action::CreateChat` → `Chats`),
+    and the app refreshes the list and opens the new conversation
+    (`AppEvent::ChatCreated`);
+  - each row has a **"..." options** affordance (`Action::ToggleChatMenu`) that
+    reveals **Mute/Unmute**, **Hide** and **Leave**; **Leave asks first**
+    (`Action::RequestLeaveChat` → a Confirm/Cancel row →
+    `Action::ConfirmLeaveChat` → `AppEvent::ChatLeft`);
+  - **muted** rows carry a badge; **hidden** rows are collapsed out of the list
+    and re-shown with a "Show hidden (N)" toggle (`Action::ToggleShowHidden`);
+  - the local mute/hidden flags are written **synchronously** (immediate, offline)
+    and the server write runs on the existing `AppRuntime`/`AppEvent` bridge
+    (`AppEvent::ChatFlagsChanged`); repaints happen only when something changed
+    (ADR-027).
+
+**Decisions.** **ADR-038** (chat creation/leave via the chat service + the
+server-vs-local mute reconciliation + schema v10).
+
+**Tests.** `cargo test -p squads-core` — **376** (353 from M1–M13/B1/B3 + **23**
+new: 9 `api` (the 1:1 probe/create, group create + `Location`, leave, mute, hide,
+roster, the response parsing and the pure write shapes), 2 `model` (`ChatMember`
+conversion + label), 3 `store` (hidden + server-mute round-trips, the **v9→v10**
+migration), 8 `chats` (create 1:1/group caching, leave dropping the chat +
+messages, the mute reconciliation online + offline, hide, roster, `Send + Sync`/
+redacting `Debug`), 1 `session`). `cargo test -p squads-app` — **32** (27 from
+M10–M13/B1/B3 + **5** new: the new-chat flow (pick a person → Create chat), the
+group topic field, the context menu mute toggle, hide → show-hidden → unhide, and
+leave-confirms-first). `cargo test -p squads-protocol` still passes **377**.
+`cargo build --workspace` (default features) succeeds and `cargo fmt -p
+squads-core -p squads-app -- --check` is clean.
+
+**How to verify manually** (real tenant; not runnable here): sign in, press
+**New chat**, search a colleague and select them (one → a 1:1 opens; two or more
+→ type a topic and Create a group); open a chat's **"..."** menu and Mute it
+(the badge appears and notifications go quiet), Hide it (it collapses into the
+"Show hidden" section and can be unhidden), and Leave it (confirm; it disappears
+from the list). Confirm the tenant agrees: the muted chat's `alerts` property is
+`"false"`, the hidden chat is unpinned, and the left chat is gone.
+
+**Blockers.** **U-011** (live chat-service acceptance of the 1:1/group create,
+leave, mute/hide and roster shapes is unverified; the request shapes are pinned
+offline). B-007 (the roster is in-process only; the two new chat flags are the
+only added persisted state).

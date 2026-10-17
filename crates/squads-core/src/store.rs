@@ -44,6 +44,9 @@
 //!   own. See ADR-034.
 //! * **v9** (B1) — the `messages(profile, timestamp)` message-search index. See
 //!   ADR-036.
+//! * **v10** (B2a) — `chats.hidden` and `chats.server_muted`, the server-side
+//!   hide/mute state (the local `chats.muted` stays the notification-routing
+//!   truth). See ADR-038.
 //!
 //! ## Who writes what
 //!
@@ -58,8 +61,11 @@
 //! the mute flag with [`Store::set_chat_muted`]. M9 records local call history
 //! through [`Store::upsert_call_log`] / [`Store::call_log`]. M12's calendar
 //! service caches meetings through [`Store::upsert_meetings`] and reads them
-//! with [`Store::upcoming_meetings`]. Nothing in this module talks to the
-//! network.
+//! with [`Store::upcoming_meetings`]. B2a's `Chats` service upserts a created
+//! chat and drops a left one (`delete_chat`), and mirrors the server mute/hide
+//! state with [`Store::set_chat_server_muted`] / [`Store::set_chat_hidden`]
+//! (the local `chats.muted` routing flag is unchanged). Nothing in this module
+//! talks to the network.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -88,7 +94,9 @@ use crate::model::{
 /// * **v8** (M13) — `accounts.self_mri` / `accounts.oid`, the signed-in
 ///   identity [`Message::mark_own`] needs.
 /// * **v9** (B1) — `messages(profile, timestamp)`, the message-search index.
-pub const SCHEMA_VERSION: i32 = 9;
+/// * **v10** (B2a) — `chats.hidden` and `chats.server_muted`, the server-side
+///   hide/mute state (the local `chats.muted` remains the routing flag).
+pub const SCHEMA_VERSION: i32 = 10;
 
 /// Timeout for a busy database before `SQLITE_BUSY` is surfaced.
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -903,6 +911,86 @@ impl Store {
         Ok(ids)
     }
 
+    /// Set (or clear) the local **hidden** flag for one chat (B2a, schema v10).
+    ///
+    /// The mirror of the server's `unpinnedTime`/`historyHiddenTime` hide: a
+    /// hidden chat is collapsed out of the chat list but can be shown again.
+    /// Returns whether a matching `(id, profile)` chat row existed.
+    pub fn set_chat_hidden(&self, profile: &str, chat_id: &str, hidden: bool) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE chats SET hidden = ?1 WHERE id = ?2 AND profile = ?3",
+            params![hidden as i64, chat_id, profile],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Whether one cached chat is hidden for this profile (unknown chat →
+    /// `false`).
+    pub fn is_chat_hidden(&self, profile: &str, chat_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let hidden = conn
+            .query_row(
+                "SELECT hidden FROM chats WHERE id = ?1 AND profile = ?2",
+                params![chat_id, profile],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(hidden.unwrap_or(0) != 0)
+    }
+
+    /// The ids of every hidden chat for this profile (the collapsed section).
+    pub fn hidden_chats(&self, profile: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id FROM chats WHERE profile = ?1 AND hidden != 0 ORDER BY id ASC")?;
+        let rows = stmt.query_map(params![profile], |row| row.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for id in rows {
+            ids.push(id?);
+        }
+        Ok(ids)
+    }
+
+    /// Record the last **server-confirmed** mute state for one chat (B2a,
+    /// schema v10).
+    ///
+    /// `Some(muted)` is what the server's `alerts` property was set to;
+    /// `None` clears it back to "unknown" (the column is nullable, so a failed
+    /// offline write stays `NULL` rather than lying). This is deliberately
+    /// **separate** from `chats.muted`, which is the local routing flag
+    /// (M8/ADR-021): the local flag is the notification-routing truth, the
+    /// server state is a best-effort mirror (see ADR-038).
+    pub fn set_chat_server_muted(
+        &self,
+        profile: &str,
+        chat_id: &str,
+        muted: Option<bool>,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let value = muted.map(|m| m as i64);
+        let changed = conn.execute(
+            "UPDATE chats SET server_muted = ?1 WHERE id = ?2 AND profile = ?3",
+            params![value, chat_id, profile],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The last server-confirmed mute state for one chat, if ever recorded
+    /// (`None` = unknown).
+    pub fn server_muted(&self, profile: &str, chat_id: &str) -> Result<Option<bool>> {
+        let conn = self.lock();
+        let value = conn
+            .query_row(
+                "SELECT server_muted FROM chats WHERE id = ?1 AND profile = ?2",
+                params![chat_id, profile],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(value.map(|v| v != 0))
+    }
+
     /// The timestamp of the message the chat was read up to, if the horizon
     /// message is still cached (a horizon pointing at an evicted/deleted
     /// message resolves to `None`).
@@ -1594,6 +1682,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if current < 9 {
         migrate_v9(&tx)?;
     }
+    if current < 10 {
+        migrate_v10(&tx)?;
+    }
     // Record the version *after* the DDL inside the same transaction, so a
     // crash can never leave a version marker ahead of the schema.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1684,6 +1775,25 @@ fn migrate_v8(tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// version marker was reset.
 fn migrate_v9(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(MIGRATION_V9_INDEX)?;
+    Ok(())
+}
+
+/// Apply the v10 additions: the `chats.hidden` and `chats.server_muted`
+/// columns (B2a).
+///
+/// Like the v2 `send_state` / v5 `muted` / v8 identity columns,
+/// `ALTER TABLE … ADD COLUMN` has no `IF NOT EXISTS`, so each probe guards
+/// re-running after a version reset. `hidden` defaults `0` (visible);
+/// `server_muted` is **nullable** — `NULL` means the server mute state is
+/// unknown (never written, or the write failed offline), which is distinct
+/// from `0` (the server confirmed unmuted).
+fn migrate_v10(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    if !column_exists(tx, "chats", "hidden")? {
+        tx.execute_batch("ALTER TABLE chats ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if !column_exists(tx, "chats", "server_muted")? {
+        tx.execute_batch("ALTER TABLE chats ADD COLUMN server_muted INTEGER;")?;
+    }
     Ok(())
 }
 
@@ -2880,6 +2990,134 @@ mod tests {
         assert!(!store.is_chat_muted("default", "missing").unwrap());
         assert!(!store.set_chat_muted("work", "c1", true).unwrap());
         assert!(!store.is_chat_muted("work", "c1").unwrap());
+    }
+
+    // ----- B2a: server mute / hide ------------------------------------------
+
+    #[test]
+    fn chat_hidden_round_trips_and_is_profile_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_chats(
+                "default",
+                &[chat("c1", "One", None), chat("c2", "Two", None)],
+            )
+            .unwrap();
+
+        assert!(!store.is_chat_hidden("default", "c1").unwrap());
+        assert!(store.set_chat_hidden("default", "c1", true).unwrap());
+        assert!(store.is_chat_hidden("default", "c1").unwrap());
+        assert!(!store.is_chat_hidden("default", "c2").unwrap());
+        assert_eq!(
+            store.hidden_chats("default").unwrap(),
+            vec!["c1".to_string()]
+        );
+
+        // Unhiding removes it from the collapsed set.
+        assert!(store.set_chat_hidden("default", "c1", false).unwrap());
+        assert!(store.hidden_chats("default").unwrap().is_empty());
+
+        // An uncached chat cannot be hidden; another profile is isolated.
+        assert!(!store.set_chat_hidden("default", "missing", true).unwrap());
+        assert!(!store.is_chat_hidden("default", "missing").unwrap());
+        assert!(!store.set_chat_hidden("work", "c1", true).unwrap());
+    }
+
+    #[test]
+    fn chat_server_mute_records_unknown_versus_confirmed() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_chats("default", &[chat("c1", "One", None)])
+            .unwrap();
+
+        // Never written → unknown (`None`), distinct from a confirmed unmute.
+        assert_eq!(store.server_muted("default", "c1").unwrap(), None);
+        assert!(
+            store
+                .set_chat_server_muted("default", "c1", Some(true))
+                .unwrap()
+        );
+        assert_eq!(store.server_muted("default", "c1").unwrap(), Some(true));
+        assert!(
+            store
+                .set_chat_server_muted("default", "c1", Some(false))
+                .unwrap()
+        );
+        assert_eq!(store.server_muted("default", "c1").unwrap(), Some(false));
+        // Clearing back to unknown is a real state, not a default.
+        assert!(store.set_chat_server_muted("default", "c1", None).unwrap());
+        assert_eq!(store.server_muted("default", "c1").unwrap(), None);
+
+        // The server flag is independent of the local routing flag.
+        assert!(store.set_chat_muted("default", "c1", true).unwrap());
+        assert!(store.is_chat_muted("default", "c1").unwrap());
+        assert_eq!(store.server_muted("default", "c1").unwrap(), None);
+        assert!(
+            !store
+                .set_chat_server_muted("default", "missing", Some(true))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn v9_database_upgrades_to_v10_adding_hide_and_server_mute_columns() {
+        let path = temp_path("v9-to-v10");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            // Build a genuine v9 database: v1 DDL, the v2 column + read_state,
+            // the v3/v4/v6/v7 tables, the v5 mute column, the v8 identity
+            // columns, the v9 search index, version marker 9, and one chat.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN send_state TEXT NOT NULL DEFAULT 'sent';",
+            )
+            .unwrap();
+            conn.execute_batch(MIGRATION_V2_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V3_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V4_TABLES).unwrap();
+            conn.execute_batch("ALTER TABLE chats ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;")
+                .unwrap();
+            conn.execute_batch(MIGRATION_V6_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V7_TABLES).unwrap();
+            conn.execute_batch("ALTER TABLE accounts ADD COLUMN self_mri TEXT;")
+                .unwrap();
+            conn.execute_batch("ALTER TABLE accounts ADD COLUMN oid TEXT;")
+                .unwrap();
+            conn.execute_batch(MIGRATION_V9_INDEX).unwrap();
+            conn.execute(
+                "INSERT INTO chats (id, profile, name, is_group, updated_at)
+                 VALUES ('c1','default','One',0,1)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 9).unwrap();
+        }
+
+        let store = Store::open(&path).expect("open the v9 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        {
+            let conn = store.lock();
+            assert!(column_exists(&conn, "chats", "hidden").unwrap());
+            assert!(column_exists(&conn, "chats", "server_muted").unwrap());
+        }
+        // The pre-existing chat defaults to visible and an unknown server mute.
+        assert!(!store.is_chat_hidden("default", "c1").unwrap());
+        assert_eq!(store.server_muted("default", "c1").unwrap(), None);
+        assert!(store.set_chat_hidden("default", "c1", true).unwrap());
+        assert!(
+            store
+                .set_chat_server_muted("default", "c1", Some(true))
+                .unwrap()
+        );
+
+        // Reopening again is a clean no-op and the state survives.
+        drop(store);
+        let store = Store::open(&path).expect("reopen v10 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert!(store.is_chat_hidden("default", "c1").unwrap());
+        assert_eq!(store.server_muted("default", "c1").unwrap(), Some(true));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]

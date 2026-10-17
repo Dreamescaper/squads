@@ -1,9 +1,18 @@
-//! The chat list column (milestone **M10**).
+//! The chat list column (milestone **M10**, extended by backlog item **B2a**).
 //!
 //! Reads chats from the local store via the app's cache ([`SquadsApp::chats`]),
 //! shows the name, preview, last-activity time and unread badge, and flags a
 //! conversation whose newest cached messages include a pending or failed send.
 //! Selecting a row queues [`Action::SelectChat`].
+//!
+//! **B2a** adds the chat-management surface:
+//!
+//! * a **New chat** button that opens the people picker in "new chat" mode
+//!   ([`Action::NewChat`]) — one person creates a 1:1, several a group;
+//! * a **"⋯" options** affordance per row ([`Action::ToggleChatMenu`]) that
+//!   reveals Mute/Unmute, Hide and Leave (Leave asks for confirmation first);
+//! * **muted** rows carry a small badge, **hidden** rows are collapsed out of
+//!   the list and can be shown again with the "Show hidden (N)" toggle.
 
 use egui::{RichText, Ui};
 
@@ -28,28 +37,64 @@ pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
                     app.set_search(search);
                 }
             });
-            if ui.button("Refresh chats").clicked() {
-                app.push_action(Action::RefreshChats);
+            ui.horizontal(|ui| {
+                if ui.button("New chat").clicked() {
+                    app.push_action(Action::NewChat);
+                }
+                if ui.button("Refresh chats").clicked() {
+                    app.push_action(Action::RefreshChats);
+                }
+            });
+            // Hidden chats are collapsed; this re-shows them (B2a).
+            if app.hidden_count() > 0 {
+                let label = if app.show_hidden() {
+                    format!("Hide hidden ({})", app.hidden_count())
+                } else {
+                    format!("Show hidden ({})", app.hidden_count())
+                };
+                if ui.button(label).clicked() {
+                    app.push_action(Action::ToggleShowHidden);
+                }
             }
             ui.separator();
 
             let filter = app.search().to_lowercase();
-            let chats: Vec<_> = app
+            let matches = |chat: &squads_core::Chat| {
+                filter.is_empty() || chat.name.to_lowercase().contains(&filter)
+            };
+            let visible: Vec<_> = app
                 .chats()
                 .iter()
-                .filter(|chat| filter.is_empty() || chat.name.to_lowercase().contains(&filter))
+                .filter(|chat| !app.is_chat_hidden(&chat.id) && matches(chat))
                 .cloned()
                 .collect();
+            // Hidden rows are only listed when the section is expanded.
+            let hidden: Vec<_> = if app.show_hidden() {
+                app.chats()
+                    .iter()
+                    .filter(|chat| app.is_chat_hidden(&chat.id) && matches(chat))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
-            if chats.is_empty() {
+            if visible.is_empty() && hidden.is_empty() {
                 ui.add_space(8.0);
                 ui.label(RichText::new("No chats cached yet.").weak());
                 return;
             }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for chat in chats {
-                    row(app, ui, &chat);
+                for chat in &visible {
+                    row(app, ui, chat);
+                }
+                if !hidden.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Hidden").weak().small());
+                    for chat in &hidden {
+                        row(app, ui, chat);
+                    }
                 }
             });
         });
@@ -60,6 +105,10 @@ fn row(app: &mut SquadsApp, ui: &mut Ui, chat: &squads_core::Chat) {
     let unread = app.unread_count(&chat.id);
     let pending = app.chat_pending(&chat.id);
     let failed = app.chat_failed(&chat.id);
+    let muted = app.is_chat_muted(&chat.id);
+    let hidden = app.is_chat_hidden(&chat.id);
+    let menu_open = app.chat_menu() == Some(chat.id.as_str());
+    let confirming = app.leave_confirm() == Some(chat.id.as_str());
     let preview = app.chat_preview(chat);
     let time = chat
         .last_message_time
@@ -77,11 +126,18 @@ fn row(app: &mut SquadsApp, ui: &mut Ui, chat: &squads_core::Chat) {
             if response.clicked() {
                 app.push_action(Action::SelectChat(chat.id.clone()));
             }
+            if muted {
+                ui.label(RichText::new("muted").weak().small());
+            }
             if !preview.is_empty() {
                 ui.label(RichText::new(preview).weak().small());
             }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            // The per-row options affordance opens the context menu (B2a).
+            if ui.button("...").on_hover_text("Chat options").clicked() {
+                app.push_action(Action::ToggleChatMenu(chat.id.clone()));
+            }
             if failed {
                 ui.colored_label(app.palette().failed, "!");
             } else if pending {
@@ -99,5 +155,43 @@ fn row(app: &mut SquadsApp, ui: &mut Ui, chat: &squads_core::Chat) {
             }
         });
     });
+
+    if menu_open {
+        chat_menu(app, ui, chat, muted, hidden);
+    }
+    if confirming {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Leave this chat?").weak().small());
+            if ui.button("Confirm leave").clicked() {
+                app.push_action(Action::ConfirmLeaveChat(chat.id.clone()));
+            }
+            if ui.button("Cancel").clicked() {
+                app.push_action(Action::CancelLeaveChat);
+            }
+        });
+    }
     ui.separator();
+}
+
+/// The inline context menu for one chat (only rendered while open).
+fn chat_menu(
+    app: &mut SquadsApp,
+    ui: &mut Ui,
+    chat: &squads_core::Chat,
+    muted: bool,
+    hidden: bool,
+) {
+    ui.horizontal(|ui| {
+        let mute_label = if muted { "Unmute" } else { "Mute" };
+        if ui.button(mute_label).clicked() {
+            app.push_action(Action::ToggleChatMuted(chat.id.clone()));
+        }
+        let hide_label = if hidden { "Unhide" } else { "Hide" };
+        if ui.button(hide_label).clicked() {
+            app.push_action(Action::ToggleChatHidden(chat.id.clone()));
+        }
+        if ui.button("Leave").clicked() {
+            app.push_action(Action::RequestLeaveChat(chat.id.clone()));
+        }
+    });
 }

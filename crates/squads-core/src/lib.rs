@@ -12,6 +12,7 @@ pub mod api;
 pub mod auth;
 pub mod calendar;
 pub mod calls;
+pub mod chats;
 pub mod error;
 pub mod files;
 pub mod media;
@@ -37,13 +38,14 @@ pub use calls::{
     CallRecording, CallService, CallSignaller, CallState, EndReason, IncomingCall, LoopbackMedia,
     MediaKind, MediaSession, PlaceCallRequest, PlacedCall, RecordingRequest, parse_incoming,
 };
+pub use chats::Chats;
 pub use error::{CoreError, Result};
 pub use files::Files;
 pub use media::{CachedMedia, MediaCache};
 pub use messaging::{HistoryPage, Messaging};
 pub use model::{
-    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, FileEntry, FileVersion, Identity,
-    Meeting, Message, Person, Reaction, Reactor, SearchHit, SendState, SharedLink, Team,
+    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, ChatMember, FileEntry, FileVersion,
+    Identity, Meeting, Message, Person, Reaction, Reactor, SearchHit, SendState, SharedLink, Team,
     TeamMember, is_channel_conversation_id,
 };
 pub use notifications::{

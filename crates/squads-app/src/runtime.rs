@@ -125,6 +125,15 @@ pub enum AppEvent {
         /// The mapped directory people (possibly empty).
         people: Vec<Person>,
     },
+    /// A new chat was created and cached (B2a); the app refreshes the list and
+    /// opens it.
+    ChatCreated(Chat),
+    /// A chat was left and dropped from the cache (B2a); the app refreshes the
+    /// list and clears the selection if it was the left chat.
+    ChatLeft(String),
+    /// The local mute/hidden flags changed (B2a); the app re-derives them from
+    /// the store so the list repaints.
+    ChatFlagsChanged,
     /// Batch presence for a set of contacts. No producer is wired yet (the M11
     /// presence panel will emit it); the variant is part of the event vocabulary.
     #[allow(dead_code)]
@@ -162,6 +171,9 @@ impl AppEvent {
             AppEvent::SearchResults { .. } => "search_results",
             AppEvent::FileSearchResults { .. } => "file_search_results",
             AppEvent::PeopleResults { .. } => "people_results",
+            AppEvent::ChatCreated(_) => "chat_created",
+            AppEvent::ChatLeft(_) => "chat_left",
+            AppEvent::ChatFlagsChanged => "chat_flags_changed",
             AppEvent::PresenceUpdated(_) => "presence_updated",
             AppEvent::Realtime(_) => "realtime",
             AppEvent::CallState(_) => "call_state",
