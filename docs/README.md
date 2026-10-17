@@ -9,6 +9,7 @@ An alternative, cross-platform Microsoft Teams client in **Rust + egui**.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Crate graph, responsibilities, data flow, protocol notes. |
 | [DECISIONS.md](DECISIONS.md) | Architecture decision records (ADRs). |
 | [PROGRESS.md](PROGRESS.md) | Live status per milestone and what actually landed. |
+| [BACKLOG.md](BACKLOG.md) | Post-plan work items (protocol surfaces not yet wired). |
 | [BLOCKERS.md](BLOCKERS.md) | Constraints, blockers, deferred work. |
 | [PACKAGING.md](PACKAGING.md) | Build, install and cross-platform packaging instructions. |
 | [reference/](reference/) | Live end-to-end shell probes kept for manual verification. |
