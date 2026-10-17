@@ -16,7 +16,8 @@ use egui_kittest::kittest::Queryable;
 
 use squads_core::auth::MemoryTokenStore;
 use squads_core::model::{
-    Channel, ChatFolder, FileEntry, Identity, Meeting, Message, Person, PinnedMessage, SendState,
+    Channel, ChatFolder, FileEntry, Identity, Meeting, Message, Person, PinnedMessage, PublicTeam,
+    SendState, TeamMember,
 };
 use squads_core::{AppDirs, Chat, Session, SessionState, Settings, Store, Team};
 
@@ -87,10 +88,15 @@ fn app_harness_with_session(
     configure(&mut session);
 
     let store_handle = Arc::clone(&store);
-    let harness = Harness::new_eframe(move |cc| {
-        SquadsApp::headless(cc.egui_ctx.clone(), dirs, session, Settings::default())
-            .expect("build app")
-    });
+    // The app renders emoji from message content and the channel-reaction
+    // picker; the bundled fonts have no emoji glyphs, so allow tofu rather than
+    // the harness's default panic (ADR-028).
+    let harness = Harness::builder()
+        .allow_missing_glyphs()
+        .build_eframe(move |cc| {
+            SquadsApp::headless(cc.egui_ctx.clone(), dirs, session, Settings::default())
+                .expect("build app")
+        });
     (harness, store_handle)
 }
 
@@ -1108,6 +1114,222 @@ fn moving_the_selected_chat_into_a_folder_queues_the_action() {
             .iter()
             .any(|action| matches!(action, Action::MoveChatToFolder { folder_id, .. } if folder_id == "work")),
         "expected a MoveChatToFolder action; got {:?}",
+        harness.state().applied_actions()
+    );
+}
+
+// ----- B4: team administration -----------------------------------------------
+
+#[test]
+fn public_team_search_renders_results_and_join_queues() {
+    let (mut harness, _store) = app_harness(|_| {});
+    harness.run();
+    harness.get_by_label("Teams").click();
+    harness.run();
+
+    // Seed the async search results (headless has no directory service).
+    harness.state_mut().set_public_results(
+        "eng",
+        vec![
+            PublicTeam {
+                id: "t1".into(),
+                display_name: "Engineering".into(),
+                description: Some("Build things".into()),
+                visibility: "public".into(),
+                is_joined: false,
+            },
+            PublicTeam {
+                id: "t2".into(),
+                display_name: "Design".into(),
+                description: None,
+                visibility: "public".into(),
+                is_joined: true,
+            },
+        ],
+    );
+    harness.run();
+
+    // The rows render; the joined one shows Joined, the other a Join button.
+    harness.get_by_label("Engineering");
+    harness.get_by_label("Build things");
+    harness.get_by_label("Joined");
+    harness.get_by_label("Join").click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .applied_actions()
+            .iter()
+            .any(|action| matches!(action, Action::JoinTeam(id) if id == "t1")),
+        "expected a JoinTeam action; got {:?}",
+        harness.state().applied_actions()
+    );
+}
+
+#[test]
+fn member_management_lists_members_and_removes_with_confirmation() {
+    let (mut harness, _store) = app_harness_with_session(
+        |store| {
+            store
+                .upsert_teams(
+                    "default",
+                    &[Team {
+                        id: "team1".into(),
+                        name: "Engineering".into(),
+                    }],
+                )
+                .expect("teams");
+        },
+        |session| {
+            // The signed-in user owns the team.
+            session.set_identity(Identity {
+                mri: "8:orgid:me-oid".into(),
+                oid: "me-oid".into(),
+                display_name: "Me".into(),
+                tenant: "contoso.onmicrosoft.com".into(),
+            });
+        },
+    );
+    harness.run();
+
+    // Seed the fetched roster (headless has no team service).
+    harness.state_mut().set_team_members(
+        "team1",
+        vec![
+            TeamMember {
+                id: "M-me".into(),
+                user_id: Some("me-oid".into()),
+                display_name: "Me".into(),
+                email: Some("me@contoso.com".into()),
+                roles: vec!["owner".into()],
+            },
+            TeamMember {
+                id: "M-ava".into(),
+                user_id: Some("ava-oid".into()),
+                display_name: "Ava".into(),
+                email: Some("ava@contoso.com".into()),
+                roles: Vec::new(),
+            },
+        ],
+    );
+    harness.run();
+
+    harness.get_by_label("Teams").click();
+    harness.run();
+    // Expanding the team reveals its roster; the owner flag unlocks Add/Remove.
+    harness.get_by_label("Engineering").click();
+    harness.run();
+    harness.get_by_label("Members");
+    harness.get_by_label("Me");
+    harness.get_by_label("Ava");
+    harness.get_by_label("Add member");
+
+    // Remove asks first, then confirms.
+    harness.get_by_label("Remove Ava").click();
+    harness.run();
+    harness.get_by_label("Confirm remove").click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .applied_actions()
+            .iter()
+            .any(|action| matches!(
+                action,
+                Action::ConfirmRemoveTeamMember { membership_id, .. } if membership_id == "M-ava"
+            )),
+        "expected a ConfirmRemoveTeamMember action; got {:?}",
+        harness.state().applied_actions()
+    );
+
+    // Add member opens the people picker in add-member mode.
+    harness.get_by_label("Add member").click();
+    harness.run();
+    assert!(
+        harness.state().people_picker_open(),
+        "Add member opens the people picker"
+    );
+    assert_eq!(harness.state().add_member_team(), Some("team1"));
+    harness.get_by_label("Grant owner role");
+
+    // Picking a person and adding queues one AddTeamMember per selection.
+    harness.state_mut().set_people_results(
+        "ava",
+        vec![person("ava-oid", "Ava", Some("ava@contoso.com"))],
+    );
+    harness.run();
+    harness.get_by_label("Ava <ava@contoso.com>").click();
+    harness.run();
+    harness.get_by_label("Add to team").click();
+    harness.run();
+    assert!(
+        harness.state().applied_actions().iter().any(|action| matches!(
+            action,
+            Action::AddTeamMember { team_id, user_id, owner } if team_id == "team1" && user_id == "ava-oid" && !owner
+        )),
+        "expected an AddTeamMember action; got {:?}",
+        harness.state().applied_actions()
+    );
+}
+
+#[test]
+fn channel_message_reactions_queue_the_channel_lane() {
+    let channel = "19:ch@thread.tacv2";
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_teams(
+                "default",
+                &[Team {
+                    id: "team1".into(),
+                    name: "Engineering".into(),
+                }],
+            )
+            .expect("teams");
+        store
+            .upsert_channels(
+                "default",
+                &[Channel {
+                    id: channel.into(),
+                    team_id: "team1".into(),
+                    name: "General".into(),
+                    description: None,
+                    membership_type: None,
+                    web_url: None,
+                    is_channel: true,
+                }],
+            )
+            .expect("channels");
+        store
+            .upsert_messages(
+                "default",
+                &[message(channel, "m1", "Ava", "react to me", false)],
+            )
+            .expect("messages");
+    });
+    harness.run();
+
+    // Open the channel from the Teams page (it becomes the selected
+    // conversation on the Chats page).
+    harness.get_by_label("Teams").click();
+    harness.run();
+    harness.get_by_label("Engineering").click();
+    harness.run();
+    harness.get_by_label("General").click();
+    harness.run();
+    assert_eq!(harness.state().selected_chat(), Some(channel));
+
+    // The channel message carries the reaction affordance; clicking an emoji
+    // queues the channel-lane action (not the chat path).
+    harness.get_by_label("react to me");
+    harness.get_by_label("👍").click();
+    harness.run();
+    assert!(
+        harness.state().applied_actions().iter().any(|action| matches!(
+            action,
+            Action::ReactInChannel { conversation_id, message_id, emoji, remove, is_reply }
+                if conversation_id == channel && message_id == "m1" && emoji == "👍" && !remove && !is_reply
+        )),
+        "expected a ReactInChannel action; got {:?}",
         harness.state().applied_actions()
     );
 }

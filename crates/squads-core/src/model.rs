@@ -16,7 +16,8 @@
 //! [`TeamMember::from_info`]; M7 adds [`FileEntry::from_shared`] /
 //! [`FileVersion::from_wire`]; M13 adds [`Identity::from_whoami`]; B3 adds
 //! [`Person::from_member`]; B2a adds [`ChatMember::from_info`]; B2b adds
-//! [`ChatFolder::from_wire`] / [`PinnedMessage::from_wire`].
+//! [`ChatFolder::from_wire`] / [`PinnedMessage::from_wire`]; B4 adds
+//! [`PublicTeam::from_info`] / [`TeamSettings::from_wire`].
 //!
 //! ## Two facts you must orient on
 //!
@@ -37,8 +38,8 @@ use serde::{Deserialize, Serialize};
 use ost::api::{
     ChannelInfo, ChatInfo, ChatMemberInfo, ConversationFolder as WireConversationFolder,
     FileVersion as WireFileVersion, MeetingInfo as WireMeetingInfo, MessageInfo, PinnedRef,
-    ReactionCount, Reactor as WireReactor, SharedFile as WireSharedFile, TeamInfo, TeamMemberInfo,
-    UserInfo,
+    PublicTeamInfo, ReactionCount, Reactor as WireReactor, SharedFile as WireSharedFile, TeamInfo,
+    TeamMemberInfo, TeamMemberSettings, UserInfo,
 };
 
 /// Delivery state of a message we authored (milestone **M5**).
@@ -323,13 +324,21 @@ impl From<(&str, &ChannelInfo)> for Channel {
 /// One team roster entry (milestone **M6**).
 ///
 /// Mirrors `ost::api::TeamMemberInfo`. `id` is the **membership** id (the DELETE
-/// target), not the user id; `roles` carries Graph role names and contains
-/// `"owner"` for team owners. The owner flag is derivable from `roles` and is
-/// deliberately not duplicated here.
+/// target), not the user id; `user_id` is the Graph/AAD user id when the roster
+/// named one (used to match the signed-in identity for "teams you own" — B4);
+/// `roles` carries Graph role names and contains `"owner"` for team owners. The
+/// owner flag is derivable from `roles` and is deliberately not duplicated here.
+///
+/// The store does **not** persist `user_id` (the `team_members` table predates
+/// it), so a roster read from the cache leaves it `None`; a live
+/// [`Teams::members`](crate::Teams::members) fills it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamMember {
     /// Membership id (not the user id).
     pub id: String,
+    /// Graph/AAD user id, when the roster named one (not persisted).
+    #[serde(default)]
+    pub user_id: Option<String>,
     /// Display name (`displayName`, falling back to the membership id).
     pub display_name: String,
     /// Email address, when Graph named one.
@@ -343,6 +352,7 @@ impl TeamMember {
     pub fn from_info(info: &TeamMemberInfo) -> Self {
         TeamMember {
             id: info.id.clone(),
+            user_id: info.user_id.clone(),
             display_name: info.display_name.clone(),
             email: info.email.clone(),
             roles: info.roles.clone(),
@@ -358,6 +368,88 @@ impl TeamMember {
 impl From<&TeamMemberInfo> for TeamMember {
     fn from(info: &TeamMemberInfo) -> Self {
         TeamMember::from_info(info)
+    }
+}
+
+// ----- team administration (B4) -------------------------------------------
+
+/// One joinable (public) team from the **B4** directory search.
+///
+/// Mirrors `ost::api::PublicTeamInfo` (Graph `/groups` `$search`, falling back
+/// to `/teams` `startswith`) and adds one local field:
+/// [`is_joined`](PublicTeam::is_joined). The wire row carries **no** membership
+/// flag, so the caller marks it against its own joined-teams list (the
+/// [`Teams`](crate::Teams) service does this from the store cache); a bare
+/// [`From<&PublicTeamInfo>`] conversion therefore defaults it to `false` rather
+/// than guessing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicTeam {
+    /// Graph group id of the team (also the join target).
+    pub id: String,
+    /// Display name (`displayName`, falling back to the id).
+    pub display_name: String,
+    /// Graph `description`, when set.
+    pub description: Option<String>,
+    /// Graph `visibility` (the vendored parser keeps only `public`).
+    pub visibility: String,
+    /// Local: whether the signed-in user has already joined this team. Not sent
+    /// by the wire; set by the caller against the joined list.
+    pub is_joined: bool,
+}
+
+impl PublicTeam {
+    /// Build a domain [`PublicTeam`] from a protocol `PublicTeamInfo`, attaching
+    /// the caller-supplied membership flag (the wire does not carry one).
+    pub fn from_info(info: &PublicTeamInfo, is_joined: bool) -> Self {
+        PublicTeam {
+            id: info.id.clone(),
+            display_name: info.name.clone(),
+            description: info.description.clone(),
+            visibility: info.visibility.clone(),
+            is_joined,
+        }
+    }
+}
+
+impl From<&PublicTeamInfo> for PublicTeam {
+    /// Membership is unknown from the wire, so [`is_joined`](PublicTeam::is_joined)
+    /// defaults to `false`; use [`PublicTeam::from_info`] to mark it.
+    fn from(info: &PublicTeamInfo) -> Self {
+        PublicTeam::from_info(info, false)
+    }
+}
+
+/// A team's member permissions + General channel (backlog item **B4**).
+///
+/// Mirrors `ost::api::TeamMemberSettings` (two Graph GETs: `GET /teams/{id}`
+/// for `memberSettings`, `GET /teams/{id}/primaryChannel` for the General
+/// channel). Each field is `None` when the read failed or the field was absent
+/// — **unknown**, deliberately distinct from `false`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamSettings {
+    /// Whether non-owners may delete channels (`memberSettings.allowDeleteChannels`).
+    pub allow_delete_channels: Option<bool>,
+    /// Whether non-owners may create/update channels
+    /// (`memberSettings.allowCreateUpdateChannels`).
+    pub allow_create_update_channels: Option<bool>,
+    /// Id of the team's General (primary) channel, when the read succeeded.
+    pub primary_channel_id: Option<String>,
+}
+
+impl TeamSettings {
+    /// Build a domain [`TeamSettings`] from the vendored projection.
+    pub fn from_wire(settings: &TeamMemberSettings) -> Self {
+        TeamSettings {
+            allow_delete_channels: settings.allow_delete_channels,
+            allow_create_update_channels: settings.allow_create_update_channels,
+            primary_channel_id: settings.primary_channel_id.clone(),
+        }
+    }
+}
+
+impl From<&TeamMemberSettings> for TeamSettings {
+    fn from(settings: &TeamMemberSettings) -> Self {
+        TeamSettings::from_wire(settings)
     }
 }
 
@@ -1413,6 +1505,7 @@ mod tests {
             is_owner: true,
         });
         assert_eq!(member.id, "M1");
+        assert_eq!(member.user_id.as_deref(), Some("oid-1"));
         assert_eq!(member.display_name, "Alice");
         assert_eq!(member.email.as_deref(), Some("alice@example.com"));
         assert_eq!(member.roles, vec!["owner".to_string()]);
@@ -1428,6 +1521,52 @@ mod tests {
         });
         assert!(!plain.is_owner());
         assert!(plain.email.is_none());
+    }
+
+    // ----- B4: team administration -----------------------------------------
+
+    #[test]
+    fn public_team_converts_and_marks_membership_locally() {
+        let info = PublicTeamInfo {
+            id: "team-1".into(),
+            name: "Engineering".into(),
+            description: Some("Build things".into()),
+            visibility: "public".into(),
+        };
+        let joined = PublicTeam::from_info(&info, true);
+        assert_eq!(joined.id, "team-1");
+        assert_eq!(joined.display_name, "Engineering");
+        assert_eq!(joined.description.as_deref(), Some("Build things"));
+        assert_eq!(joined.visibility, "public");
+        assert!(joined.is_joined);
+        // The wire carries no membership flag, so `From` defaults it false.
+        let bare = PublicTeam::from(&info);
+        assert!(!bare.is_joined);
+        assert_eq!(bare.id, joined.id);
+        // It round-trips through JSON (the shape a future cache would store).
+        let back: PublicTeam =
+            serde_json::from_str(&serde_json::to_string(&joined).unwrap()).unwrap();
+        assert_eq!(back, joined);
+    }
+
+    #[test]
+    fn team_settings_map_unknown_fields_to_none() {
+        let settings = TeamSettings::from_wire(&TeamMemberSettings {
+            allow_delete_channels: Some(true),
+            allow_create_update_channels: None,
+            primary_channel_id: Some("19:general@thread.tacv2".into()),
+        });
+        assert_eq!(settings.allow_delete_channels, Some(true));
+        assert_eq!(settings.allow_create_update_channels, None);
+        assert_eq!(
+            settings.primary_channel_id.as_deref(),
+            Some("19:general@thread.tacv2")
+        );
+        // A bare default is all-unknown, not all-false.
+        let empty = TeamSettings::from_wire(&TeamMemberSettings::default());
+        assert_eq!(empty.allow_delete_channels, None);
+        assert_eq!(empty.allow_create_update_channels, None);
+        assert!(empty.primary_channel_id.is_none());
     }
 
     // ----- B3: people -------------------------------------------------------

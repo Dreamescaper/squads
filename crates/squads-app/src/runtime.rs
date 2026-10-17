@@ -28,8 +28,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use squads_core::api::JoinTarget;
 use squads_core::model::{
-    CallLogEntry, Chat, ChatFolder, FileEntry, Meeting, Message, Person, PinnedMessage, SearchHit,
-    Team,
+    CallLogEntry, Chat, ChatFolder, FileEntry, Meeting, Message, Person, PinnedMessage, PublicTeam,
+    SearchHit, Team, TeamMember,
 };
 use squads_core::{CallState, Channel, ContactPresence, Identity, RealtimeEvent, SignInProgress};
 
@@ -144,6 +144,28 @@ pub enum AppEvent {
         /// The cached pins, each with its message resolved when present.
         pins: Vec<PinnedMessage>,
     },
+    /// Public-team search results (B4).
+    PublicTeamsLoaded(Vec<PublicTeam>),
+    /// A team was joined and the joined-teams cache refreshed (B4).
+    TeamJoined(Team),
+    /// One team's roster was fetched (B4).
+    TeamMembersLoaded {
+        /// Owning team.
+        team_id: String,
+        /// The roster.
+        members: Vec<TeamMember>,
+    },
+    /// A team's roster changed (a member was added or removed) (B4); the app
+    /// re-reads the cached roster.
+    TeamMemberChanged {
+        /// Owning team.
+        team_id: String,
+    },
+    /// A channel message's reactions changed (B4); the app reloads the timeline.
+    ReactionsChanged {
+        /// Owning conversation.
+        chat_id: String,
+    },
     /// Batch presence for a set of contacts. No producer is wired yet (the M11
     /// presence panel will emit it); the variant is part of the event vocabulary.
     #[allow(dead_code)]
@@ -186,6 +208,11 @@ impl AppEvent {
             AppEvent::ChatFlagsChanged => "chat_flags_changed",
             AppEvent::FoldersLoaded(_) => "folders_loaded",
             AppEvent::PinsLoaded { .. } => "pins_loaded",
+            AppEvent::PublicTeamsLoaded(_) => "public_teams_loaded",
+            AppEvent::TeamJoined(_) => "team_joined",
+            AppEvent::TeamMembersLoaded { .. } => "team_members_loaded",
+            AppEvent::TeamMemberChanged { .. } => "team_member_changed",
+            AppEvent::ReactionsChanged { .. } => "reactions_changed",
             AppEvent::PresenceUpdated(_) => "presence_updated",
             AppEvent::Realtime(_) => "realtime",
             AppEvent::CallState(_) => "call_state",

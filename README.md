@@ -52,7 +52,8 @@ crates/
 | File & people search | Graph drive search + directory `/users` `$search` (single-window, 25); a global search box on the Files page; a **reusable people picker** (async query, multi-select, `selected_people()` for B2a's new chat) | Live Graph acceptance and the delegated `Files.Read`/`User.ReadBasic.All` scopes (U-010) | Paging (single-window only) |
 | Inline media | `<img>`/GIF extraction, one-fetch-per-URL `MediaCache` (Skype token only on Microsoft hosts), images rendered in the timeline | Live media hosts/`Content-Type`s and rendered pixels (U-008/B-012) | Streaming; per-account cache |
 | Realtime | Trouter wrap, typed event bus, write-through | Live push; call frames are filtered upstream (B-008) | — |
-| Teams/channels | Metadata cache, channel history, thread replies, middle-tier writes | Write acceptance; channel reactions/receipts (U-003) | — |
+| Teams/channels | Metadata cache, channel history, thread replies, middle-tier writes | Write acceptance; `create_channel` rides Graph (U-003) | Channel read receipts |
+| Team administration | **Browse public teams** (search + join), an owner-gated **member roster** (add via the people picker, remove with confirmation), team settings, and a **channel reaction** affordance (existing chips remove, the six picker emojis add, thread replies included) | Live Graph acceptance of public-team search/join, member admin, team settings and the Graph channel-reaction lane (U-003) | Paging the public-team search (single window, 25) |
 | Calendar | Graph `calendarView` agenda + week view, schedule/cancel, offline `meetings` cache, join hand-off to calls | Live Graph calendar acceptance; join-by-id is a browser fallback (U-007) | — |
 | Files | Graph list/upload/download/links/versions, coarse progress | Real SharePoint/OneDrive acceptance (U-004) | Streaming I/O |
 | Presence | Two backends, unified by default; pure mapping | Unified token audience/shapes (B-009/U-005) | Quiet hours (B-010) |

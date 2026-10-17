@@ -217,14 +217,26 @@ M6's teams/channel calls are thin wrappers over the vendored crate, tested
 offline against local TCP stubs (method/path/auth/body + store effects). The
 following cannot be exercised here (B-002 — no live tenant):
 
-- **Channel reactions and read receipts are best-effort and not wired.** The
-  chat-service reaction endpoint (`/messages/{id}/reactions`) **404s** on channel
-  threads and the consumption-horizon call (`/v1/threads/{id}/consumptionhorizons`)
-  **403s** (`AclCheckFailed`); the alternative Graph `setReaction`/`unsetReaction`
-  paths the vendor added are **NOT verified live** (auth was down when they
-  landed). M6 therefore exposes **no** channel react/mark-read: chats keep the M5
-  [`Messaging`] paths. Wiring channel reactions/receipts needs a signed-in probe
-  to settle the Graph-vs-chat-service id mapping and the scope grant.
+- **Channel reactions are wired to the dedicated Graph lane but not
+  live-verified; receipts are still not wired.** The chat-service reaction
+  endpoint (`/messages/{id}/reactions`) **404s** on channel threads, so **B4**
+  routes channel reactions through the vendored **Graph**
+  `…/messages/{id}/(set|unset)Reaction` lane (including the `replies/{reply}`
+  variant) via `Teams::react_in_channel`. That lane is the one the vendor flagged
+  **NOT verified live** (auth was down when it landed): the unicode-vs-named
+  `reactionType` form, the `ChannelMessage.Send` scope grant and the
+  Graph-vs-chat-service message id mapping still need a signed-in probe. Channel
+  **read receipts** remain on hold — Graph exposes no channel receipt API and the
+  chat-service consumption-horizon call (`/v1/threads/{id}/consumptionhorizons`)
+  **403s** (`AclCheckFailed`) on `tacv2` threads. Chats keep the M5
+  [`Messaging`] paths.
+- **B4's public-team search/join, member admin and team-settings shapes are
+  unverified live.** `search_public_teams` (`/groups` `$search` → `/teams`
+  `startswith`), `join_team` (`POST /teams/{id}/members` for self),
+  `add_team_member`/`remove_team_member` and `team_settings` are wrapped
+  straight from the vendored crate and pinned offline by stubs; whether the Teams
+  first-party token carries the needed read scopes and whether the live services
+  accept the shapes is assumed, not proven.
 - **`create_channel` rides Graph, not the middle tier.** The vendored
   `create_channel_data` posts to Graph (`POST /teams/{id}/channels`, body
   `displayName` + optional `description`); like the channel edit/delete routes it
@@ -245,16 +257,19 @@ following cannot be exercised here (B-002 — no live tenant):
   live `conversationLink`/id mapping is unverified. A pending→sent realtime race
   can still create a duplicate row until a resync (same shape as U-002).
 - **Roster/owner semantics.** `TeamMember.id` is the **membership** id, not the
-  user id; the owner flag is derived from `roles` containing `"owner"`. Both come
-  straight from the vendored parser and are not validated against a live roster.
+  user id; the owner flag is derived from `roles` containing `"owner"` and the
+  signed-in owner is matched by `TeamMember.user_id` against our oid (B4). Both
+  come straight from the vendored parser and are not validated against a live
+  roster; the store does not persist `user_id`, so a cached roster cannot decide
+  ownership.
 
 **Impact:** channel write correctness and the channel reaction/receipt story are
-assumed from the vendored crate + stubs.
+assumed from the vendored crate + stubs; channel reactions are now wired (B4) but
+unverified live.
 
 **Mitigation:** keep the writes behind `ApiClient`/`Teams`; the deterministic stub
-tests pin the exact paths/bodies/auth so a regression is caught; wire channel
-reactions/receipts in a live-verified follow-up (candidate for M8, alongside
-presence/notifications).
+tests pin the exact paths/bodies/auth so a regression is caught; verify the
+channel reaction lane and the B4 admin shapes against a live tenant.
 
 ### U-004 — M7 files aspects not exercised offline
 

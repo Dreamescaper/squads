@@ -493,7 +493,7 @@ impl Messaging {
 
 /// Adjust a reaction-count list locally: `+1` on add (inserting a new emoji
 /// entry when absent), `-1` on remove (dropping the entry at zero).
-fn apply_reaction(reactions: &mut Vec<Reaction>, emoji: &str, remove: bool) {
+pub(crate) fn apply_reaction(reactions: &mut Vec<Reaction>, emoji: &str, remove: bool) {
     if remove {
         if let Some(i) = reactions.iter().position(|r| r.emoji == emoji) {
             if reactions[i].count <= 1 {

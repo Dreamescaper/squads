@@ -18,7 +18,7 @@
 //!
 //! ## Schema & migrations
 //!
-//! The schema version lives in `PRAGMA user_version`; this build knows **v9**.
+//! The schema version lives in `PRAGMA user_version`; this build knows **v11**.
 //! Migrations are forward-only and re-entrant: statements are `IF NOT EXISTS`
 //! (or guarded by a schema probe, for `ALTER TABLE`), so re-running is a no-op.
 //! A database whose `user_version` is **newer** than this build understands is
@@ -70,7 +70,11 @@
 //! (the local `chats.muted` routing flag is unchanged). B2b's `Folders`/`Pins`
 //! services cache folders with [`Store::replace_chat_folders`] (membership on
 //! `chats.folder_id`) and pins with [`Store::replace_chat_pins`] /
-//! [`Store::remove_pin`]. Nothing in this module talks to the network.
+//! [`Store::remove_pin`]. B4's `Teams` administration uses the existing
+//! `teams`/`channels`/`team_members` tables: [`Store::team_for_channel`] (a
+//! read-only reverse lookup the channel-reaction lane needs for the team id)
+//! and [`Store::delete_team_member`] (the roster removal); **no schema change**
+//! was needed, so there is no v12. Nothing in this module talks to the network.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -1503,6 +1507,25 @@ impl Store {
         Ok(channel)
     }
 
+    /// The team id a cached channel belongs to, or `None` when the channel is
+    /// not cached (B4).
+    ///
+    /// The channel-reaction lane needs the **team** id alongside the channel
+    /// (the Graph path is `/teams/{team}/channels/{channel}/…`), and a
+    /// conversation id alone does not name its team; this reverse lookup over
+    /// the `channels` cache supplies it. Read-only and schema-free.
+    pub fn team_for_channel(&self, profile: &str, channel_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        let team = conn
+            .query_row(
+                "SELECT team_id FROM channels WHERE id = ?1 AND profile = ?2 LIMIT 1",
+                params![channel_id, profile],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(team)
+    }
+
     /// Delete one cached channel (M6 `delete_channel`). Returns whether a row
     /// existed. Team members are unaffected.
     pub fn delete_channel(&self, profile: &str, team_id: &str, channel_id: &str) -> Result<bool> {
@@ -1573,6 +1596,22 @@ impl Store {
             members.push(member?);
         }
         Ok(members)
+    }
+
+    /// Delete one cached team membership (B4 `remove_member`). Returns whether a
+    /// row existed. Keyed by `(id, team_id)`, like the upsert.
+    pub fn delete_team_member(
+        &self,
+        profile: &str,
+        team_id: &str,
+        member_id: &str,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let removed = conn.execute(
+            "DELETE FROM team_members WHERE id = ?1 AND team_id = ?2 AND profile = ?3",
+            params![member_id, team_id, profile],
+        )?;
+        Ok(removed > 0)
     }
 
     // ----- files (M7) -----------------------------------------------------
@@ -2225,6 +2264,9 @@ fn row_to_team_member(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamMember> {
     let roles_json: String = row.get(3)?;
     Ok(TeamMember {
         id: row.get(0)?,
+        // The `team_members` table does not store the user id; a cached roster
+        // leaves it unknown (a live fetch fills it — B4).
+        user_id: None,
         display_name: row.get(1)?,
         email: row.get(2)?,
         roles: roles_from_json(&roles_json),
@@ -2956,6 +2998,7 @@ mod tests {
     fn member(id: &str, name: &str) -> TeamMember {
         TeamMember {
             id: id.into(),
+            user_id: Some(format!("oid-{id}")),
             display_name: name.into(),
             email: Some(format!("{id}@example.com")),
             roles: vec!["owner".into()],
@@ -3119,6 +3162,73 @@ mod tests {
         let roster = store.team_members("t1").unwrap();
         assert_eq!(roster.len(), 2);
         assert!(roster[0].roles.is_empty());
+    }
+
+    // ----- B4: team administration -----------------------------------------
+
+    #[test]
+    fn team_for_channel_resolves_the_team_and_delete_team_member_drops_one() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_channels(
+                "default",
+                &[
+                    channel("19:ch@thread.tacv2", "team-1", "General"),
+                    channel("19:other@thread.tacv2", "team-2", "Other"),
+                ],
+            )
+            .unwrap();
+        // The reverse lookup names the owning team.
+        assert_eq!(
+            store
+                .team_for_channel("default", "19:ch@thread.tacv2")
+                .unwrap()
+                .as_deref(),
+            Some("team-1")
+        );
+        assert_eq!(
+            store
+                .team_for_channel("default", "19:other@thread.tacv2")
+                .unwrap()
+                .as_deref(),
+            Some("team-2")
+        );
+        // An uncached channel is `None`, and a different profile is isolated.
+        assert!(
+            store
+                .team_for_channel("default", "19:unknown@thread.tacv2")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .team_for_channel("work", "19:ch@thread.tacv2")
+                .unwrap()
+                .is_none()
+        );
+
+        // Roster removal drops exactly one membership.
+        store
+            .upsert_team_members(
+                "default",
+                "team-1",
+                &[member("M1", "Alice"), member("M2", "Bob")],
+            )
+            .unwrap();
+        assert!(store.delete_team_member("default", "team-1", "M1").unwrap());
+        assert_eq!(
+            store
+                .team_members("team-1")
+                .unwrap()
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["M2"]
+        );
+        // A second delete is a miss; a wrong-profile delete too.
+        assert!(!store.delete_team_member("default", "team-1", "M1").unwrap());
+        assert!(!store.delete_team_member("work", "team-1", "M2").unwrap());
+        assert_eq!(store.team_members("team-1").unwrap().len(), 1);
     }
 
     // ----- M7: files --------------------------------------------------------

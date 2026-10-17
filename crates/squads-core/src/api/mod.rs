@@ -82,6 +82,16 @@
 //! ([`ApiClient::unpin_message`]) is a Graph `DELETE` the Teams token is not
 //! granted, so it refuses before any network. See [`crate::Folders`] /
 //! [`crate::Pins`].
+//!
+//! **Team administration (B4)** adds the rest of the teams surface: public-team
+//! discovery + join ([`ApiClient::search_public_teams`],
+//! [`ApiClient::join_team`]), member admin ([`ApiClient::add_team_member`],
+//! [`ApiClient::remove_team_member`]) and team settings
+//! ([`ApiClient::team_settings`]) — all **Graph**. Channel message **reactions**
+//! ([`ApiClient::set_channel_reaction`] / [`ApiClient::unset_channel_reaction`])
+//! use the dedicated **Graph** `…/messages/{id}/(set|unset)Reaction` lane
+//! (including the `replies/{reply}` variant), because the chat-service reaction
+//! endpoint 404s on channel threads. See [`crate::Teams`].
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -93,7 +103,7 @@ use ost::config::Config;
 
 /// Protocol types surfaced by the M5 chat calls, re-exported so the UI and
 /// `messaging` do not need to reach into the vendored crate.
-pub use ost::api::{MessagesPage, ReadReceipt, SentMessage};
+pub use ost::api::{MessagesPage, REACTION_EMOJI, ReadReceipt, SentMessage};
 
 /// Protocol types surfaced by the M6 teams/channel calls.
 pub use ost::api::{ChannelInfo, TeamCreateResult, TeamInfo, TeamMemberInfo};
@@ -180,6 +190,32 @@ pub use ost::api::{
     conversation_folders_url, fill_pin_from_message, folder_move_actions, folder_move_body,
     graph_pins_path, graph_unpin_path, parse_conversation_folders, parse_graph_pins,
     parse_thread_pins, pick_pins, thread_pins_url,
+};
+
+/// Protocol types and pure helpers surfaced by the **B4** team administration
+/// (public-team discovery + join, member add/remove, team settings, and the
+/// channel message-reaction lanes). Re-exported so [`Teams`](crate::Teams) and
+/// the tests can pin the request/response shapes without reaching into the
+/// vendored crate.
+///
+/// **Public-team discovery** is Graph (`/groups` `$search`, falling back to
+/// `/teams` `startswith`) and single-window ([`PUBLIC_TEAMS_MAX`]); a hit is
+/// joined with [`join_team_data`] (a `POST /teams/{id}/members` for self).
+/// **Member admin** ([`add_team_member_data`] / [`remove_team_member_data`])
+/// is Graph too. **Team settings** ([`team_settings_data`]) is two Graph GETs.
+/// **Channel reactions** ([`set_channel_reaction_data`] /
+/// [`unset_channel_reaction_data`]) are the dedicated Graph lane
+/// (`…/messages/{id}/(set|unset)Reaction`, with a `replies/{reply}` variant):
+/// the chat-service reaction endpoint 404s on channel threads, which is why
+/// this is separate from the chat reaction path (see `docs/DECISIONS.md`,
+/// ADR-040, and U-003).
+pub use ost::api::{
+    PUBLIC_TEAMS_MAX, PublicTeamInfo, PublicTeamsSource, TeamMemberSettings, add_member_body,
+    add_team_member_data, channel_react_body, channel_reply_set_reaction_path,
+    channel_reply_unset_reaction_path, channel_set_reaction_path, channel_unset_reaction_path,
+    join_team_data, member_path, members_path, parse_public_teams, public_teams_groups_path,
+    public_teams_list_path, remove_team_member_data, search_public_teams_data,
+    set_channel_reaction_data, team_settings_data, unset_channel_reaction_data,
 };
 
 use crate::auth::tokens::{StoredToken, TokenSet};
@@ -1488,6 +1524,192 @@ impl ApiClient {
         tracing::debug!(call, "unpinned message");
         Ok(())
     }
+
+    // ----- B4: team administration ----------------------------------------
+
+    /// Search the directory for public (joinable) teams by name (Graph
+    /// `/groups` `$search`, falling back to `/teams` `startswith`).
+    ///
+    /// **Single window**: the vendored path builder clamps `limit` to Graph's
+    /// `1..=PUBLIC_TEAMS_MAX` window and there is no paging cursor, so one call
+    /// returns at most that many rows. A blank query is rejected by the vendored
+    /// call before any network. The returned source names which Graph surface
+    /// answered; the vendored parser keeps only `visibility == public` rows and
+    /// does **not** filter out teams already joined (callers mark membership
+    /// against their own list — see [`Teams::search_public`](crate::Teams::search_public)).
+    pub async fn search_public_teams(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<(PublicTeamsSource, Vec<PublicTeamInfo>)> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.search_public_teams",
+            limit,
+            call
+        );
+        let (source, teams) = ost::api::search_public_teams_data(&self.client, query, limit)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = teams.len(), ?source, call, "searched public teams");
+        Ok((source, teams))
+    }
+
+    /// Join one team by id as the signed-in user (Graph
+    /// `POST /teams/{id}/members` for self, resolved through `/me`).
+    ///
+    /// Returns the trimmed team id on success. A blank/path-breaking id is
+    /// rejected before any network. Join-by-invite-code is not Graph and is out
+    /// of scope (see the vendored `join_team_data`).
+    pub async fn join_team(&self, team_id: &str) -> Result<String> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.join_team", call);
+        let id = ost::api::join_team_data(&self.client, team_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "joined team");
+        Ok(id)
+    }
+
+    /// Add one user (a Graph/AAD id or UPN) to a team; `owner` grants the
+    /// owner role (Graph `POST /teams/{id}/members`).
+    ///
+    /// Returns the created membership. A blank/path-breaking team id or a blank
+    /// user is rejected before any network.
+    pub async fn add_team_member(
+        &self,
+        team_id: &str,
+        user_id: &str,
+        owner: bool,
+    ) -> Result<TeamMemberInfo> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.add_team_member",
+            owner,
+            call
+        );
+        let member = ost::api::add_team_member_data(&self.client, team_id, user_id, owner)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "added team member");
+        Ok(member)
+    }
+
+    /// Remove one membership from a team (Graph
+    /// `DELETE /teams/{team}/members/{member}`). `membership_id` is the roster
+    /// **membership** id, not the user id; a blank/path-breaking id is rejected
+    /// before any network.
+    pub async fn remove_team_member(&self, team_id: &str, membership_id: &str) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.remove_team_member",
+            call
+        );
+        ost::api::remove_team_member_data(&self.client, team_id, membership_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "removed team member");
+        Ok(())
+    }
+
+    /// Read a team's member permissions and General (primary) channel id (two
+    /// Graph GETs: `GET /teams/{id}` and `GET /teams/{id}/primaryChannel`).
+    ///
+    /// The vendored call fails only when **both** reads fail; a single failure
+    /// leaves its fields `None` (unknown, never a guessed `false`).
+    pub async fn team_settings(&self, team_id: &str) -> Result<TeamMemberSettings> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.team_settings", call);
+        let settings = ost::api::team_settings_data(&self.client, team_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "read team settings");
+        Ok(settings)
+    }
+
+    /// Set one picker-emoji reaction on a **channel** message.
+    ///
+    /// This is the dedicated **Graph** channel-reaction lane
+    /// (`POST /teams/{team}/channels/{channel}/messages/{message}/setReaction`,
+    /// or the `…/replies/{reply}/setReaction` variant when `reply_id` is
+    /// `Some`): the chat-service reaction endpoint 404s on channel threads, so
+    /// this is *not* the chat path ([`ApiClient::send_reaction`]). The vendored
+    /// call needs the **team** id (a Graph group id or a thread id) as well as
+    /// the channel, rejects unknown emoji and path-breaking ids before any
+    /// network, and answers `204` with no body. `reply_id` targets a thread
+    /// reply; `None` targets the root message. **Not verified live** (U-003).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_channel_reaction(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+        reply_id: Option<&str>,
+    ) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.set_channel_reaction",
+            is_reply = reply_id.is_some(),
+            call
+        );
+        ost::api::set_channel_reaction_data(
+            &self.client,
+            team_id,
+            channel_id,
+            message_id,
+            emoji,
+            reply_id,
+        )
+        .instrument(span)
+        .await?;
+        tracing::debug!(call, "set channel reaction");
+        Ok(())
+    }
+
+    /// Remove one picker-emoji reaction from a **channel** message (the Graph
+    /// `…/unsetReaction` lane; same arg rules as
+    /// [`ApiClient::set_channel_reaction`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn unset_channel_reaction(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+        reply_id: Option<&str>,
+    ) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.unset_channel_reaction",
+            is_reply = reply_id.is_some(),
+            call
+        );
+        ost::api::unset_channel_reaction_data(
+            &self.client,
+            team_id,
+            channel_id,
+            message_id,
+            emoji,
+            reply_id,
+        )
+        .instrument(span)
+        .await?;
+        tracing::debug!(call, "unset channel reaction");
+        Ok(())
+    }
 }
 
 impl fmt::Debug for ApiClient {
@@ -2597,5 +2819,358 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source, PinSource::Graph);
+    }
+
+    // ----- B4: team administration ----------------------------------------
+
+    #[tokio::test]
+    async fn search_public_teams_reads_groups_and_keeps_only_public() {
+        let body = serde_json::json!({
+            "value": [
+                {"id": "t-public", "displayName": "Public Eng", "description": "Open",
+                 "visibility": "public"},
+                {"id": "t-private", "displayName": "Secret", "visibility": "private"}
+            ]
+        })
+        .to_string();
+        let (base, seen, task) = http_stub(vec![StubResponse::ok(body)]).await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let (source, teams) = client
+            .search_public_teams("eng", 25)
+            .await
+            .expect("search public teams");
+        assert_eq!(source, PublicTeamsSource::Groups);
+        assert_eq!(teams.len(), 1, "the private team is dropped");
+        assert_eq!(teams[0].id, "t-public");
+        assert_eq!(teams[0].name, "Public Eng");
+        assert_eq!(teams[0].visibility, "public");
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0].starts_with("GET /groups?$search="),
+            "unexpected request: {}",
+            reqs[0]
+        );
+        assert!(reqs[0].contains("$count=true"), "{}", reqs[0]);
+        assert!(reqs[0].contains("$top=25"), "{}", reqs[0]);
+        assert!(
+            reqs[0].contains("authorization: Bearer graph-token"),
+            "{}",
+            reqs[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_public_teams_falls_back_to_teams_startswith() {
+        let teams_body = serde_json::json!({
+            "value": [{"id": "t1", "displayName": "Eng", "visibility": "public"}]
+        })
+        .to_string();
+        let (base, seen, task) = http_stub(vec![
+            StubResponse::status(403),
+            StubResponse::ok(teams_body),
+        ])
+        .await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let (source, teams) = client
+            .search_public_teams("eng", 25)
+            .await
+            .expect("search public teams");
+        assert_eq!(source, PublicTeamsSource::Teams);
+        assert_eq!(teams.len(), 1);
+        assert_eq!(teams[0].id, "t1");
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 2, "groups refused, then /teams");
+        assert!(reqs[0].starts_with("GET /groups?$search="), "{}", reqs[0]);
+        assert!(
+            reqs[1].starts_with("GET /teams?$filter="),
+            "unexpected request: {}",
+            reqs[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_public_teams_rejects_a_blank_query_before_any_network() {
+        let (base, seen, task) = http_stub(vec![]).await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let err = client
+            .search_public_teams("   ", 25)
+            .await
+            .err()
+            .expect("blank query refused");
+        assert!(format!("{err:#}").contains("empty query"), "{err:#}");
+
+        task.await.expect("stub drains");
+        assert!(b2a_requests(&seen).is_empty());
+    }
+
+    #[tokio::test]
+    async fn join_team_adds_self_as_a_member() {
+        let (base, seen, task) = http_stub(vec![
+            StubResponse::ok(serde_json::json!({ "id": ME_GUID }).to_string()),
+            StubResponse::status(201),
+        ])
+        .await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let id = client.join_team(" team-1 ").await.expect("join team");
+        assert_eq!(id, "team-1", "the trimmed id comes back");
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 2, "whoami then the membership POST");
+        assert!(reqs[0].starts_with("GET /me "), "{}", reqs[0]);
+        assert!(
+            reqs[1].starts_with("POST /teams/team-1/members "),
+            "unexpected request: {}",
+            reqs[1]
+        );
+        assert!(
+            reqs[1].contains(&format!("users('{ME_GUID}')")),
+            "the body binds the resolved self: {}",
+            reqs[1]
+        );
+        assert!(reqs[1].contains("\"roles\":[]"), "{}", reqs[1]);
+    }
+
+    #[tokio::test]
+    async fn add_team_member_posts_the_owner_body_and_parses_the_membership() {
+        let body = serde_json::json!({
+            "id": "M9", "displayName": "Ava", "userId": "oid-9",
+            "email": "ava@x.example", "roles": ["owner"]
+        })
+        .to_string();
+        let (base, seen, task) = http_stub(vec![StubResponse::ok(body)]).await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let member = client
+            .add_team_member("team-1", "ava@x.example", true)
+            .await
+            .expect("add member");
+        assert_eq!(member.id, "M9");
+        assert_eq!(member.display_name, "Ava");
+        assert!(member.is_owner);
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0].starts_with("POST /teams/team-1/members "),
+            "unexpected request: {}",
+            reqs[0]
+        );
+        assert!(reqs[0].contains("\"roles\":[\"owner\"]"), "{}", reqs[0]);
+        assert!(reqs[0].contains("users('ava@x.example')"), "{}", reqs[0]);
+    }
+
+    #[tokio::test]
+    async fn remove_team_member_deletes_the_membership() {
+        let (base, seen, task) = http_stub(vec![StubResponse::status(204)]).await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        client
+            .remove_team_member("team-1", "M9")
+            .await
+            .expect("remove member");
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0].starts_with("DELETE /teams/team-1/members/M9 "),
+            "unexpected request: {}",
+            reqs[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn team_settings_reads_the_team_and_its_primary_channel() {
+        let (base, seen, task) = http_stub(vec![
+            StubResponse::ok(
+                serde_json::json!({
+                    "id": "team-1",
+                    "memberSettings": {
+                        "allowCreateUpdateChannels": true,
+                        "allowDeleteChannels": false
+                    }
+                })
+                .to_string(),
+            ),
+            StubResponse::ok(serde_json::json!({ "id": "19:general@thread.tacv2" }).to_string()),
+        ])
+        .await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let settings = client.team_settings("team-1").await.expect("team settings");
+        assert_eq!(settings.allow_create_update_channels, Some(true));
+        assert_eq!(settings.allow_delete_channels, Some(false));
+        assert_eq!(
+            settings.primary_channel_id.as_deref(),
+            Some("19:general@thread.tacv2")
+        );
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].starts_with("GET /teams/team-1 "), "{}", reqs[0]);
+        assert!(
+            reqs[1].starts_with("GET /teams/team-1/primaryChannel "),
+            "unexpected request: {}",
+            reqs[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn team_settings_keeps_a_single_failure_unknown() {
+        // The team read 200s (flags set) but primaryChannel 403s: the flags
+        // survive and the channel id stays unknown — never a guess.
+        let (base, _seen, task) = http_stub(vec![
+            StubResponse::ok(
+                serde_json::json!({
+                    "id": "team-1",
+                    "memberSettings": { "allowDeleteChannels": true }
+                })
+                .to_string(),
+            ),
+            StubResponse::status(403),
+        ])
+        .await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let settings = client.team_settings("team-1").await.expect("team settings");
+        assert_eq!(settings.allow_delete_channels, Some(true));
+        assert_eq!(settings.allow_create_update_channels, None);
+        assert_eq!(settings.primary_channel_id, None);
+        task.await.expect("stub drains");
+    }
+
+    #[tokio::test]
+    async fn channel_reactions_use_the_graph_lane_for_root_and_reply() {
+        let (base, seen, task) = http_stub(vec![
+            StubResponse::status(204),
+            StubResponse::status(204),
+            StubResponse::status(204),
+        ])
+        .await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        // Add on the root, add on a reply, then remove from the root.
+        client
+            .set_channel_reaction("team-1", "19:ch@thread.tacv2", "m1", "👍", None)
+            .await
+            .expect("react root");
+        client
+            .set_channel_reaction("team-1", "19:ch@thread.tacv2", "m1", "❤️", Some("r2"))
+            .await
+            .expect("react reply");
+        client
+            .unset_channel_reaction("team-1", "19:ch@thread.tacv2", "m1", "👍", None)
+            .await
+            .expect("unreact root");
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 3);
+        assert!(
+            reqs[0].starts_with(
+                "POST /teams/team-1/channels/19:ch@thread.tacv2/messages/m1/setReaction "
+            ),
+            "unexpected request: {}",
+            reqs[0]
+        );
+        // The body carries the emoji itself (Graph takes the unicode type).
+        assert!(reqs[0].contains("\"reactionType\":\"👍\""), "{}", reqs[0]);
+        assert!(
+            reqs[1].starts_with(
+                "POST /teams/team-1/channels/19:ch@thread.tacv2/messages/m1/replies/r2/setReaction "
+            ),
+            "unexpected request: {}",
+            reqs[1]
+        );
+        assert!(
+            reqs[2].starts_with(
+                "POST /teams/team-1/channels/19:ch@thread.tacv2/messages/m1/unsetReaction "
+            ),
+            "unexpected request: {}",
+            reqs[2]
+        );
+        // The channel lane is Graph-authenticated, never the skype token.
+        assert!(
+            reqs[0].contains("authorization: Bearer graph-token"),
+            "{}",
+            reqs[0]
+        );
+        assert!(!reqs[0].contains("skypetoken"), "{}", reqs[0]);
+    }
+
+    #[tokio::test]
+    async fn channel_reaction_rejects_an_unknown_emoji_before_any_network() {
+        let (base, seen, task) = http_stub(vec![]).await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let err = client
+            .set_channel_reaction("team-1", "19:ch@thread.tacv2", "m1", "🎉", None)
+            .await
+            .err()
+            .expect("unknown emoji refused");
+        assert!(
+            format!("{err:#}").contains("unsupported reaction"),
+            "{err:#}"
+        );
+
+        task.await.expect("stub drains");
+        assert!(b2a_requests(&seen).is_empty());
+    }
+
+    #[test]
+    fn b4_pure_helpers_pin_the_request_shapes() {
+        // Public-team parsing keeps only public rows, dedupes ids and falls
+        // back to the id when the name is blank.
+        let payload = serde_json::json!({
+            "value": [
+                {"id": "a", "displayName": "A", "visibility": "public"},
+                {"id": "a", "displayName": "A again", "visibility": "public"},
+                {"id": "b", "visibility": "Public"},
+                {"id": "c", "displayName": "C", "visibility": "hiddenmembership"},
+                {"displayName": "no id", "visibility": "public"}
+            ]
+        });
+        let teams = parse_public_teams(&payload);
+        assert_eq!(teams.len(), 2);
+        assert_eq!(teams[0].id, "a");
+        assert_eq!(teams[1].id, "b");
+        assert_eq!(teams[1].name, "b", "blank name falls back to the id");
+        assert!(parse_public_teams(&serde_json::json!({})).is_empty());
+
+        // The two search paths are distinct Graph shapes.
+        assert!(public_teams_groups_path("eng", 99).starts_with("/groups?$search="));
+        assert!(public_teams_groups_path("eng", 99).contains("$top=25"));
+        assert!(public_teams_list_path("eng", 0).starts_with("/teams?$filter="));
+
+        // Member add body (owner flag) and the reaction paths/body.
+        let body = add_member_body("oid-1", true);
+        assert_eq!(body["roles"], serde_json::json!(["owner"]));
+        assert_eq!(members_path("t1"), "/teams/t1/members");
+        assert_eq!(member_path("t1", "m9"), "/teams/t1/members/m9");
+        assert_eq!(
+            channel_set_reaction_path("t1", "c1", "m1"),
+            "/teams/t1/channels/c1/messages/m1/setReaction"
+        );
+        assert_eq!(
+            channel_reply_unset_reaction_path("t1", "c1", "m1", "r2"),
+            "/teams/t1/channels/c1/messages/m1/replies/r2/unsetReaction"
+        );
+        assert_eq!(
+            channel_react_body("❤️"),
+            serde_json::json!({ "reactionType": "❤️" })
+        );
+        assert_eq!(PUBLIC_TEAMS_MAX, 25);
     }
 }

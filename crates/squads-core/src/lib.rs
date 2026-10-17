@@ -48,8 +48,9 @@ pub use media::{CachedMedia, MediaCache};
 pub use messaging::{HistoryPage, Messaging};
 pub use model::{
     CallDirection, CallLogEntry, CallOutcome, Channel, Chat, ChatFolder, ChatMember, FileEntry,
-    FileVersion, Identity, Meeting, Message, Person, PinnedMessage, Reaction, Reactor, SearchHit,
-    SendState, SharedLink, Team, TeamMember, is_channel_conversation_id, is_system_folder,
+    FileVersion, Identity, Meeting, Message, Person, PinnedMessage, PublicTeam, Reaction, Reactor,
+    SearchHit, SendState, SharedLink, Team, TeamMember, TeamSettings, is_channel_conversation_id,
+    is_system_folder,
 };
 pub use notifications::{
     ActivityItem, LogNotifier, Notification, NotificationContext, NotificationKind, Notifications,
@@ -67,7 +68,7 @@ pub use search::{Search, escape_like, like_pattern, snippet};
 pub use session::{Session, SessionState};
 pub use settings::{Accent, Settings, Theme, WindowSettings};
 pub use store::{Account, Counts, SearchRow, Store};
-pub use teams::Teams;
+pub use teams::{Teams, split_thread_conversation};
 pub use text::{Mention, html_escape, mentions, strip_html};
 
 #[cfg(feature = "desktop-notifications")]

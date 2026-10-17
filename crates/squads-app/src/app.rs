@@ -28,7 +28,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use squads_core::api::JoinTarget;
-use squads_core::model::{Channel, Identity, Meeting, Message, Person, SearchHit, SendState};
+use squads_core::model::{
+    Channel, Identity, Meeting, Message, Person, PublicTeam, SearchHit, SendState, TeamMember,
+};
 use squads_core::{
     Accent, AppDirs, Calendar, CallIdentity, CallLogEntry, CallService, CallState, Chat,
     ChatFolder, Chats, ContactPresence, FileEntry, Files, Folders, IncomingCall, MediaCache,
@@ -209,6 +211,52 @@ pub enum Action {
         chat_id: String,
         /// The pinned message id.
         message_id: String,
+    },
+    /// Search the directory for public (joinable) teams (B4).
+    SearchPublicTeams(String),
+    /// Join a public team (B4).
+    JoinTeam(String),
+    /// Refresh one team's roster (B4).
+    RefreshTeamMembers(String),
+    /// Open the people picker in **"add team member"** mode (B4).
+    OpenAddTeamMember(String),
+    /// Add one person to a team (B4). `user_id` is the Graph user id.
+    AddTeamMember {
+        /// Owning team.
+        team_id: String,
+        /// The Graph/AAD user id to add.
+        user_id: String,
+        /// Grant the owner role.
+        owner: bool,
+    },
+    /// Ask to remove a team membership (opens the confirmation) (B4).
+    RequestRemoveTeamMember {
+        /// Owning team.
+        team_id: String,
+        /// The roster membership id.
+        membership_id: String,
+    },
+    /// Confirm removing a team membership (B4).
+    ConfirmRemoveTeamMember {
+        /// Owning team.
+        team_id: String,
+        /// The roster membership id.
+        membership_id: String,
+    },
+    /// Cancel a pending member removal (B4).
+    CancelRemoveTeamMember,
+    /// Add or remove a reaction on a **channel** message (B4).
+    ReactInChannel {
+        /// The conversation the message is stored under (channel or thread).
+        conversation_id: String,
+        /// The message (or reply) id.
+        message_id: String,
+        /// The picker emoji.
+        emoji: String,
+        /// Remove instead of add.
+        remove: bool,
+        /// The message is a thread reply.
+        is_reply: bool,
     },
     /// Refresh the upcoming meetings from the calendar service (M12).
     RefreshCalendar,
@@ -466,6 +514,17 @@ pub struct SquadsApp {
     selected_folder: Option<String>,
     pins: Vec<PinnedMessage>,
 
+    /// Team administration (B4): the public-team search query + results, the
+    /// per-team rosters, the open "add member" flow (which team + owner flag),
+    /// and the pending member-removal confirmation.
+    public_query: String,
+    public_results: Vec<PublicTeam>,
+    public_loading: bool,
+    members: HashMap<String, Vec<TeamMember>>,
+    add_member_team: Option<String>,
+    add_member_owner: bool,
+    remove_member_confirm: Option<(String, String)>,
+
     /// Calendar (M12): the cached upcoming meetings, whether a fetch is in
     /// flight, the last resolved join target, the agenda/week toggle, and the
     /// "new meeting" form fields.
@@ -636,6 +695,13 @@ impl SquadsApp {
             folders: Vec::new(),
             selected_folder: None,
             pins: Vec::new(),
+            public_query: String::new(),
+            public_results: Vec::new(),
+            public_loading: false,
+            members: HashMap::new(),
+            add_member_team: None,
+            add_member_owner: false,
+            remove_member_confirm: None,
             meetings: Vec::new(),
             calendar_loading: false,
             join_target: None,
@@ -864,6 +930,85 @@ impl SquadsApp {
     /// The selected chat's cached pinned messages (B2b).
     pub fn pins(&self) -> &[PinnedMessage] {
         &self.pins
+    }
+
+    // ----- B4: team administration ------------------------------------------
+
+    /// The public-team search query.
+    pub fn public_query(&self) -> &str {
+        &self.public_query
+    }
+
+    /// Mutable public-team search query (the Teams view edits it).
+    pub fn public_query_mut(&mut self) -> &mut String {
+        &mut self.public_query
+    }
+
+    /// The public-team search results.
+    pub fn public_results(&self) -> &[PublicTeam] {
+        &self.public_results
+    }
+
+    /// Whether a public-team search is in flight.
+    pub fn public_loading(&self) -> bool {
+        self.public_loading
+    }
+
+    /// The cached roster of one team (B4).
+    pub fn members_for(&self, team_id: &str) -> &[TeamMember] {
+        self.members.get(team_id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Whether the signed-in user holds the `owner` role on `team_id` (B4).
+    ///
+    /// Derived from the fetched roster: a member is "us" when its Graph
+    /// `user_id` matches our identity's oid. A cached roster (which does not
+    /// persist the user id) therefore reports `false` until a live fetch.
+    pub fn is_owner_of(&self, team_id: &str) -> bool {
+        let Some(oid) = self.session.identity().map(|identity| identity.oid.clone()) else {
+            return false;
+        };
+        self.members_for(team_id)
+            .iter()
+            .any(|member| member.is_owner() && member.user_id.as_deref() == Some(oid.as_str()))
+    }
+
+    /// The team whose "add member" picker is open, if any (B4).
+    pub fn add_member_team(&self) -> Option<&str> {
+        self.add_member_team.as_deref()
+    }
+
+    /// Whether the pending member add grants the owner role (B4).
+    pub fn add_member_owner(&self) -> bool {
+        self.add_member_owner
+    }
+
+    /// Mutable owner-role flag for the add-member picker (B4).
+    pub fn add_member_owner_mut(&mut self) -> &mut bool {
+        &mut self.add_member_owner
+    }
+
+    /// The `(team_id, membership_id)` a removal is pending confirmation for
+    /// (B4).
+    pub fn remove_member_confirm(&self) -> Option<(&str, &str)> {
+        self.remove_member_confirm
+            .as_ref()
+            .map(|(team, member)| (team.as_str(), member.as_str()))
+    }
+
+    /// Test-only: seed a team's roster (the headless harness has no service to
+    /// fetch one).
+    #[cfg(test)]
+    pub(crate) fn set_team_members(&mut self, team_id: &str, members: Vec<TeamMember>) {
+        self.members.insert(team_id.to_string(), members);
+    }
+
+    /// Test-only: seed the public-team query and results.
+    #[cfg(test)]
+    pub(crate) fn set_public_results(&mut self, query: &str, teams: Vec<PublicTeam>) {
+        self.public_query = query.to_string();
+        self.public_results = teams;
+        self.public_loading = false;
     }
 
     /// Test-only: seed the global file-search query and results (the headless
@@ -1733,6 +1878,120 @@ impl SquadsApp {
         }
     }
 
+    // ----- B4: team administration ----------------------------------------
+
+    /// Search the directory for public teams (B4). A blank query clears the
+    /// results without a request.
+    fn search_public_teams(&mut self, query: String) {
+        if query.trim().is_empty() {
+            self.public_results.clear();
+            self.public_loading = false;
+            return;
+        }
+        let Some(teams) = self.teams_svc.clone() else {
+            return;
+        };
+        self.public_loading = true;
+        self.runtime.spawn(async move {
+            match teams.search_public(&query).await {
+                Ok(found) => AppEvent::PublicTeamsLoaded(found),
+                Err(e) => AppEvent::Error(format!("search public teams: {e}")),
+            }
+        });
+    }
+
+    /// Join a public team, then refresh the joined-teams cache (B4).
+    fn join_team(&mut self, team_id: String) {
+        let Some(teams) = self.teams_svc.clone() else {
+            return;
+        };
+        self.runtime.spawn(async move {
+            match teams.join(&team_id).await {
+                Ok(team) => AppEvent::TeamJoined(team),
+                Err(e) => AppEvent::Error(format!("join team: {e}")),
+            }
+        });
+    }
+
+    /// Fetch one team's roster (B4).
+    fn refresh_team_members(&mut self, team_id: String) {
+        let Some(teams) = self.teams_svc.clone() else {
+            return;
+        };
+        self.runtime.spawn(async move {
+            match teams.members(&team_id).await {
+                Ok(members) => AppEvent::TeamMembersLoaded { team_id, members },
+                Err(e) => AppEvent::Error(format!("team members: {e}")),
+            }
+        });
+    }
+
+    /// Open the people picker in "add team member" mode (B4).
+    fn open_add_team_member(&mut self, team_id: String) {
+        self.people_selected.clear();
+        self.add_member_owner = false;
+        self.add_member_team = Some(team_id);
+        self.new_chat_open = false;
+        self.people_picker_open = true;
+        self.focus_people_search = true;
+    }
+
+    /// Add one person to a team (B4). Clears the add-member flow once queued.
+    fn add_team_member(&mut self, team_id: String, user_id: String, owner: bool) {
+        self.add_member_team = None;
+        self.people_picker_open = false;
+        self.people_selected.clear();
+        let Some(teams) = self.teams_svc.clone() else {
+            return;
+        };
+        self.runtime.spawn(async move {
+            match teams.add_member(&team_id, &user_id, owner).await {
+                Ok(_) => AppEvent::TeamMemberChanged { team_id },
+                Err(e) => AppEvent::Error(format!("add member: {e}")),
+            }
+        });
+    }
+
+    /// Confirm and run a membership removal (B4).
+    fn confirm_remove_team_member(&mut self, team_id: String, membership_id: String) {
+        self.remove_member_confirm = None;
+        let Some(teams) = self.teams_svc.clone() else {
+            return;
+        };
+        self.runtime.spawn(async move {
+            match teams.remove_member(&team_id, &membership_id).await {
+                Ok(()) => AppEvent::TeamMemberChanged { team_id },
+                Err(e) => AppEvent::Error(format!("remove member: {e}")),
+            }
+        });
+    }
+
+    /// Add or remove a reaction on a channel message (B4), routing through the
+    /// `Teams` channel-reaction lane and reloading the timeline on success.
+    fn react_in_channel(
+        &mut self,
+        conversation_id: String,
+        message_id: String,
+        emoji: String,
+        remove: bool,
+        is_reply: bool,
+    ) {
+        let Some(teams) = self.teams_svc.clone() else {
+            return;
+        };
+        self.runtime.spawn(async move {
+            match teams
+                .react_in_channel(&conversation_id, &message_id, &emoji, remove, is_reply)
+                .await
+            {
+                Ok(()) => AppEvent::ReactionsChanged {
+                    chat_id: conversation_id,
+                },
+                Err(e) => AppEvent::Error(format!("react: {e}")),
+            }
+        });
+    }
+
     /// Re-install the theme from the current settings (after a preference
     /// change) and persist them.
     fn reinstall_theme(&mut self) {
@@ -2137,16 +2396,24 @@ impl SquadsApp {
         self.expanded_teams.insert(team_id.clone());
         let cached = self.store.channels_for_team(&team_id).unwrap_or_default();
         self.channels.insert(team_id.clone(), cached);
+        // B4: paint the cached roster immediately (keeping any already-fetched
+        // roster), then refresh it live.
+        let cached_members = self.store.team_members(&team_id).unwrap_or_default();
+        self.members
+            .entry(team_id.clone())
+            .or_insert(cached_members);
 
         let Some(teams) = self.teams_svc.clone() else {
             return;
         };
+        let members_team = team_id.clone();
         self.runtime.spawn(async move {
             match teams.channels(&team_id).await {
                 Ok(channels) => AppEvent::ChannelsLoaded { team_id, channels },
                 Err(e) => AppEvent::Error(format!("channels: {e}")),
             }
         });
+        self.refresh_team_members(members_team);
     }
 
     fn refresh_files(&mut self, chat_id: String) {
@@ -2529,6 +2796,44 @@ impl SquadsApp {
                     self.pins = pins;
                 }
             }
+            AppEvent::PublicTeamsLoaded(teams) => {
+                self.public_results = teams;
+                self.public_loading = false;
+            }
+            AppEvent::TeamJoined(team) => {
+                if let Err(e) = self
+                    .store
+                    .upsert_teams(&self.profile, std::slice::from_ref(&team))
+                {
+                    self.push_error(e);
+                }
+                self.teams = self.store.list_teams(&self.profile).unwrap_or_default();
+                // Mark the join in the search results so the button flips.
+                for result in &mut self.public_results {
+                    if result.id == team.id {
+                        result.is_joined = true;
+                    }
+                }
+                self.expanded_teams.insert(team.id.clone());
+                self.refresh_team_members(team.id);
+                self.toasts.push(Toast {
+                    text: format!("Joined {}", team.name),
+                    error: false,
+                });
+            }
+            AppEvent::TeamMembersLoaded { team_id, members } => {
+                self.members.insert(team_id, members);
+            }
+            AppEvent::TeamMemberChanged { team_id } => {
+                // Re-fetch the roster live (the cached read loses the user ids
+                // the owner check needs — B4).
+                self.refresh_team_members(team_id);
+            }
+            AppEvent::ReactionsChanged { chat_id } => {
+                if self.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                    self.reload_timeline();
+                }
+            }
             AppEvent::PresenceUpdated(list) => {
                 for presence in list {
                     self.presence.insert(presence.mri.clone(), presence);
@@ -2748,6 +3053,31 @@ impl SquadsApp {
                 chat_id,
                 message_id,
             } => self.unpin_message(chat_id, message_id),
+            Action::SearchPublicTeams(query) => self.search_public_teams(query),
+            Action::JoinTeam(team_id) => self.join_team(team_id),
+            Action::RefreshTeamMembers(team_id) => self.refresh_team_members(team_id),
+            Action::OpenAddTeamMember(team_id) => self.open_add_team_member(team_id),
+            Action::AddTeamMember {
+                team_id,
+                user_id,
+                owner,
+            } => self.add_team_member(team_id, user_id, owner),
+            Action::RequestRemoveTeamMember {
+                team_id,
+                membership_id,
+            } => self.remove_member_confirm = Some((team_id, membership_id)),
+            Action::ConfirmRemoveTeamMember {
+                team_id,
+                membership_id,
+            } => self.confirm_remove_team_member(team_id, membership_id),
+            Action::CancelRemoveTeamMember => self.remove_member_confirm = None,
+            Action::ReactInChannel {
+                conversation_id,
+                message_id,
+                emoji,
+                remove,
+                is_reply,
+            } => self.react_in_channel(conversation_id, message_id, emoji, remove, is_reply),
             Action::RefreshCalendar => self.refresh_calendar(),
             Action::RefreshCalendarWeek => self.refresh_calendar_week(),
             Action::JoinMeeting { target, passcode } => self.join_meeting(target, passcode),
@@ -2850,6 +3180,9 @@ impl SquadsApp {
                 self.chat_menu = None;
                 self.new_chat_open = false;
                 self.leave_confirm = None;
+                // The add-member flow and its removal confirmation (B4).
+                self.add_member_team = None;
+                self.remove_member_confirm = None;
                 self.show_info = false;
             }
             Action::OpenSettings => self.dispatch(Action::SetPage(Page::Settings)),
@@ -2937,6 +3270,13 @@ impl SquadsApp {
         self.folders.clear();
         self.selected_folder = None;
         self.pins.clear();
+        self.public_query.clear();
+        self.public_results.clear();
+        self.public_loading = false;
+        self.members.clear();
+        self.add_member_team = None;
+        self.add_member_owner = false;
+        self.remove_member_confirm = None;
         self.meetings.clear();
         self.calendar_loading = false;
         self.join_target = None;

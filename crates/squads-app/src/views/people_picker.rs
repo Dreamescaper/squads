@@ -39,12 +39,16 @@ pub fn show(app: &mut SquadsApp, ctx: &Context) {
     }
 
     let new_chat = app.new_chat_open();
+    let add_team = app.add_member_team().map(str::to_string);
     let mut toggle: Option<squads_core::model::Person> = None;
     let mut clear = false;
     let mut close = false;
     let mut create = false;
+    let mut add = false;
 
-    let title = if new_chat {
+    let title = if add_team.is_some() {
+        "Add team member"
+    } else if new_chat {
         "New chat"
     } else {
         "People picker"
@@ -55,7 +59,9 @@ pub fn show(app: &mut SquadsApp, ctx: &Context) {
         .anchor(Align2::CENTER_TOP, [0.0, 96.0])
         .default_width(420.0)
         .show(ctx, |ui| {
-            let hint = if new_chat {
+            let hint = if add_team.is_some() {
+                "Find people to add to this team. Select one or more, then Add to team."
+            } else if new_chat {
                 "Find people to start a chat with. One person starts a 1:1; several start a group."
             } else {
                 "Find people to start a chat with."
@@ -106,6 +112,12 @@ pub fn show(app: &mut SquadsApp, ctx: &Context) {
                 response.labelled_by(label.id);
             }
 
+            // In add-member mode, an owner-role toggle (B4).
+            if add_team.is_some() {
+                ui.add_space(4.0);
+                ui.checkbox(app.add_member_owner_mut(), "Grant owner role");
+            }
+
             ui.add_space(4.0);
             if app.people_loading() {
                 ui.horizontal(|ui| {
@@ -141,6 +153,15 @@ pub fn show(app: &mut SquadsApp, ctx: &Context) {
                         create = true;
                     }
                 }
+                if add_team.is_some() {
+                    let enabled = !app.selected_people().is_empty();
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Add to team"))
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                }
                 if ui.button("Clear").clicked() {
                     clear = true;
                 }
@@ -155,6 +176,17 @@ pub fn show(app: &mut SquadsApp, ctx: &Context) {
     }
     if create {
         app.push_action(Action::CreateChat);
+    }
+    if add && let Some(team_id) = add_team {
+        let owner = app.add_member_owner();
+        let picked = app.selected_people().to_vec();
+        for person in picked {
+            app.push_action(Action::AddTeamMember {
+                team_id: team_id.clone(),
+                user_id: person.id,
+                owner,
+            });
+        }
     }
     if clear {
         app.push_action(Action::ClearPeopleSelection);

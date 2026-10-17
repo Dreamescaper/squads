@@ -11,6 +11,11 @@
 //! **B2b** adds the **pinned-messages panel** to the info pane: the selected
 //! chat's pins (sender, preview, time) with a **Go** jump (reusing B1's
 //! highlight mechanism) and an **Unpin** action.
+//!
+//! **B4** adds a **channel reaction affordance**: a channel message's reactions
+//! are clickable to remove and the six picker emojis add one, all queued as
+//! [`Action::ReactInChannel`] and routed to the dedicated Graph channel-reaction
+//! lane (thread replies included). Chat reactions keep the read-only chips.
 
 use std::path::Path;
 
@@ -263,19 +268,72 @@ fn bubble(app: &mut SquadsApp, ui: &mut Ui, message: &Message, index: usize) {
                     for url in image_urls(&message.raw) {
                         inline_image(app, ui, &url);
                     }
-                    if !message.reactions.is_empty() {
-                        ui.horizontal(|ui| {
-                            for reaction in &message.reactions {
-                                ui.label(
-                                    RichText::new(format!("{} {}", reaction.emoji, reaction.count))
+                    if !message.reactions.is_empty() || is_channel_message(&message.chat_id) {
+                        if is_channel_message(&message.chat_id) {
+                            channel_reactions(app, ui, message);
+                        } else {
+                            ui.horizontal(|ui| {
+                                for reaction in &message.reactions {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} {}",
+                                            reaction.emoji, reaction.count
+                                        ))
                                         .small(),
-                                );
-                            }
-                        });
+                                    );
+                                }
+                            });
+                        }
                     }
                 });
             });
         });
+    });
+}
+
+/// Whether a conversation id names a channel message (B4).
+///
+/// A channel message is stored under the plain channel id or the derived thread
+/// conversation `<channel>;messageid=<root>`; both resolve to a channel.
+fn is_channel_message(conversation_id: &str) -> bool {
+    let (base, _) = squads_core::split_thread_conversation(conversation_id);
+    squads_core::is_channel_conversation_id(base)
+}
+
+/// The channel reaction affordance (B4): existing reactions are clickable to
+/// remove, and the six picker emojis add one. Every click queues
+/// [`Action::ReactInChannel`]; the `Teams` service routes it to the dedicated
+/// Graph channel-reaction lane (including thread replies).
+fn channel_reactions(app: &mut SquadsApp, ui: &mut Ui, message: &Message) {
+    let is_reply = message.reply_to.is_some();
+    ui.horizontal_wrapped(|ui| {
+        for reaction in &message.reactions {
+            let text = format!("{} {}", reaction.emoji, reaction.count);
+            if ui.small_button(text).clicked() {
+                app.push_action(Action::ReactInChannel {
+                    conversation_id: message.chat_id.clone(),
+                    message_id: message.id.clone(),
+                    emoji: reaction.emoji.clone(),
+                    remove: true,
+                    is_reply,
+                });
+            }
+        }
+        for (emoji, _reaction_type) in squads_core::api::REACTION_EMOJI {
+            if ui
+                .small_button(*emoji)
+                .on_hover_text("Add reaction")
+                .clicked()
+            {
+                app.push_action(Action::ReactInChannel {
+                    conversation_id: message.chat_id.clone(),
+                    message_id: message.id.clone(),
+                    emoji: (*emoji).to_string(),
+                    remove: false,
+                    is_reply,
+                });
+            }
+        }
     });
 }
 

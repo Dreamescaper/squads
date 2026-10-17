@@ -1578,3 +1578,107 @@ HTTP client and **cannot be stubbed offline**, so only its pure shapes and the
 local-first move are tested; the live folder read/move, the live pin read and the
 unavailable server unpin are unverified). B-007 (folder names and pin previews
 join chat content in the unencrypted store).
+
+---
+
+## B4 — Team administration
+
+**Goal.** Finish the `api::teams` surface: **public-team discovery + join**,
+**member add/remove**, **team settings**, and the previously-unwired **channel
+message reactions** (U-003) — all offline-testable against local TCP stubs, with
+a Teams-page browse/join flow, owner-gated member management (via B3's people
+picker) and a channel reaction affordance in the conversation view.
+
+**Landed.**
+
+- `api` (M2 module, extended) — typed, instrumented Graph wrappers in the
+  existing `ApiClient` style (redacting `Debug`, request counter, `tracing`
+  spans): `search_public_teams` (`GET /groups` `$search`, falling back to
+  `GET /teams` `startswith`; **single window**, clamped to `PUBLIC_TEAMS_MAX`),
+  `join_team` (`POST /teams/{id}/members` for self, resolved through `/me`),
+  `add_team_member` (owner role optional), `remove_team_member`
+  (`DELETE /teams/{team}/members/{membership}`), `team_settings` (two GETs:
+  `/teams/{id}` + `/teams/{id}/primaryChannel`), and the dedicated **channel
+  reaction** lane `set_channel_reaction`/`unset_channel_reaction`
+  (`POST …/messages/{id}/(set|unset)Reaction`, with a `replies/{reply}` variant
+  when a reply id is given). The B4 pure helpers/types are re-exported
+  (`public_teams_groups_path`, `public_teams_list_path`, `parse_public_teams`,
+  `PublicTeamInfo`, `PublicTeamsSource`, `PUBLIC_TEAMS_MAX`, `join_team_data`,
+  `add_team_member_data`, `add_member_body`, `remove_team_member_data`,
+  `member_path`, `members_path`, `team_settings_data`, `TeamMemberSettings`,
+  `channel_set_reaction_path`, `channel_unset_reaction_path`,
+  `channel_reply_set_reaction_path`, `channel_reply_unset_reaction_path`,
+  `channel_react_body`).
+- `model` — [`PublicTeam`](../crates/squads-core/src/model.rs)
+  (id/display_name/description/visibility + a **local** `is_joined` the wire does
+  not carry, so `From` defaults it `false` and the service marks it against the
+  joined cache) and [`TeamSettings`](../crates/squads-core/src/model.rs)
+  (the two `memberSettings` flags + the General channel id, each `None` when the
+  read failed — **unknown**, never a guessed `false`). `TeamMember` gains a
+  non-persisted `user_id` (the vendored projection carries it) so the app can
+  match the signed-in owner. The existing `model::Reaction` is reused unchanged.
+- `store` — **no schema change** (no v12). Two read/write helpers on the
+  existing tables: `team_for_channel` (the reverse lookup the channel-reaction
+  lane needs, since a conversation id does not name its team) and
+  `delete_team_member` (the roster removal). `TeamMember::user_id` is **not**
+  persisted (a cached roster leaves it `None`; a live fetch fills it).
+- `teams` — the `Teams` service gains `search_public` (marks membership from the
+  cached joined teams), `join` (join, then refresh the joined-teams cache and
+  return the team), `add_member` / `remove_member` (write-through the roster
+  cache), `settings`, and `react_in_channel(conversation_id, message_id, emoji,
+  remove, is_reply)`. The channel-reaction lane resolves the **team** from the
+  cached channel, derives the **root** for a reply from the derived conversation
+  id (falling back to the stored `reply_to`), performs the API call, then
+  adjusts the stored message's reactions (the same coarse ±1 as chat reactions).
+  The pure `split_thread_conversation` is the inverse of `thread_conversation`.
+- `crates/squads-app` — a **Browse public teams** search on the Teams page
+  (query → results with Join/Joined), an **owner-gated member roster** (shown
+  when the fetched roster names the signed-in user as an owner: **Add member**
+  opens B3's people picker in "add member" mode with an owner-role toggle, and
+  **Remove** confirms first), and a **channel reaction affordance** in the
+  conversation view (existing chips remove; the six picker emojis add; thread
+  replies route through the reply lane). All of it rides the existing
+  `AppRuntime`/`AppEvent` bridge (`PublicTeamsLoaded` / `TeamJoined` /
+  `TeamMembersLoaded` / `TeamMemberChanged` / `ReactionsChanged`) and repaints
+  only when something changed (ADR-027). The headless harness allows missing
+  glyphs (emoji render as tofu — the bundled fonts carry none).
+
+**Decisions.** **ADR-040** (public-team search/join + member admin via Graph,
+the schema-free reverse lookup, and the dedicated Graph channel-reaction lanes
+and why they differ from chat reactions).
+
+**Tests.** `cargo test -p squads-core` — **417** (B2b's 395 + **22** new: 11
+`api`, 2 `model`, 1 `store`, 8 `teams`). `cargo test -p squads-app` — **38**
+(B2b's 35 + **3** new: the public-team search/join flow, member management with
+add-via-picker + remove-with-confirmation, and reacting to a channel message).
+`cargo test -p squads-protocol` still passes **377**. `cargo build --workspace`
+(default features) succeeds and `cargo fmt -p squads-core -p squads-app --
+--check` is clean. New coverage includes: the public-team `/groups` `$search`
+shape (only public rows, dedupe, blank-name fallback) and the `/teams`
+`startswith` fallback on a refused groups read; a blank query rejected before any
+network; `join_team` resolving self through `/me` then `POST /teams/{id}/members`;
+member add (owner body) / remove (`DELETE …/members/{membership}`); team settings
+reading both GETs and leaving a **single** failed read unknown; the channel
+set/unset reaction paths for **both** the root and the reply variant (Graph token,
+not skypetoken) and an unknown-emoji refusal; the `Teams` service's public-search
+membership marking, join-then-refresh, roster caching/removal, settings mapping,
+and `react_in_channel` resolving the team + updating the store (root and reply);
+`split_thread_conversation`; `team_for_channel`/`delete_team_member` round-trips
+and profile isolation; and the headless Teams-page search/join, member
+management (picker add + remove confirm) and the channel reaction action.
+
+**How to verify manually** (real tenant; not runnable here): sign in, open
+**Teams**, type a team name into **Browse public teams** and confirm joinable
+results render; press **Join** and confirm the team appears (with its channels)
+and the button flips to **Joined**. Expand a team you own and confirm the
+**Members** roster, **Add member** (search a colleague, optionally grant owner,
+Add) and **Remove** (with confirmation). Open a channel and react to a message
+(and to a thread reply) with the picker emojis; confirm the counts update and
+the tenant agrees. See U-003 for the unverified live acceptance.
+
+**Blockers.** **U-003** (updated: the channel reaction lane is now **wired** to
+the dedicated Graph paths but is **not live-verified**; the public-team
+search/join, member admin and team-settings shapes are likewise unproven live;
+`create_channel` still rides Graph). B-007 (public-team names/descriptions,
+member names/emails and channel reaction state join chat content in the
+unencrypted store).

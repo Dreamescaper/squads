@@ -27,6 +27,9 @@
 //! | Create channel | **Graph** (vendored) | [`Teams::create_channel`] |
 //! | Edit / delete channel | **Middle tier** | [`Teams::update_channel`] / [`Teams::delete_channel`] |
 //! | Create team | **Middle tier** | [`Teams::create_team`] |
+//! | Public-team search / join | **Graph** | [`Teams::search_public`] / [`Teams::join`] |
+//! | Member add / remove / settings | **Graph** | [`Teams::add_member`] / [`Teams::remove_member`] / [`Teams::settings`] |
+//! | Channel reaction | **Graph** (dedicated lane) | [`Teams::react_in_channel`] |
 //!
 //! Channel *messages* ride the **same chat-service endpoints as chats**: the
 //! channel conversation id (`19:…@thread.tacv2`) is accepted by
@@ -45,16 +48,21 @@
 //! derived conversation id (with the root echoed in `reply_to`). The UI must
 //! group channel replies by `<channel>;messageid=<root>` — **not** the channel
 //! id — when it renders a thread; [`Teams::thread_conversation`] exposes the
-//! mapping so callers do not have to re-derive it.
+//! mapping so callers do not have to re-derive it, and
+//! [`split_thread_conversation`] is its inverse.
 //!
-//! ## Reactions and read receipts are best-effort
+//! ## Team administration and channel reactions (B4)
 //!
-//! Channel reactions and receipts are **not** wired here. The chat-service
-//! reactions endpoint 404s on channel threads and the consumption-horizon call
-//! 403s; the Graph channel-reaction paths are unverified live. They are
-//! recorded in `docs/BLOCKERS.md` (U-003) and deferred. Chats keep the M5
-//! [`Messaging::react`](crate::messaging::Messaging::react) /
-//! [`Messaging::mark_read`](crate::messaging::Messaging::mark_read) paths.
+//! Public-team discovery/join, member add/remove and team settings are **Graph**
+//! ([`Teams::search_public`], [`Teams::join`], [`Teams::add_member`],
+//! [`Teams::remove_member`], [`Teams::settings`]). Channel **reactions** use a
+//! **dedicated Graph lane** ([`Teams::react_in_channel`] →
+//! `…/messages/{id}/(set|unset)Reaction`, with a `replies/{reply}` variant),
+//! *not* the chat-service reaction path: that endpoint **404s** on channel
+//! threads, and the Graph channel-reaction paths are unverified live (U-003).
+//! The lane needs the **team** id alongside the channel, resolved from the
+//! cached channel; the chat paths keep the M5
+//! [`Messaging::react`](crate::messaging::Messaging::react) lane. See ADR-040.
 //!
 //! ## Optimistic writes
 //!
@@ -68,8 +76,8 @@ use std::sync::Arc;
 
 use crate::api::ApiClient;
 use crate::error::Result;
-use crate::messaging::{HistoryPage, Messaging};
-use crate::model::{Channel, Message, SendState, Team, TeamMember};
+use crate::messaging::{HistoryPage, Messaging, apply_reaction};
+use crate::model::{Channel, Message, PublicTeam, SendState, Team, TeamMember, TeamSettings};
 use crate::store::Store;
 
 /// Messages fetched by [`Teams::open_channel`] (the newest page).
@@ -180,6 +188,165 @@ impl Teams {
     /// The cached roster of one team (offline read).
     pub fn cached_members(&self, team_id: &str) -> Result<Vec<TeamMember>> {
         self.store.team_members(team_id)
+    }
+
+    // ----- team administration (B4) ---------------------------------------
+
+    /// Search the directory for public (joinable) teams (Graph `/groups`
+    /// `$search`, falling back to `/teams` `startswith`), marking each hit with
+    /// whether it is already joined.
+    ///
+    /// **Single window** (Graph caps at [`PUBLIC_TEAMS_MAX`](crate::api::PUBLIC_TEAMS_MAX));
+    /// a blank query returns an empty list without a request. Membership is not
+    /// on the wire, so [`PublicTeam::is_joined`] is derived from the cached
+    /// joined teams (the store); a search therefore reflects the last
+    /// [`Teams::list_teams`].
+    pub async fn search_public(&self, query: &str) -> Result<Vec<PublicTeam>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let (_source, infos) = self
+            .client
+            .search_public_teams(query, crate::api::PUBLIC_TEAMS_MAX)
+            .await?;
+        let joined: std::collections::HashSet<String> = self
+            .store
+            .list_teams(&self.profile)?
+            .into_iter()
+            .map(|team| team.id)
+            .collect();
+        Ok(infos
+            .iter()
+            .map(|info| PublicTeam::from_info(info, joined.contains(&info.id)))
+            .collect())
+    }
+
+    /// Join one team as the signed-in user, then refresh the joined-teams cache.
+    ///
+    /// Returns the joined [`Team`] from the refreshed cache (or an id-named
+    /// placeholder when Graph does not list the fresh membership yet). The
+    /// refresh is the point: it fills the channels the new team brings, so the
+    /// browser shows it immediately.
+    pub async fn join(&self, team_id: &str) -> Result<Team> {
+        let id = self.client.join_team(team_id).await?;
+        let teams = self.list_teams().await?;
+        Ok(teams
+            .into_iter()
+            .find(|team| team.id == id)
+            .unwrap_or(Team {
+                name: id.clone(),
+                id,
+            }))
+    }
+
+    /// Add one user (a Graph/AAD id or UPN) to a team and cache the new roster
+    /// entry. `owner` grants the owner role.
+    pub async fn add_member(
+        &self,
+        team_id: &str,
+        user_id: &str,
+        owner: bool,
+    ) -> Result<TeamMember> {
+        let info = self.client.add_team_member(team_id, user_id, owner).await?;
+        let member = TeamMember::from_info(&info);
+        self.store
+            .upsert_team_members(&self.profile, team_id, std::slice::from_ref(&member))?;
+        Ok(member)
+    }
+
+    /// Remove one membership (the roster **membership** id, not the user id)
+    /// from a team and drop the cached entry.
+    pub async fn remove_member(&self, team_id: &str, membership_id: &str) -> Result<()> {
+        self.client
+            .remove_team_member(team_id, membership_id)
+            .await?;
+        self.store
+            .delete_team_member(&self.profile, team_id, membership_id)?;
+        Ok(())
+    }
+
+    /// Read a team's member permissions + General channel id (Graph; two GETs).
+    ///
+    /// Purely a read: nothing is persisted (settings are cheap to re-read and
+    /// per-team, so they are not cached — see ADR-040).
+    pub async fn settings(&self, team_id: &str) -> Result<TeamSettings> {
+        let settings = self.client.team_settings(team_id).await?;
+        Ok(TeamSettings::from_wire(&settings))
+    }
+
+    /// Add or remove an emoji reaction on a **channel** message, adjusting the
+    /// cached row's counts.
+    ///
+    /// Channel reactions use the dedicated **Graph** lane (the chat-service
+    /// reaction endpoint 404s on channel threads — see ADR-018/ADR-040 and
+    /// U-003), which needs the **team** id as well as the channel; the team is
+    /// resolved from the cached channel (`Store::team_for_channel`), so the
+    /// channel must have been listed (a [`Teams::list_teams`]/[`Teams::channels`]
+    /// refresh) first.
+    ///
+    /// `conversation_id` is the conversation the message is stored under: the
+    /// channel id for a top-level message, or the derived thread conversation
+    /// `<channel>;messageid=<root>` for a reply. When `is_reply` is `true` the
+    /// reaction targets the `…/replies/{reply}/setReaction` lane: the root is
+    /// taken from `conversation_id`'s `;messageid=` suffix when present, else
+    /// from the stored message's `reply_to`, and `message_id` is the **reply**
+    /// id. The local count adjustment is coarse (±1, no reactor identity), the
+    /// same as [`Messaging::react`](crate::messaging::Messaging::react); the
+    /// authoritative reactor list arrives with the next history refresh.
+    pub async fn react_in_channel(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        emoji: &str,
+        remove: bool,
+        is_reply: bool,
+    ) -> Result<()> {
+        let (channel_id, root_from_conv) = split_thread_conversation(conversation_id);
+        let team_id = self
+            .store
+            .team_for_channel(&self.profile, channel_id)?
+            .ok_or_else(|| {
+                crate::error::CoreError::Protocol(anyhow::anyhow!(
+                    "channel {channel_id} is not cached, so its team is unknown"
+                ))
+            })?;
+
+        // For a reply, the Graph lane wants (root, reply); the root comes from
+        // the derived conversation id, falling back to the stored message.
+        let (root_id, reply_id): (String, Option<String>) = if is_reply {
+            let root = match root_from_conv {
+                Some(root) => root.to_string(),
+                None => self
+                    .store
+                    .message(conversation_id, message_id)?
+                    .and_then(|message| message.reply_to)
+                    .ok_or_else(|| {
+                        crate::error::CoreError::Protocol(anyhow::anyhow!(
+                            "reply root unknown (not in the conversation id or the stored message)"
+                        ))
+                    })?,
+            };
+            (root, Some(message_id.to_string()))
+        } else {
+            (message_id.to_string(), None)
+        };
+
+        if remove {
+            self.client
+                .unset_channel_reaction(&team_id, channel_id, &root_id, emoji, reply_id.as_deref())
+                .await?;
+        } else {
+            self.client
+                .set_channel_reaction(&team_id, channel_id, &root_id, emoji, reply_id.as_deref())
+                .await?;
+        }
+
+        if let Some(mut message) = self.store.message(conversation_id, message_id)? {
+            apply_reaction(&mut message.reactions, emoji, remove);
+            self.store
+                .upsert_messages(&self.profile, std::slice::from_ref(&message))?;
+        }
+        Ok(())
     }
 
     // ----- channel history (chat service) ---------------------------------
@@ -402,6 +569,20 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// Split a channel conversation id into `(channel_id, root_id)` (B4).
+///
+/// A channel reply lives under the derived conversation
+/// `<channel>;messageid=<root>` (see the module docs); the channel-reaction
+/// lane needs the plain **channel** plus, for a reply, the **root** message id.
+/// A plain channel id returns `(id, None)`. Pure; the inverse of
+/// [`Teams::thread_conversation`].
+pub fn split_thread_conversation(conversation_id: &str) -> (&str, Option<&str>) {
+    match conversation_id.split_once(";messageid=") {
+        Some((channel, root)) if !root.is_empty() => (channel, Some(root)),
+        _ => (conversation_id, None),
+    }
+}
+
 /// Redacting `Debug`: no message bodies or channel names.
 impl std::fmt::Debug for Teams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -446,6 +627,24 @@ mod tests {
         let client = Arc::new(ApiClient::from_tokens(&tokens_for(base)));
         let teams = Teams::new("default", Arc::clone(&store), client);
         (store, teams)
+    }
+
+    fn message(chat_id: &str, id: &str, sender: &str, content: &str, own: bool) -> Message {
+        Message {
+            id: id.into(),
+            chat_id: chat_id.into(),
+            sender_mri: format!("8:orgid:{sender}"),
+            sender_name: sender.into(),
+            timestamp: "2026-01-02T09:30:00Z".into(),
+            content: content.into(),
+            raw: format!("<p>{content}</p>"),
+            reactions: Vec::new(),
+            reply_to: None,
+            client_message_id: None,
+            edited: false,
+            is_own: own,
+            send_state: SendState::Sent,
+        }
     }
 
     fn requests(seen: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
@@ -985,5 +1184,288 @@ mod tests {
         assert!(teams.cached_channels("t1").unwrap().is_empty());
         assert!(teams.cached_members("t1").unwrap().is_empty());
         assert_eq!(teams.client().request_count(), 0);
+    }
+
+    // ----- B4: team administration ----------------------------------------
+
+    fn seed_channel(store: &Store, team_id: &str, channel_id: &str) {
+        store
+            .upsert_channels(
+                "default",
+                &[Channel {
+                    id: channel_id.into(),
+                    team_id: team_id.into(),
+                    name: "General".into(),
+                    description: None,
+                    membership_type: None,
+                    web_url: None,
+                    is_channel: true,
+                }],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_public_marks_membership_against_the_joined_cache() {
+        let (base, seen, task) = http_stub(vec![StubResponse::ok(
+            serde_json::json!({
+                "value": [
+                    {"id": "team-1", "displayName": "Joined", "visibility": "public"},
+                    {"id": "team-2", "displayName": "New", "visibility": "public"}
+                ]
+            })
+            .to_string(),
+        )])
+        .await;
+        let (store, teams) = test_teams(&base);
+        store
+            .upsert_teams(
+                "default",
+                &[Team {
+                    id: "team-1".into(),
+                    name: "Joined".into(),
+                }],
+            )
+            .unwrap();
+
+        let found = teams.search_public("eng").await.expect("search");
+        assert_eq!(found.len(), 2);
+        assert!(found[0].is_joined, "team-1 is in the joined cache");
+        assert!(!found[1].is_joined);
+
+        // A blank query short-circuits with no request.
+        assert!(teams.search_public("  ").await.unwrap().is_empty());
+
+        task.await.expect("stub drains");
+        assert!(
+            requests(&seen)[0].starts_with("GET /groups?$search="),
+            "{}",
+            requests(&seen)[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn join_posts_self_then_refreshes_the_team_list() {
+        let (base, seen, task) = http_stub(vec![
+            StubResponse::ok(serde_json::json!({ "id": "me-oid" }).to_string()),
+            StubResponse::status(201),
+            StubResponse::ok(
+                serde_json::json!({"value": [{"id": "team-1", "displayName": "Eng"}]}).to_string(),
+            ),
+            StubResponse::ok(
+                serde_json::json!({"value": [
+                    {"id": "19:general@thread.tacv2", "displayName": "General"}
+                ]})
+                .to_string(),
+            ),
+        ])
+        .await;
+        let (store, teams) = test_teams(&base);
+
+        let team = teams.join("team-1").await.expect("join");
+        assert_eq!(team.id, "team-1");
+        assert_eq!(team.name, "Eng");
+        // The refresh cached the joined team and its channels.
+        assert_eq!(store.list_teams("default").unwrap().len(), 1);
+        assert_eq!(store.channels_for_team("team-1").unwrap().len(), 1);
+
+        task.await.expect("stub drains");
+        let reqs = requests(&seen);
+        assert!(reqs[0].starts_with("GET /me "), "{}", reqs[0]);
+        assert!(
+            reqs[1].starts_with("POST /teams/team-1/members "),
+            "{}",
+            reqs[1]
+        );
+        assert!(reqs[2].starts_with("GET /me/joinedTeams "), "{}", reqs[2]);
+    }
+
+    #[tokio::test]
+    async fn add_member_caches_and_remove_member_drops_the_roster_entry() {
+        let body = serde_json::json!({
+            "id": "M9", "displayName": "Ava", "email": "ava@x.example", "roles": []
+        })
+        .to_string();
+        let (base, seen, task) =
+            http_stub(vec![StubResponse::ok(body), StubResponse::status(204)]).await;
+        let (store, teams) = test_teams(&base);
+
+        let member = teams
+            .add_member("team-1", "oid-9", false)
+            .await
+            .expect("add member");
+        assert_eq!(member.id, "M9");
+        assert!(!member.is_owner());
+        assert_eq!(store.team_members("team-1").unwrap().len(), 1);
+
+        teams
+            .remove_member("team-1", "M9")
+            .await
+            .expect("remove member");
+        assert!(store.team_members("team-1").unwrap().is_empty());
+
+        task.await.expect("stub drains");
+        let reqs = requests(&seen);
+        assert!(
+            reqs[0].starts_with("POST /teams/team-1/members "),
+            "{}",
+            reqs[0]
+        );
+        assert!(
+            reqs[1].starts_with("DELETE /teams/team-1/members/M9 "),
+            "{}",
+            reqs[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_maps_the_team_member_permissions() {
+        let (base, seen, task) = http_stub(vec![
+            StubResponse::ok(
+                serde_json::json!({
+                    "id": "team-1",
+                    "memberSettings": { "allowCreateUpdateChannels": true }
+                })
+                .to_string(),
+            ),
+            StubResponse::ok(serde_json::json!({ "id": "19:general@thread.tacv2" }).to_string()),
+        ])
+        .await;
+        let (_store, teams) = test_teams(&base);
+
+        let settings = teams.settings("team-1").await.expect("settings");
+        assert_eq!(settings.allow_create_update_channels, Some(true));
+        assert_eq!(settings.allow_delete_channels, None, "unknown, not false");
+        assert_eq!(
+            settings.primary_channel_id.as_deref(),
+            Some("19:general@thread.tacv2")
+        );
+
+        task.await.expect("stub drains");
+        let reqs = requests(&seen);
+        assert!(reqs[0].starts_with("GET /teams/team-1 "), "{}", reqs[0]);
+        assert!(
+            reqs[1].starts_with("GET /teams/team-1/primaryChannel "),
+            "{}",
+            reqs[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn react_in_channel_resolves_the_team_and_updates_the_store() {
+        let channel = "19:ch@thread.tacv2";
+        let (base, seen, task) =
+            http_stub(vec![StubResponse::status(204), StubResponse::status(204)]).await;
+        let (store, teams) = test_teams(&base);
+        seed_channel(&store, "team-1", channel);
+        store
+            .upsert_messages(
+                "default",
+                &[message(channel, "m1", "Ava", "react to me", false)],
+            )
+            .unwrap();
+
+        teams
+            .react_in_channel(channel, "m1", "👍", false, false)
+            .await
+            .expect("add reaction");
+        let row = store.message(channel, "m1").unwrap().unwrap();
+        assert_eq!(row.reactions.len(), 1);
+        assert_eq!(row.reactions[0].count, 1);
+
+        teams
+            .react_in_channel(channel, "m1", "👍", true, false)
+            .await
+            .expect("remove reaction");
+        assert!(
+            store
+                .message(channel, "m1")
+                .unwrap()
+                .unwrap()
+                .reactions
+                .is_empty()
+        );
+
+        task.await.expect("stub drains");
+        let reqs = requests(&seen);
+        assert!(
+            reqs[0].starts_with(&format!(
+                "POST /teams/team-1/channels/{channel}/messages/m1/setReaction "
+            )),
+            "unexpected request: {}",
+            reqs[0]
+        );
+        assert!(
+            reqs[1].starts_with(&format!(
+                "POST /teams/team-1/channels/{channel}/messages/m1/unsetReaction "
+            )),
+            "unexpected request: {}",
+            reqs[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn react_in_channel_routes_a_thread_reply_through_the_reply_lane() {
+        let channel = "19:ch@thread.tacv2";
+        let root = "1700000000000";
+        let thread = format!("{channel};messageid={root}");
+        let (base, seen, task) = http_stub(vec![StubResponse::status(204)]).await;
+        let (store, teams) = test_teams(&base);
+        seed_channel(&store, "team-1", channel);
+        let mut reply = message(&thread, "r2", "Ava", "in thread", false);
+        reply.reply_to = Some(root.to_string());
+        store.upsert_messages("default", &[reply]).unwrap();
+
+        // The thread conversation id carries the root, so no store lookup is
+        // needed for it.
+        teams
+            .react_in_channel(&thread, "r2", "❤️", false, true)
+            .await
+            .expect("react to reply");
+        assert_eq!(
+            store.message(&thread, "r2").unwrap().unwrap().reactions[0].count,
+            1
+        );
+
+        task.await.expect("stub drains");
+        let req = requests(&seen)[0].clone();
+        assert!(
+            req.starts_with(&format!(
+                "POST /teams/team-1/channels/{channel}/messages/{root}/replies/r2/setReaction "
+            )),
+            "unexpected request: {req}"
+        );
+    }
+
+    #[tokio::test]
+    async fn react_in_channel_refuses_an_uncached_channel_before_any_network() {
+        let (base, seen, task) = http_stub(vec![]).await;
+        let (_store, teams) = test_teams(&base);
+
+        let err = teams
+            .react_in_channel("19:unknown@thread.tacv2", "m1", "👍", false, false)
+            .await
+            .expect_err("uncached channel refused");
+        assert!(format!("{err:#}").contains("not cached"), "{err:#}");
+
+        task.await.expect("stub drains");
+        assert!(requests(&seen).is_empty());
+    }
+
+    #[test]
+    fn split_thread_conversation_inverts_the_mapping() {
+        assert_eq!(
+            split_thread_conversation("19:ch@thread.tacv2"),
+            ("19:ch@thread.tacv2", None)
+        );
+        assert_eq!(
+            split_thread_conversation("19:ch@thread.tacv2;messageid=7"),
+            ("19:ch@thread.tacv2", Some("7"))
+        );
+        // A trailing empty root is not a thread id.
+        assert_eq!(
+            split_thread_conversation("19:ch@thread.tacv2;messageid="),
+            ("19:ch@thread.tacv2;messageid=", None)
+        );
     }
 }

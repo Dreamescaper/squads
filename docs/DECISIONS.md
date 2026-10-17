@@ -1824,3 +1824,102 @@ The vendored surfaces:
   fallback ready for a token that can read it.
 - No encryption change: folder names and pin previews join chat content in the
   plaintext store (B-007).
+
+---
+
+## ADR-040 — Public-team join + member admin (Graph), and the dedicated Graph channel-reaction lanes
+
+**Status:** accepted (B4)
+
+**Context.** Backlog item **B4** finishes the `api::teams` surface M6 left out:
+**public-team discovery + join**, **member add/remove**, **team settings**, and
+**channel message reactions** — the last of which M6 explicitly deferred
+(ADR-018/U-003). Three things had to be settled: which host serves each call, how
+the channel-reaction lane differs from the chat-reaction lane, and whether any
+new state needs persisting.
+
+The vendored surfaces:
+
+- **Public-team search** is Graph and **two-lane**: `GET /groups` `$search`
+  (word match, `ConsistencyLevel: eventual`, `Group.Read.All`-class) with a
+  fallback to `GET /teams` `startswith(displayName)` (`Team.ReadBasic.All`) when
+  `/groups` is refused. Both are **single-window** (no cursor; capped at
+  `PUBLIC_TEAMS_MAX = 25`), and the parser keeps only `visibility == public`
+  rows. **Join** is Graph `POST /teams/{id}/members` for self (the own user id
+  resolved through `/me`); join-by-invite-code is not Graph and is out of scope.
+- **Member admin** is Graph: `POST /teams/{id}/members` (owner role optional)
+  and `DELETE /teams/{team}/members/{membership}` (the **membership** id, not the
+  user id). **Team settings** is two Graph GETs (`GET /teams/{id}` for
+  `memberSettings`, `GET /teams/{id}/primaryChannel` for the General channel),
+  each independently failing to `None`.
+- **Channel reactions** are the problem child. The **chat-service** reaction
+  endpoint (`/messages/{id}/reactions`) **404s** on channel threads, so the
+  channel counterpart is the **Graph** `POST /teams/{team}/channels/{channel}/
+  messages/{id}/(set|unset)Reaction` lane (`reactionType` sent as the picker
+  unicode), with a `…/replies/{reply}/(set|unset)Reaction` variant for thread
+  replies. The vendored crate flags this lane **NOT verified live** (auth was
+  down when it landed).
+
+**Decision.**
+
+1. **Wrap the vendored calls, Graph throughout.** `ApiClient` gains
+   `search_public_teams`, `join_team`, `add_team_member`, `remove_team_member`,
+   `team_settings`, `set_channel_reaction` and `unset_channel_reaction`, in the
+   existing instrumented (redacting `Debug`, request counter, `tracing` spans)
+   style, and re-exports the B4 pure helpers/types so the request/response shapes
+   are pinned offline.
+2. **Owned models, additive.** `model::PublicTeam` mirrors `PublicTeamInfo` plus
+   a **local** `is_joined` (the wire carries no membership; `From` defaults it
+   `false` and the service marks it against the joined cache).
+   `model::TeamSettings` mirrors the two flags + the General channel id, each
+   `None` when unknown. `TeamMember` gains a **non-persisted** `user_id` (the
+   vendored projection carries it) so the app can recognise the signed-in owner;
+   the store does not persist it. `model::Reaction` is **reused unchanged** —
+   channel reactions adjust the same stored representation as chat reactions.
+3. **The channel-reaction lane needs the team id.** The Graph path is keyed by
+   `(team, channel, message, reply)`, but a conversation id does not name its
+   team. `Teams::react_in_channel(conversation_id, message_id, emoji, remove,
+   is_reply)` resolves the team from the **cached channel**
+   (`Store::team_for_channel`, a schema-free reverse lookup over the existing
+   `channels` table) and derives the **root** for a reply from the derived thread
+   conversation `<channel>;messageid=<root>` (falling back to the stored
+   `reply_to`); `split_thread_conversation` is the inverse of the existing
+   `thread_conversation`. The call then adjusts the stored message's reactions
+   (the same coarse ±1 as `Messaging::react`; canonical counts arrive with the
+   next history refresh).
+4. **No new persisted state.** Public-team search results are transient (like
+   the B3 people search); `TeamSettings` is cheap to re-read and per-team, so it
+   is **not cached**; the roster already lives in `team_members`. The only store
+   additions are two schema-free helpers (`team_for_channel`,
+   `delete_team_member`), so **there is no schema v12**.
+5. **The app.** A **Browse public teams** search on the Teams page
+   (`Action::SearchPublicTeams` → `AppEvent::PublicTeamsLoaded`, a Join button
+   per hit → `Action::JoinTeam`), an **owner-gated member roster**
+   (`is_owner_of` = a fetched member whose `user_id` matches our oid carries the
+   `owner` role; **Add member** opens B3's people picker in "add member" mode
+   with an owner-role toggle; **Remove** confirms first), and a **channel
+   reaction affordance** in the conversation view (`Action::ReactInChannel` →
+   `AppEvent::ReactionsChanged`). All ride the existing `AppRuntime`/`AppEvent`
+   bridge and repaint only when something changed (ADR-027).
+
+**Consequences.**
+
+- Every request shape is pinned **offline** against a local TCP stub (the
+  `/groups`/`/teams` search paths, the join/member-add bodies, the member
+  `DELETE`, the two settings GETs, and the channel `setReaction`/`unsetReaction`
+  paths for the root **and** the reply variant, with the Graph bearer), and the
+  service effects (membership marking, roster write-through, the store reaction
+  update) are covered.
+- **The channel-reaction lane is now wired but not live-verified** (U-003
+  updated): the vendored crate's own note that the unicode-vs-named
+  `reactionType`, the scope grant and the Graph-vs-chat-service message id
+  mapping need a signed-in probe still stands. The **public-team search/join,
+  member admin and team-settings** shapes are likewise unproven live.
+- Channel **read receipts** stay on hold (Graph exposes no channel receipt API
+  and the chat-service consumption horizon 403s on `tacv2` threads); chat
+  receipts keep the M5 path.
+- `create_channel` still rides Graph (a vendor-vs-brief discrepancy noted in
+  U-003); routing it through the middle tier remains a contained change in
+  `ApiClient::create_channel`.
+- No encryption change: public-team names/descriptions, member names/emails and
+  channel reaction state join chat content in the plaintext store (B-007).

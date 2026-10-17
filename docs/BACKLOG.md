@@ -129,7 +129,20 @@ that a people query renders results and selection yields an id.
 
 ---
 
-## B4 — Team administration ⬜
+## B4 — Team administration ✅
+
+**Landed.** `api` wrappers for `search_public_teams_data`, `join_team_data`,
+`add_team_member_data`, `remove_team_member_data`, `team_settings_data`,
+`set_channel_reaction_data`/`unset_channel_reaction_data` (+ the pure
+`public_teams_*_path`, `add_member_body`, `member(s)_path`, `channel_*_reaction_path`,
+`channel_react_body` helpers re-exported); `model::{PublicTeam, TeamSettings}`
+(and `TeamMember::user_id`, needed to match the signed-in owner);
+`Teams::{search_public, join, add_member, remove_member, settings,
+react_in_channel}`; two schema-free store helpers (`team_for_channel`,
+`delete_team_member`); and the app's **Browse public teams** search/join, the
+owner-gated **member roster** (add via B3's people picker, remove with
+confirmation) and a **channel reaction affordance** (existing chips remove, the
+six picker emojis add, thread replies included). See ADR-040 and PROGRESS (B4).
 
 **Gap.** The rest of `api::teams`: public team discovery + join, member
 add/remove, team settings, and channel message reactions (U-003).
