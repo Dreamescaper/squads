@@ -83,8 +83,23 @@ impl Palette {
 /// `System` follows egui's default (which tracks the OS), so no explicit
 /// `Visuals` are set for it; the accent is still applied on top.
 pub fn install(ctx: &Context, settings: &Settings) -> Palette {
+    // M13: register the egui_extras image loaders so `egui::Image::from_uri`
+    // can decode the `file://…` inline-media cache. Guarded so re-applying the
+    // theme (a settings change) does not stack duplicate loaders; the loaders
+    // are content-sniffed, not extension-bound.
+    install_image_loaders_once(ctx);
     apply(ctx, settings);
     Palette::for_theme(resolve(settings.theme), settings.accent)
+}
+
+/// Install the egui_extras image loaders on `ctx` exactly once.
+fn install_image_loaders_once(ctx: &Context) {
+    let id = egui::Id::unique("squads::image_loaders_installed");
+    if ctx.data(|data| data.get_temp::<bool>(id)).unwrap_or(false) {
+        return;
+    }
+    egui_extras::install_image_loaders(ctx);
+    ctx.data_mut(|data| data.insert_temp(id, true));
 }
 
 /// Re-apply every themed setting to a live context (used by the settings view).

@@ -8,12 +8,19 @@
 //! reactions and the optimistic [`SendState`] styling (pending / failed with a
 //! retry button).
 
+use std::path::Path;
+
 use egui::{RichText, Ui};
 use squads_core::SendState;
 use squads_core::model::Message;
+use squads_core::text::image_urls;
 
-use crate::app::{Action, SquadsApp, short_time};
+use crate::app::{Action, MediaState, SquadsApp, short_time};
 use crate::views::composer;
+
+/// The largest an inline image is drawn, regardless of its natural size.
+const MAX_IMAGE_WIDTH: f32 = 320.0;
+const MAX_IMAGE_HEIGHT: f32 = 320.0;
 
 /// Render the conversation for the selected chat/channel.
 pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
@@ -174,6 +181,12 @@ fn bubble(app: &mut SquadsApp, ui: &mut Ui, message: &Message, index: usize) {
                     if !message.content.is_empty() {
                         ui.label(&message.content);
                     }
+                    // Inline images / GIFs (M13): extract from the raw HTML and
+                    // render each cached bitmap (or a placeholder while it
+                    // loads).
+                    for url in image_urls(&message.raw) {
+                        inline_image(app, ui, &url);
+                    }
                     if !message.reactions.is_empty() {
                         ui.horizontal(|ui| {
                             for reaction in &message.reactions {
@@ -188,4 +201,44 @@ fn bubble(app: &mut SquadsApp, ui: &mut Ui, message: &Message, index: usize) {
             });
         });
     });
+}
+
+/// Render one inline image URL (M13): the cached bitmap, a labelled
+/// placeholder while it is fetched, or a small note when it failed.
+///
+/// The fetch itself never happens here — an unknown URL queues
+/// [`Action::LoadMedia`] and shows the placeholder; `apply_actions` performs
+/// the fetch off the frame (ADR-026).
+fn inline_image(app: &mut SquadsApp, ui: &mut Ui, url: &str) {
+    match app.media_state(url) {
+        Some(MediaState::Loaded(path)) => {
+            ui.add(
+                egui::Image::from_uri(file_uri(&path))
+                    .max_width(MAX_IMAGE_WIDTH)
+                    .max_height(MAX_IMAGE_HEIGHT),
+            );
+        }
+        Some(MediaState::Failed) => {
+            ui.label(RichText::new("Image unavailable").weak().small());
+        }
+        Some(MediaState::Loading) => {
+            ui.label(RichText::new("Loading image...").weak().small());
+        }
+        None => {
+            app.request_media(url);
+            ui.label(RichText::new("Loading image...").weak().small());
+        }
+    }
+}
+
+/// A `file://` URI for a local path egui's image loader can open.
+///
+/// egui's loader expects a leading `/` after the scheme (a POSIX path already
+/// has one; a Windows path is normalised to forward slashes and prefixed).
+fn file_uri(path: &Path) -> String {
+    let mut text = path.to_string_lossy().replace('\\', "/");
+    if !text.starts_with('/') {
+        text.insert(0, '/');
+    }
+    format!("file://{text}")
 }

@@ -126,6 +126,22 @@ Each milestone is an independent work item for the implementation loop: **implem
   entry + `Ctrl/Cmd+2`) and `views/calendar.rs`, join hand-off to `CallService`.
   See `PROGRESS.md` (M12) and ADR-033.
 
+### M13 — Self identity + inline media
+- Fetch and cache the signed-in identity (Graph `/me` → `Identity`, schema-v8
+  `accounts.self_mri`/`oid`) and apply `mark_own` to server-loaded history and
+  the realtime collector so our own messages render on the own side.
+- Extract inline image URLs from raw HTML (`text::image_urls`), fetch and cache
+  them once with an offline-first `MediaCache` (Skype token only on Microsoft
+  hosts), and render them in the egui timeline via `egui_extras` image loaders.
+- **Exit:** identity mapping, `mark_own`, URL extraction and the media cache are
+  tested offline against stubs (fetch + auth-header rule + cache hit); a
+  headless `egui_kittest` test shows an own message and an image placeholder.
+- **Landed:** `model::Identity`, schema **v8** (`accounts.self_mri`/`oid`),
+  `Session::identity()`/`set_identity`/`client()`, `Messaging`/realtime
+  `mark_own`, `api::whoami`/`fetch_media`, `text::image_urls`, `MediaCache`,
+  `egui_extras` image loading in `views/conversation.rs`. See `PROGRESS.md`
+  (M13) and ADR-034/ADR-035.
+
 ## 4. Working agreement (the loop)
 
 For each milestone: implement (via subagent where useful) → review the diff → run
@@ -166,3 +182,4 @@ Documentation is updated continuously:
 - [x] M10 — egui UI
 - [x] M11 — Polish & packaging
 - [x] M12 — Calendar
+- [x] M13 — Self identity + inline media

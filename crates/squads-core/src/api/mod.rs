@@ -48,6 +48,11 @@
 //! Channel reactions and read receipts are **best-effort**: they ride separate
 //! Graph paths that are not live-verified, and the chat-service consumption
 //! horizon 403s on `tacv2` threads (see `docs/BLOCKERS.md`).
+//!
+//! **Identity (M13)** is Graph `GET /me` ([`ApiClient::whoami`]); **inline media
+//! (M13)** is [`ApiClient::fetch_media`] plus the pure host rule
+//! ([`media_needs_auth`] / [`media_auth_headers`]). The cached, one-fetch
+//! variant lives in [`crate::MediaCache`].
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,6 +77,13 @@ pub use ost::api::{FileVersion, SharedFile, UploadProgress};
 
 /// Protocol type surfaced by the M8 Graph presence call.
 pub use ost::api::PresenceInfo;
+
+/// Protocol type surfaced by the M13 `whoami` call (the signed-in identity).
+pub use ost::api::UserInfo;
+
+/// Inline-media types surfaced by the M13 media wrapper: fetched bytes + the
+/// vendored size cap.
+pub use ost::api::{MAX_BYTES, MediaBytes};
 
 /// Protocol types surfaced by the M12 calendar calls, re-exported so the UI and
 /// `calendar` do not reach into the vendored crate. The **pure** helpers
@@ -122,6 +134,31 @@ pub fn tokens_to_config(tokens: &TokenSet) -> Config {
         teams_region: None,
         teams_ring: None,
     }
+}
+
+/// Own roster MRI for an Entra object id (`8:orgid:<oid>`) (M13).
+///
+/// A thin, tested re-export of the vendored [`ost::api::own_member_mri`], used
+/// when mapping whoami into an [`Identity`](crate::model::Identity).
+pub fn own_member_mri(oid: &str) -> String {
+    ost::api::own_member_mri(oid)
+}
+
+/// Whether an inline media URL needs the Skype token (M13).
+///
+/// A thin re-export of the vendored host rule: only Microsoft media hosts
+/// (`*.msg.teams.microsoft.com`, `*.asm.skype.com`, …) authenticate; everything
+/// else fetches unauthenticated so the token never leaks to third parties.
+pub fn media_needs_auth(url: &str) -> bool {
+    ost::api::media::needs_auth(url)
+}
+
+/// Token headers for one inline media URL (M13), as `(name, value)` pairs.
+///
+/// Empty for public hosts; the vendored [`ost::api::media::auth_headers`] picks
+/// the object-store vs. chat-service scheme per host family.
+pub fn media_auth_headers(url: &str, token: &str) -> Vec<(&'static str, String)> {
+    ost::api::media::auth_headers(url, token)
 }
 
 /// A typed, instrumented facade over the vendored Teams client.
@@ -1027,6 +1064,40 @@ impl ApiClient {
         tracing::debug!(call, "resolved join meeting id");
         Ok(resolved)
     }
+
+    // ----- M13: identity & inline media -----------------------------------
+
+    /// `GET /me` — the signed-in user's profile (M13).
+    ///
+    /// This is what lets server-loaded history and realtime messages be marked
+    /// own: the caller maps the returned [`UserInfo`] into an
+    /// [`Identity`](crate::model::Identity) (MRI `8:orgid:<id>`) and threads it
+    /// into [`Messaging`](crate::Messaging) / the realtime collector.
+    pub async fn whoami(&self) -> Result<UserInfo> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.whoami", call);
+        let info = ost::api::whoami_data(&self.client).instrument(span).await?;
+        tracing::debug!(call, "read whoami");
+        Ok(info)
+    }
+
+    /// Download one inline media URL (a chat `<img src>`) (M13).
+    ///
+    /// The vendored helper attaches the Skype token **only** on Microsoft media
+    /// hosts ([`media_needs_auth`]) and never to third parties, and rejects
+    /// non-`https` URLs and over-cap payloads. Callers that want caching should
+    /// use [`MediaCache`](crate::MediaCache) instead.
+    pub async fn fetch_media(&self, url: &str) -> Result<MediaBytes> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.fetch_media", call);
+        let bytes = ost::api::fetch_media_data(&self.client, url)
+            .instrument(span)
+            .await?;
+        tracing::debug!(len = bytes.data.len(), call, "fetched inline media");
+        Ok(bytes)
+    }
 }
 
 impl fmt::Debug for ApiClient {
@@ -1491,5 +1562,67 @@ mod tests {
             cfg.access_token.as_ref().map(|t| t.token.as_str()),
             Some("spaces-token")
         );
+    }
+
+    // ----- M13: identity & inline media -----------------------------------
+
+    #[tokio::test]
+    async fn whoami_maps_to_an_identity_with_the_derived_mri() {
+        let body = serde_json::json!({
+            "id": "abc-123",
+            "displayName": "Alice Smith",
+            "mail": "alice@contoso.com",
+            "userPrincipalName": "alice@contoso.com"
+        })
+        .to_string();
+        let (base, seen, task) = one_shot_json_stub(body).await;
+
+        let tokens = fresh_tokens(serde_json::json!({ "graphBase": base }));
+        let client = ApiClient::from_tokens(&tokens);
+        let info = client.whoami().await.expect("whoami");
+        assert_eq!(info.id, "abc-123");
+        assert_eq!(info.display_name, "Alice Smith");
+        assert_eq!(info.mail.as_deref(), Some("alice@contoso.com"));
+        assert_eq!(client.request_count(), 1);
+
+        let identity = crate::model::Identity::from_whoami(&info, tokens.tenant());
+        assert_eq!(identity.mri, "8:orgid:abc-123");
+        assert_eq!(identity.oid, "abc-123");
+        assert_eq!(identity.display_name, "Alice Smith");
+        assert_eq!(identity.tenant, "contoso.onmicrosoft.com");
+
+        task.await.expect("stub drains");
+        let req = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            req.starts_with("GET /me "),
+            "unexpected request line: {req}"
+        );
+        // The Graph token, not the skype token, authorises `/me`.
+        assert!(req.contains("authorization: Bearer graph-token"), "{req}");
+    }
+
+    #[test]
+    fn own_member_mri_wrapper_matches_the_vendored_shape() {
+        assert_eq!(own_member_mri("abc-123"), "8:orgid:abc-123");
+        assert_eq!(own_member_mri("  abc-123  "), "8:orgid:abc-123");
+    }
+
+    #[test]
+    fn media_host_rule_sends_the_token_only_to_microsoft_hosts() {
+        // Microsoft media hosts need auth (and get headers).
+        assert!(media_needs_auth(
+            "https://us-api.asm.skype.com/v1/objects/0/x"
+        ));
+        assert!(media_needs_auth(
+            "https://amer.ng.msg.teams.microsoft.com/v1/objects/0/x"
+        ));
+        assert!(!media_auth_headers("https://us-api.asm.skype.com/x", "T").is_empty());
+        // Public hosts send no token.
+        assert!(!media_needs_auth(
+            "https://media.giphy.com/media/abc/giphy.gif"
+        ));
+        assert!(media_auth_headers("https://media.giphy.com/abc.gif", "T").is_empty());
+        // An evil look-alike never gets the token.
+        assert!(media_auth_headers("https://asm.skype.com.evil.com/x", "T").is_empty());
     }
 }

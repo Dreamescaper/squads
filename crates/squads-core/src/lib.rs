@@ -14,6 +14,7 @@ pub mod calendar;
 pub mod calls;
 pub mod error;
 pub mod files;
+pub mod media;
 pub mod messaging;
 pub mod model;
 pub mod notifications;
@@ -26,7 +27,7 @@ pub mod store;
 pub mod teams;
 pub mod text;
 
-pub use api::{ApiClient, tokens_to_config};
+pub use api::{ApiClient, media_needs_auth, own_member_mri, tokens_to_config};
 pub use auth::{AuthDriver, AuthTransport, SignInProgress, TokenKind, TokenSet};
 pub use calendar::{Calendar, Lobby, lobby_step};
 pub use calls::{
@@ -36,10 +37,11 @@ pub use calls::{
 };
 pub use error::{CoreError, Result};
 pub use files::Files;
+pub use media::{CachedMedia, MediaCache};
 pub use messaging::{HistoryPage, Messaging};
 pub use model::{
-    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, FileEntry, FileVersion, Meeting,
-    Message, Reaction, Reactor, SendState, SharedLink, Team, TeamMember,
+    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, FileEntry, FileVersion, Identity,
+    Meeting, Message, Reaction, Reactor, SendState, SharedLink, Team, TeamMember,
     is_channel_conversation_id,
 };
 pub use notifications::{

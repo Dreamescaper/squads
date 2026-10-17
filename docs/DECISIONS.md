@@ -1363,3 +1363,119 @@ is off-limits.
   the plaintext store (B-007).
 - Adding a calendar field later (e.g. a real `all_day` once the projection
   carries it) is a model + v7 column + `from_info` change, no caller impact.
+
+---
+
+## ADR-034 — Self identity: whoami → a cached identity, schema-v8 `accounts`, and where `mark_own` is applied
+
+**Status:** accepted (M13)
+
+**Context.** M3 gave [`Message`](../crates/squads-core/src/model.rs) a
+`mark_own(self_mri)` helper precisely because `MessageInfo` cannot know who the
+signed-in user is, and M5's optimistic paths set `is_own = true` directly. But
+**nothing ever obtained the MRI**: `ost::api::me::whoami_data` and
+`ost::api::chat::own_member_mri` were unused, so every message loaded from the
+server (`Messaging::open` / `load_older`) and every realtime `NewMessage` kept
+`is_own = false`. Our own history rendered on the other side, and the M8
+notification router could not recognise our own messages either. Two questions
+had to be settled: how the identity is obtained and cached, and *where* the
+`mark_own` pass runs.
+
+**Decision.**
+
+1. **Obtain it from Graph `/me`.** A new `ApiClient::whoami` wraps the vendored
+   `whoami_data(client) -> UserInfo`; `model::Identity::from_whoami(&UserInfo,
+   tenant)` derives the MRI with the vendored `own_member_mri` (`8:orgid:<oid>`).
+   An empty id yields an empty MRI rather than a bogus `8:orgid:`.
+2. **Cache it in memory *and* on disk.** `Session` holds an `Option<Identity>`
+   and persists it to the `accounts` row in **schema v8** (`accounts.self_mri`,
+   `accounts.oid`; guarded `ALTER TABLE`, existing rows default `NULL`). The
+   app fetches whoami asynchronously after sign-in/restore and delivers it as
+   `AppEvent::IdentityLoaded`; `Session::set_identity` caches and persists it,
+   and `restore()` rebuilds it from the store offline, so `mark_own` survives a
+   restart without a fresh whoami.
+3. **Apply `mark_own` at the two places that map wire messages**, not in the UI:
+   `Messaging` carries the self MRI (`with_self_mri` / `set_self_mri`, seeded
+   from the persisted account so a restart keeps it) and marks every page it
+   maps; the realtime collector takes the MRI
+   (`collect_once` / `RealtimeService::start`) and marks a pushed `NewMessage`
+   **before** it is cached and published, so the store and the bus event agree.
+   The conversation view *additionally* re-marks the timeline against
+   `Session::self_mri()` on reload, so history cached before whoami resolved
+   still renders on the own side (a belt-and-braces pass, not the source of
+   truth).
+
+**Consequences.**
+
+- Server-loaded history and realtime messages now carry the correct `is_own`;
+  the notification router's "own message → no notification" rule works for
+  pushed messages too.
+- The identity is a **cache**, not a credential: an empty/stale `self_mri`
+  degrades to "nothing is own" rather than mis-marking; a later whoami refresh
+  re-marks.
+- `accounts` gains two nullable columns and `Account` two `Option` fields
+  (additive; the store's key and every other table are unchanged). B-007 still
+  applies: the MRI/OID join chat content in the plaintext store.
+- The self MRI is captured when the realtime feed starts; a whoami that resolves
+  afterwards restarts the feed (`SquadsApp::restart_realtime`) rather than
+  mutating a running collector, mirroring the existing token-change behaviour
+  (B-008).
+- The real whoami response and the live own-side rendering remain unverified
+  here (U-008); the mapping and the `mark_own` passes are covered offline.
+
+---
+
+## ADR-035 — Inline media: `text::image_urls` + a deterministic `MediaCache` + `egui_extras` image loading
+
+**Status:** accepted (M13)
+
+**Context.** Teams message HTML carries images as `<img src="…">`; the M10
+timeline rendered only `Message::content` (HTML-stripped text), so images and
+GIFs never appeared. `ost::api::media` (`fetch_media_data` / `needs_auth` /
+`auth_headers`) already knows how to fetch them — Microsoft media hosts
+(`*.msg.teams.microsoft.com`, `*.asm.skype.com`, …) authenticate with the Skype
+token; public hosts must fetch **without** it — but nothing in `squads-core`
+used it, and the vendored `fetch_media_data` refuses non-`https` URLs, which
+makes it untestable against a local stub. Two questions: how URLs are extracted
+from the raw body, and how bytes are fetched/cached and rendered.
+
+**Decision.**
+
+1. **Extraction is pure and shared.** `text::image_urls(raw) -> Vec<String>`
+   pulls `<img src=…>` (any quoting/attribute order, case-insensitive) plus
+   obvious image links (an `http(s)://…` ending in a known image extension).
+   HTML entities in the `src` are decoded, percent-encoding is preserved, and
+   the function is total and de-duplicating. Object-store `src`s with **no**
+   extension (`…/views/imgo`) are surfaced via their `<img>` tag, never guessed
+   from a link.
+2. **A small cache owns the fetch.** `media::MediaCache { dirs, token, client }`
+   writes bytes under `AppDirs::media_dir()` at a **deterministic** path
+   (`sha256(url)[..16]` + an image extension, `bin` when none) and returns
+   `CachedMedia { url, path, mime, from_cache }`. A second `fetch` for the same
+   URL returns the file with **no request**, so repeated renders never refetch.
+   The token is attached only when `media_needs_auth(url)` is true, using the
+   vendored `auth_headers` scheme, so it never leaks to third parties. The HTTP
+   client is injectable (`with_client`), which is what makes the auth-header
+   rule and the cache-hit property testable against a local stub. Writes are
+   atomic and capped at `MAX_BYTES`.
+3. **Rendering rides the existing bridge.** `squads-app` adds `egui_extras`
+   (feature `image`) and installs its loaders in `theme::install`; the
+   conversation view renders each extracted URL as an `egui::Image` from the
+   cached `file://` path (bounded to 320×320) or a labelled placeholder, and
+   requests the fetch with `Action::LoadMedia` — the backend answers with
+   `AppEvent::MediaLoaded` / `MediaFailed`, so nothing blocks the frame and a
+   repaint happens only when something changed (ADR-027).
+
+**Consequences.**
+
+- Images/GIFs render in the timeline; a URL is fetched once and cached, and the
+  token boundary is explicit and tested.
+- The cache is keyed by URL only (not by account) and is **unencrypted at rest**
+  like the rest of the local cache (B-007). Bytes are buffered in memory once per
+  fetch before the write (no streaming).
+- The fetch/rendering path is offline-testable (URL extraction, the service
+  against a stub, and a headless `egui_kittest` placeholder test); the real
+  media hosts, `Content-Type`s and rendered pixels remain unverified here
+  (U-008 / B-012).
+- `egui_extras`/`image` are pure-Rust decoders (png/jpeg/gif/webp/…), so the
+  default build gains no system dependency.

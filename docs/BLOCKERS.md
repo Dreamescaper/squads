@@ -93,7 +93,8 @@ stub to serve `whoami` + roster + history and cover the branch offline.
 are written in the clear, including display names, sender MRIs, raw message HTML
 and reaction reactor names. The file is protected only by filesystem/OS-account
 permissions (and WAL leaves `store.sqlite-wal`/`-shm` siblings with the same
-exposure).
+exposure). M13 adds the inline-media cache (`cache/media/<hash>.<ext>`), which
+writes fetched image bytes in the clear too.
 
 **Impact:** anyone with read access to the user's data directory can read cached
 Teams content. This is not acceptable for a general release and must be
@@ -562,3 +563,31 @@ no live driver.
 contained; the deterministic stub tests pin the exact paths/params/bodies so a
 regression is caught; the join classification and lobby machine are pure and
 fully unit-tested.
+
+### U-008 — M13 whoami and inline media not exercised offline
+
+M13's identity fetch and inline-media fetch are thin wrappers tested offline
+against local TCP stubs (request line/headers + store/cache effects), and the
+`mark_own` passes and URL extraction are pure. The following cannot be exercised
+here (B-002 — no live tenant):
+
+- **Live whoami.** That the real `GET /me` returns the `id`/`displayName` we map
+  into an `Identity`, and that the derived `8:orgid:<id>` MRI is exactly the one
+  the chat service stamps on our messages (`from`), is assumed from the vendored
+  crate + a stub. If the two disagree, own messages would stay `false`; the
+  mapping is deliberately tolerant (full MRI or bare OID, case-insensitive).
+- **Live media acceptance.** Whether the real Microsoft media hosts accept the
+  vendored token scheme (`skype_token …` vs. `Authentication`/`X-SkypeToken`),
+  whether the returned `Content-Type`s match the extensions we infer, and
+  whether the AMS object-store URLs (no extension) always return decodable
+  images are unproven. Public-host fetches are the simple case.
+- **Rendered pixels.** The headless `egui_kittest` test asserts the placeholder
+  and the queued `LoadMedia`, not that a decoded bitmap is painted (B-001/B-012).
+
+**Impact:** own-message recognition and image rendering are assumed from the
+vendored crate + stubs, not proven against Teams.
+
+**Mitigation:** keep both behind `ApiClient`/`MediaCache` so a live fix is
+contained; the deterministic stub tests pin the request shapes and the cache-hit
+property; the media host rule is the vendored one, so a scheme change comes from
+upstream.

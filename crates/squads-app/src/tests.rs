@@ -15,7 +15,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 use squads_core::auth::MemoryTokenStore;
-use squads_core::model::{Channel, FileEntry, Meeting, Message, SendState};
+use squads_core::model::{Channel, FileEntry, Identity, Meeting, Message, SendState};
 use squads_core::{AppDirs, Chat, Session, SessionState, Settings, Store, Team};
 
 use crate::app::{Action, Page, SquadsApp};
@@ -64,6 +64,15 @@ fn message(chat_id: &str, id: &str, sender: &str, content: &str, own: bool) -> M
 /// the app is constructed; the returned `Arc<Store>` is the same store the app
 /// reads.
 fn app_harness(setup: impl FnOnce(&Store)) -> (Harness<'static, SquadsApp>, Arc<Store>) {
+    app_harness_with_session(setup, |_| {})
+}
+
+/// Like [`app_harness`], but also lets the test configure the [`Session`]
+/// (e.g. inject a signed-in identity) before the app is built.
+fn app_harness_with_session(
+    setup: impl FnOnce(&Store),
+    configure: impl FnOnce(&mut Session),
+) -> (Harness<'static, SquadsApp>, Arc<Store>) {
     let dirs = temp_dirs();
     let store = Arc::new(Store::open_in_memory().expect("in-memory store"));
     setup(&store);
@@ -73,6 +82,7 @@ fn app_harness(setup: impl FnOnce(&Store)) -> (Harness<'static, SquadsApp>, Arc<
         Session::with_token_store_and_db(dirs.clone(), "default", tokens, store.clone())
             .expect("session");
     session.set_state(SessionState::Ready);
+    configure(&mut session);
 
     let store_handle = Arc::clone(&store);
     let harness = Harness::new_eframe(move |cc| {
@@ -522,6 +532,73 @@ fn calendar_page_join_by_link_queues_a_join_action() {
     assert!(
         joined,
         "expected a JoinMeeting action; got {:?}",
+        harness.state().applied_actions()
+    );
+}
+
+// ----- M13: own identity & inline media --------------------------------------
+
+#[test]
+fn an_own_message_is_marked_and_rendered_from_the_identity() {
+    // Seed a message whose sender MRI matches our identity but that was cached
+    // before whoami resolved (`is_own = false`).
+    let (mut harness, _store) = app_harness_with_session(
+        |store| {
+            store
+                .upsert_chats("default", &[chat("c1", "Alice")])
+                .expect("chats");
+            let mine = message("c1", "m1", "self", "hi from me", false);
+            store.upsert_messages("default", &[mine]).expect("messages");
+        },
+        |session| {
+            session.set_identity(Identity {
+                mri: "8:orgid:self".into(),
+                oid: "self".into(),
+                display_name: "Me".into(),
+                tenant: "contoso".into(),
+            });
+        },
+    );
+    harness.run();
+    harness.get_by_label("Alice").click();
+    harness.run();
+
+    // The text renders, and the identity marks the message own on the timeline
+    // (so the bubble is drawn on the own side).
+    harness.get_by_label("hi from me");
+    assert!(
+        harness.state().timeline()[0].is_own,
+        "the identity must mark our message own"
+    );
+}
+
+#[test]
+fn a_message_with_an_image_renders_a_placeholder_not_only_text() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+        let mut image = message("c1", "m1", "Alice", "", false);
+        image.raw = r#"<p><img src="https://example.com/photo.png"></p>"#.into();
+        store
+            .upsert_messages("default", &[image])
+            .expect("messages");
+    });
+    harness.run();
+    harness.get_by_label("Alice").click();
+    harness.run();
+
+    // The image placeholder is rendered (headless has no cache, so the fetch
+    // stays pending) rather than only the plain text.
+    harness.get_by_label("Loading image...");
+    let requested = harness
+        .state()
+        .applied_actions()
+        .iter()
+        .any(|action| matches!(action, Action::LoadMedia { url } if url == "https://example.com/photo.png"));
+    assert!(
+        requested,
+        "expected a LoadMedia action; got {:?}",
         harness.state().applied_actions()
     );
 }

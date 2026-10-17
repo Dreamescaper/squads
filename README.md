@@ -3,7 +3,7 @@
 An alternative, cross-platform **Microsoft Teams** client built with **Rust** and
 [**egui**](https://github.com/emilk/egui) (immediate-mode, event-driven, glow/OpenGL).
 
-> Status: the planned milestones (**M0–M12**) are implemented. The workspace
+> Status: the planned milestones (**M0–M13**) are implemented. The workspace
 > builds and tests **offline, with default features**; the network paths need a
 > live tenant and the UI needs a display, neither of which exist in the build
 > environment. See [`docs/STATUS.md`](docs/STATUS.md) for the one-screen state and
@@ -45,7 +45,8 @@ crates/
 | Area | Works (verified offline) | Unverified (needs a live tenant / device / display) | Deferred |
 |---|---|---|---|
 | Auth | Device-code flow, five-token model, 0600 token store, refresh | Real AAD/`authsvc` exchange | Browser PKCE loopback (B-004) |
-| Chat | Offline-first store + paging, optimistic send, edit/delete/reply/react/receipts | Server acceptance of the write shapes (U-002) | — |
+| Chat | Offline-first store + paging, optimistic send, edit/delete/reply/react/receipts; own messages rendered on the own side from the whoami identity | Server acceptance of the write shapes (U-002); live whoami (U-008) | — |
+| Inline media | `<img>`/GIF extraction, one-fetch-per-URL `MediaCache` (Skype token only on Microsoft hosts), images rendered in the timeline | Live media hosts/`Content-Type`s and rendered pixels (U-008/B-012) | Streaming; per-account cache |
 | Realtime | Trouter wrap, typed event bus, write-through | Live push; call frames are filtered upstream (B-008) | — |
 | Teams/channels | Metadata cache, channel history, thread replies, middle-tier writes | Write acceptance; channel reactions/receipts (U-003) | — |
 | Calendar | Graph `calendarView` agenda + week view, schedule/cancel, offline `meetings` cache, join hand-off to calls | Live Graph calendar acceptance; join-by-id is a browser fallback (U-007) | — |
@@ -99,7 +100,8 @@ Resolved by `squads_core::AppDirs` (`directories`, project id
 - `tokens.json` / `tokens-<profile>.json` — the token set, mode `0600` (secret).
 - `store.sqlite` (+ `-wal`/`-shm`) — the offline cache; **unencrypted at rest**
   (B-007).
-- `media/` — downloads when no download directory is set.
+- `media/` — downloads when no download directory is set, and the inline-media
+  cache (one hashed file per fetched image URL).
 
 ## Troubleshooting
 

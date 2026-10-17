@@ -54,17 +54,26 @@ const COLLECT_TIMEOUT_MS: u64 = 250;
 /// write through to `store` and publish to `bus`.
 ///
 /// Returns the number of [`RealtimeEvent`]s handled. This is the deterministic
-/// core of the collector loop and the entry point for tests.
-pub fn collect_once(profile: &str, store: &Store, bus: &EventBus) -> usize {
+/// core of the collector loop and the entry point for tests. `self_mri` (M13) is
+/// the signed-in user's MRI: a decoded new message whose sender matches is
+/// marked [`Message::is_own`](crate::model::Message::is_own) before it is cached
+/// and published.
+pub fn collect_once(profile: &str, store: &Store, bus: &EventBus, self_mri: Option<&str>) -> usize {
     let payloads = ost::event_hub::drain(COLLECT_BATCH);
-    apply_payloads(profile, store, bus, payloads)
+    apply_payloads(profile, store, bus, payloads, self_mri)
 }
 
-fn apply_payloads(profile: &str, store: &Store, bus: &EventBus, payloads: Vec<String>) -> usize {
+fn apply_payloads(
+    profile: &str,
+    store: &Store,
+    bus: &EventBus,
+    payloads: Vec<String>,
+    self_mri: Option<&str>,
+) -> usize {
     let mut applied = 0;
     for payload in payloads {
         for event in decode_all(&payload) {
-            apply_event(profile, store, bus, event);
+            apply_event(profile, store, bus, event, self_mri);
             applied += 1;
         }
     }
@@ -75,7 +84,20 @@ fn apply_payloads(profile: &str, store: &Store, bus: &EventBus, payloads: Vec<St
 ///
 /// The store write happens **before** the publish so a consumer that reacts to
 /// the event and immediately reads the store sees the new state.
-fn apply_event(profile: &str, store: &Store, bus: &EventBus, event: RealtimeEvent) {
+fn apply_event(
+    profile: &str,
+    store: &Store,
+    bus: &EventBus,
+    mut event: RealtimeEvent,
+    self_mri: Option<&str>,
+) {
+    // M13: a pushed new message is marked own before it is cached/published, so
+    // a consumer reading the bus event sees the same `is_own` the store holds.
+    if let RealtimeEvent::NewMessage { message, .. } = &mut event
+        && let Some(mri) = self_mri
+    {
+        message.mark_own(mri);
+    }
     match &event {
         RealtimeEvent::NewMessage { message, .. } => {
             if let Err(e) = store.upsert_messages(profile, std::slice::from_ref(message)) {
@@ -129,6 +151,7 @@ impl RealtimeService {
         profile: impl Into<String>,
         tokens: &TokenSet,
         store: Arc<Store>,
+        self_mri: Option<String>,
     ) -> Self {
         let bus = EventBus::default();
         let config = tokens_to_config(tokens);
@@ -146,7 +169,13 @@ impl RealtimeService {
             loop {
                 let payloads = ost::event_hub::drain_wait(COLLECT_BATCH, COLLECT_TIMEOUT_MS);
                 if !payloads.is_empty() {
-                    let n = apply_payloads(&profile, &store, &collector_bus, payloads);
+                    let n = apply_payloads(
+                        &profile,
+                        &store,
+                        &collector_bus,
+                        payloads,
+                        self_mri.as_deref(),
+                    );
                     tracing::trace!(events = n, "realtime: collected push events");
                 }
                 // Yield so the task is cancellable between (blocking) waits.
@@ -240,7 +269,7 @@ mod tests {
         let id = format!("m4-{}", uuid::Uuid::new_v4());
         ost::event_hub::publish(message_fixture(&chat_id, &id, "<p>hello <b>m4</b></p>"));
 
-        let applied = collect_once("default", &store, &bus);
+        let applied = collect_once("default", &store, &bus, None);
         assert_eq!(applied, 1);
 
         // Write-through: the message is in the store with the stripped body.
@@ -308,7 +337,7 @@ mod tests {
             .to_string(),
         );
 
-        assert_eq!(collect_once("default", &store, &bus), 1);
+        assert_eq!(collect_once("default", &store, &bus, None), 1);
 
         let stored = store.messages(&chat_id, 10).unwrap();
         assert_eq!(stored.len(), 1, "edit must not create a second row");
@@ -363,7 +392,7 @@ mod tests {
             .to_string(),
         );
 
-        assert_eq!(collect_once("default", &store, &bus), 1);
+        assert_eq!(collect_once("default", &store, &bus, None), 1);
         assert!(store.messages(&chat_id, 10).unwrap().is_empty());
     }
 
@@ -380,7 +409,7 @@ mod tests {
             serde_json::json!({ "resourceType": "MessageLoss", "resource": {} }).to_string(),
         );
 
-        assert_eq!(collect_once("default", &store, &bus), 1);
+        assert_eq!(collect_once("default", &store, &bus, None), 1);
         assert!(matches!(
             rx.try_recv().expect("resync event"),
             RealtimeEvent::Resync { .. }
@@ -413,7 +442,7 @@ mod tests {
             .to_string(),
         );
 
-        assert_eq!(collect_once("default", &store, &bus), 2);
+        assert_eq!(collect_once("default", &store, &bus, None), 2);
         assert!(matches!(
             rx.try_recv().unwrap(),
             RealtimeEvent::Typing { .. }
@@ -432,6 +461,53 @@ mod tests {
         ost::event_hub::drain(usize::MAX);
         let store = Store::open_in_memory().unwrap();
         let bus = EventBus::default();
-        assert_eq!(collect_once("default", &store, &bus), 0);
+        assert_eq!(collect_once("default", &store, &bus, None), 0);
+    }
+
+    #[test]
+    fn collect_once_marks_a_pushed_new_message_own_when_the_mri_is_known() {
+        let _guard = hub_guard();
+        ost::event_hub::drain(usize::MAX);
+
+        let store = Store::open_in_memory().unwrap();
+        let bus = EventBus::default();
+        let mut rx = bus.subscribe();
+
+        let chat_id = format!("19:m13-{}@unq.gbl.spaces", uuid::Uuid::new_v4());
+        let id = format!("m13-{}", uuid::Uuid::new_v4());
+        // The fixture sender is `8:orgid:aaaa`.
+        ost::event_hub::publish(message_fixture(&chat_id, &id, "<p>mine</p>"));
+
+        assert_eq!(
+            collect_once("default", &store, &bus, Some("8:orgid:aaaa")),
+            1
+        );
+
+        // The store row and the bus event both carry `is_own`.
+        let stored = store.messages(&chat_id, 10).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].is_own, "the pushed message is ours");
+        let event = rx.try_recv().expect("a published event");
+        match event {
+            RealtimeEvent::NewMessage { message, .. } => {
+                assert!(message.is_own, "the bus event is marked own too");
+            }
+            other => panic!("expected NewMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_once_leaves_own_false_when_the_mri_is_unknown() {
+        let _guard = hub_guard();
+        ost::event_hub::drain(usize::MAX);
+
+        let store = Store::open_in_memory().unwrap();
+        let bus = EventBus::default();
+        let chat_id = format!("19:m13b-{}@unq.gbl.spaces", uuid::Uuid::new_v4());
+        let id = format!("m13b-{}", uuid::Uuid::new_v4());
+        ost::event_hub::publish(message_fixture(&chat_id, &id, "<p>hi</p>"));
+
+        assert_eq!(collect_once("default", &store, &bus, None), 1);
+        assert!(!store.messages(&chat_id, 10).unwrap()[0].is_own);
     }
 }

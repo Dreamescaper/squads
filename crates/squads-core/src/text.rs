@@ -26,6 +26,13 @@
 //! mentioned. It recognises Teams' `<at …>Name</at>` tags (with or without an
 //! MRI-carrying attribute) and plain-text `@name` tokens.
 //!
+//! ## Image extraction (M13)
+//!
+//! [`image_urls`] pulls the inline images out of a raw body — `<img src="…">`
+//! tags (any quoting) plus obvious image links — so the conversation view can
+//! fetch and render them via [`crate::MediaCache`]. It decodes HTML entities in
+//! the `src` but leaves percent-encoding intact.
+//!
 //! ## What we do *not* do here
 //!
 //! Outgoing HTML is built by the vendored, **fenced-code-aware**
@@ -348,6 +355,123 @@ fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     haystack.to_ascii_lowercase().find(needle)
 }
 
+// ----- image URL extraction (M13) -----------------------------------------
+
+/// Extract image URLs from raw Teams message HTML (milestone **M13**).
+///
+/// Two shapes are recognised, in document order:
+///
+/// * `<img src="…">` tags — any attribute order, single/double/unquoted values,
+///   case-insensitive tag/attribute names. The `src` is HTML-entity-decoded
+///   (`&amp;` → `&`) but left percent-encoded (a URL must keep `%3A`). A
+///   Microsoft object-store `src` (`…/views/imgo`, no file extension) is
+///   surfaced here, which is why `<img>` is handled separately from links.
+/// * plain `http(s)://…` links whose path ends in a known image extension
+///   (`png`/`jpg`/`jpeg`/`gif`/`webp`/`bmp`/`svg`/`avif`/`ico`/`tif`), e.g. an
+///   `<a href>` or a bare link.
+///
+/// Pure and total: malformed/unterminated tags are skipped, a non-image link is
+/// not returned, results are de-duplicated preserving first-seen order, and the
+/// function never panics.
+pub fn image_urls(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+
+    // 1. `<img src="…">` tags (case-insensitive tag name, any quoting).
+    let lower = raw.to_ascii_lowercase();
+    let mut i = 0;
+    while let Some(pos) = lower[i..].find("<img") {
+        let start = i + pos;
+        let after = raw.get(start + 4..).unwrap_or("");
+        let boundary = after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
+        if !boundary {
+            i = start + 4;
+            continue;
+        }
+        let Some(gt) = raw[start..].find('>') else {
+            break;
+        };
+        let attrs = raw.get(start + 4..start + gt).unwrap_or("");
+        if let Some(src) = attr_value(attrs, "src") {
+            let decoded = decode_entities(src.trim());
+            if !decoded.is_empty() {
+                push_unique(&mut out, decoded);
+            }
+        }
+        i = start + gt + 1;
+    }
+
+    // 2. Obvious image links (a `http(s)://…` ending in an image extension).
+    for url in find_urls(raw) {
+        if has_image_extension(&url) {
+            push_unique(&mut out, url);
+        }
+    }
+
+    out
+}
+
+/// The value of one attribute in a tag's attribute string (case-insensitive
+/// name), or `None`.
+fn attr_value(attrs: &str, key: &str) -> Option<String> {
+    parse_attrs(attrs)
+        .into_iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value)
+}
+
+/// Every `http(s)://…` token in `raw`, trimmed of trailing punctuation.
+fn find_urls(raw: &str) -> Vec<String> {
+    let lower = raw.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(pos) = lower[i..].find("http") {
+        let start = i + pos;
+        let rest = &lower[start..];
+        if !rest.starts_with("https://") && !rest.starts_with("http://") {
+            i = start + 4;
+            continue;
+        }
+        let end = raw[start..]
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '}' | ',')
+            })
+            .map(|n| start + n)
+            .unwrap_or(raw.len());
+        let url = trim_url(&decode_entities(&raw[start..end]));
+        if !url.is_empty() {
+            out.push(url);
+        }
+        i = end.max(start + 4);
+    }
+    out
+}
+
+/// Strip trailing sentence punctuation from a scanned URL.
+fn trim_url(url: &str) -> String {
+    url.trim_end_matches(['.', ',', ';', ':', '!', '?'])
+        .to_string()
+}
+
+/// Whether a URL's path ends in a known image extension.
+fn has_image_extension(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "avif" | "ico" | "tif" | "tiff"
+    )
+}
+
+/// Push `url` unless an identical value is already present (first-seen order).
+fn push_unique(out: &mut Vec<String>, url: String) {
+    if !out.iter().any(|existing| existing == &url) {
+        out.push(url);
+    }
+}
+
 /// Decode the small set of named/numeric entities Teams emits for text content.
 fn decode_entities(text: &str) -> String {
     if !text.contains('&') {
@@ -533,5 +657,98 @@ mod tests {
             mentions(r#"<at mri="8:x"></at>"#),
             vec![named("", Some("8:x"))]
         );
+    }
+
+    // ----- M13: image URL extraction ----------------------------------------
+
+    #[test]
+    fn img_tags_are_extracted_with_every_quoting_style() {
+        let html = r#"<p>look <img src="https://a.example/one.png"> and
+            <img src='https://b.example/two.gif' alt="x"> plus
+            <img src=https://c.example/three.jpg></p>"#;
+        assert_eq!(
+            image_urls(html),
+            vec![
+                "https://a.example/one.png",
+                "https://b.example/two.gif",
+                "https://c.example/three.jpg",
+            ]
+        );
+    }
+
+    #[test]
+    fn multiple_images_keep_document_order_and_dedupe() {
+        let html =
+            r#"<img src="https://a/1.png"><img src="https://a/2.png"><img src="https://a/1.png">"#;
+        assert_eq!(image_urls(html), vec!["https://a/1.png", "https://a/2.png"]);
+    }
+
+    #[test]
+    fn object_store_srcs_without_an_extension_are_kept() {
+        // AMS/object-store URLs carry no file extension; the <img> tag is the
+        // only place they appear, so they must still be surfaced.
+        let html = r#"<img src="https://us-api.asm.skype.com/v1/objects/0-abc/views/imgo">"#;
+        assert_eq!(
+            image_urls(html),
+            vec!["https://us-api.asm.skype.com/v1/objects/0-abc/views/imgo"]
+        );
+    }
+
+    #[test]
+    fn obvious_image_links_are_found_but_other_links_are_not() {
+        let html = r#"see <a href="https://giphy.com/cat.gif">a cat</a>
+            and <a href="https://example.com/doc.pdf">a doc</a>
+            or https://example.com/photo.webp here"#;
+        assert_eq!(
+            image_urls(html),
+            vec![
+                "https://giphy.com/cat.gif",
+                "https://example.com/photo.webp"
+            ]
+        );
+        // A bare non-image link is excluded.
+        assert!(image_urls("https://example.com/page.html").is_empty());
+    }
+
+    #[test]
+    fn entities_are_decoded_and_percent_encoding_is_preserved() {
+        let html = r#"<img src="https://h.example/a%20b.png?x=1&amp;y=2">"#;
+        assert_eq!(
+            image_urls(html),
+            vec!["https://h.example/a%20b.png?x=1&y=2"]
+        );
+    }
+
+    #[test]
+    fn image_extraction_never_panics_on_odd_input() {
+        for raw in [
+            "<img",
+            "<img src=",
+            "<img src=\"unclosed",
+            "<IMG SRC=\"HTTPS://A/B.PNG\">",
+            "<image src=\"x\">",
+            "no images at all",
+            "<img src=\"\">",
+            "https://",
+            "http://",
+        ] {
+            let _ = image_urls(raw);
+        }
+        // Tag names are case-insensitive.
+        assert_eq!(
+            image_urls("<IMG SRC=\"https://a/b.PNG\">"),
+            vec!["https://a/b.PNG"]
+        );
+        // An empty src is dropped.
+        assert!(image_urls("<img src=\"\">").is_empty());
+        // `<image>` is not an `<img>` tag; the URL inside it is only surfaced
+        // by the obvious-image-link scan (which is fine — it is an image).
+        assert_eq!(
+            image_urls("<image src=\"https://a/b.png\">"),
+            vec!["https://a/b.png"]
+        );
+        // A relative `<img src>` is kept (it is a real `<img>`), but a relative
+        // non-image link is not.
+        assert_eq!(image_urls("<img src=\"/x/y.png\">"), vec!["/x/y.png"]);
     }
 }

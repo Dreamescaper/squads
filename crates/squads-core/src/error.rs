@@ -46,6 +46,13 @@ pub enum CoreError {
     #[error("store error: {0}")]
     Store(String),
 
+    /// Inline media fetch/cache failed (M13).
+    ///
+    /// Carries a short message (URL host + transport/status detail), never the
+    /// token.
+    #[error("media error: {0}")]
+    Media(String),
+
     /// The on-disk database has a schema version this build cannot handle.
     #[error(
         "store schema version {found} is not supported by this build (supports up to {supported})"

@@ -30,17 +30,18 @@ use tokio::sync::broadcast;
 use crate::api::ApiClient;
 use crate::auth::flow::{AuthDriver, AuthTransport, HttpTransport, SignInProgress};
 use crate::auth::store::{DEFAULT_PROFILE, FileTokenStore, TokenStore};
-use crate::auth::tokens::TokenSet;
+use crate::auth::tokens::{TokenSet, now_unix};
 use crate::calendar::Calendar;
 use crate::calls::{CallCredentials, CallEndpoints, CallIdentity, CallService, CallSignaller};
 use crate::error::{CoreError, Result};
 use crate::files::Files;
 use crate::messaging::Messaging;
+use crate::model::Identity;
 use crate::notifications::{LogNotifier, Notifications, Notifier};
 use crate::paths::AppDirs;
 use crate::presence::{Presence, presence_base_from_region};
 use crate::realtime::{RealtimeEvent, RealtimeService};
-use crate::store::Store;
+use crate::store::{Account, Store};
 use crate::teams::Teams;
 
 /// High-level state of the local client, independent of rendering.
@@ -101,6 +102,10 @@ pub struct Session {
     /// shared via `Arc` so the M4 realtime task can write through it.
     store: Arc<Store>,
     tokens: Option<TokenSet>,
+    /// The signed-in user's identity (M13), resolved from whoami and persisted
+    /// in the `accounts` row. Makes `mark_own` work for server-loaded history
+    /// and realtime messages.
+    identity: Option<Identity>,
     sign_in: Option<SignInTask>,
     /// Lazily-built protocol client (M2), shared behind an `Arc` so the M5
     /// [`Messaging`] service can hold it too. Dropped whenever the token set
@@ -155,6 +160,7 @@ impl Session {
             token_store,
             store,
             tokens: None,
+            identity: None,
             sign_in: None,
             api: None,
             realtime: None,
@@ -207,6 +213,65 @@ impl Session {
         self.tokens.as_ref()
     }
 
+    /// The signed-in user's identity, if whoami has resolved (or a previous
+    /// run's identity was restored from the store) (M13).
+    pub fn identity(&self) -> Option<&Identity> {
+        self.identity.as_ref()
+    }
+
+    /// The signed-in user's MRI (`8:orgid:<guid>`), if known (M13).
+    pub fn self_mri(&self) -> Option<&str> {
+        self.identity
+            .as_ref()
+            .map(|identity| identity.mri.as_str())
+            .filter(|mri| !mri.trim().is_empty())
+    }
+
+    /// Cache the signed-in identity and persist it to the `accounts` row
+    /// (M13), so `mark_own` survives a restart without a fresh whoami.
+    ///
+    /// The existing row's `created_at` is preserved; the tenant falls back to
+    /// the token set's when whoami did not name one.
+    pub fn set_identity(&mut self, identity: Identity) {
+        let existing = self.store.get_account(&self.profile).ok().flatten();
+        let created_at = existing
+            .as_ref()
+            .map(|account| account.created_at)
+            .unwrap_or_else(|| now_unix() as i64);
+        let personal = self
+            .tokens
+            .as_ref()
+            .map(|tokens| tokens.personal)
+            .unwrap_or(false);
+        let tenant = non_empty(&identity.tenant)
+            .or_else(|| {
+                self.tokens
+                    .as_ref()
+                    .map(|tokens| tokens.tenant().to_string())
+            })
+            .or_else(|| existing.as_ref().and_then(|account| account.tenant.clone()));
+        let account = Account {
+            profile: self.profile.clone(),
+            tenant,
+            personal,
+            display_name: non_empty(&identity.display_name),
+            self_mri: non_empty(&identity.mri),
+            oid: non_empty(&identity.oid),
+            created_at,
+        };
+        if let Err(e) = self.store.put_account(&account) {
+            tracing::warn!(error = %e, "could not persist the signed-in identity");
+        }
+        self.identity = Some(identity);
+    }
+
+    /// The shared protocol client for this session, building it lazily (M13:
+    /// used to spawn the whoami fetch without holding a borrow across the
+    /// frame). Returns [`CoreError::NotSignedIn`] when no token set is loaded.
+    pub fn client(&mut self) -> Result<Arc<ApiClient>> {
+        self.api_arc()
+    }
+
     /// The protocol client for this session, building it lazily on first use
     /// from the current [`TokenSet`].
     ///
@@ -243,11 +308,12 @@ impl Session {
     /// that page should keep the handle they get back.
     pub fn messaging(&mut self) -> Result<Messaging> {
         let client = self.api_arc()?;
-        Ok(Messaging::new(
-            self.profile.clone(),
-            Arc::clone(&self.store),
-            client,
-        ))
+        let self_mri = self.self_mri().map(str::to_string);
+        let mut service = Messaging::new(self.profile.clone(), Arc::clone(&self.store), client);
+        if let Some(mri) = self_mri {
+            service = service.with_self_mri(mri);
+        }
+        Ok(service)
     }
 
     /// The M6 teams & channels service for this session.
@@ -405,11 +471,13 @@ impl Session {
         let tokens = self.tokens.as_ref().ok_or(CoreError::NotSignedIn)?.clone();
         // Dropping the previous service aborts its tasks.
         self.realtime = None;
+        let self_mri = self.self_mri().map(str::to_string);
         let service = RealtimeService::start(
             &handle,
             self.profile.clone(),
             &tokens,
             Arc::clone(&self.store),
+            self_mri,
         );
         self.realtime = Some(service);
         Ok(())
@@ -496,10 +564,19 @@ impl Session {
             Some(tokens) => {
                 tracing::info!(profile = %self.profile, "restored stored credentials");
                 self.tokens = Some(tokens);
+                // Restore the cached identity (M13) so `mark_own` works before
+                // the whoami refresh completes.
+                self.identity = self
+                    .store
+                    .get_account(&self.profile)
+                    .ok()
+                    .flatten()
+                    .and_then(account_identity);
                 self.state = SessionState::Loading;
             }
             None => {
                 self.tokens = None;
+                self.identity = None;
                 self.state = SessionState::SignedOut;
             }
         }
@@ -619,11 +696,33 @@ impl Session {
         // Stop the realtime feed before dropping the credentials it captured.
         self.realtime = None;
         self.tokens = None;
+        self.identity = None;
         self.api = None;
         self.token_store.delete(&self.profile)?;
         self.state = SessionState::SignedOut;
         Ok(())
     }
+}
+
+/// `Some(trimmed)` when `value` is non-empty, else `None`.
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Rebuild an [`Identity`] from a persisted [`Account`] row, when it carries a
+/// usable MRI.
+fn account_identity(account: Account) -> Option<Identity> {
+    let mri = account.self_mri?;
+    if mri.trim().is_empty() {
+        return None;
+    }
+    Some(Identity {
+        mri,
+        oid: account.oid.unwrap_or_default(),
+        display_name: account.display_name.unwrap_or_default(),
+        tenant: account.tenant.unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -687,6 +786,8 @@ mod tests {
                 tenant: None,
                 personal: false,
                 display_name: None,
+                self_mri: None,
+                oid: None,
                 created_at: 1,
             })
             .unwrap();
@@ -1093,6 +1194,70 @@ mod tests {
         assert!(session.has_api());
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&tmp2).ok();
+    }
+
+    // ----- M13: identity -----------------------------------------------------
+
+    fn identity() -> Identity {
+        Identity::from_whoami(
+            &crate::api::UserInfo {
+                display_name: "Alice".into(),
+                mail: Some("alice@contoso.com".into()),
+                id: "aaaa".into(),
+            },
+            "common",
+        )
+    }
+
+    #[test]
+    fn set_identity_persists_and_reaches_the_messaging_service() {
+        let (tmp, dirs) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        store.save("default", &sample_set()).unwrap();
+        let mut session = Session::with_store(dirs, "default", store).expect("session");
+        session.restore().expect("restore");
+        assert!(session.self_mri().is_none());
+
+        session.set_identity(identity());
+        assert_eq!(session.self_mri(), Some("8:orgid:aaaa"));
+        assert_eq!(session.identity().map(|i| i.oid.as_str()), Some("aaaa"));
+        let account = session.store().get_account("default").unwrap().unwrap();
+        assert_eq!(account.self_mri.as_deref(), Some("8:orgid:aaaa"));
+        assert_eq!(account.oid.as_deref(), Some("aaaa"));
+        assert_eq!(account.display_name.as_deref(), Some("Alice"));
+        assert!(account.created_at > 0, "a fresh row gets a timestamp");
+
+        // A service built after the identity is known carries the MRI.
+        let messaging = session.messaging().expect("messaging");
+        assert_eq!(messaging.self_mri().as_deref(), Some("8:orgid:aaaa"));
+
+        // Sign-out clears it.
+        session.sign_out().expect("sign out");
+        assert!(session.identity().is_none());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn restore_recovers_the_persisted_identity() {
+        let (tmp, dirs) = dirs();
+        let token_store = Arc::new(MemoryTokenStore::new());
+        token_store.save("default", &sample_set()).unwrap();
+        {
+            let mut session =
+                Session::with_store(dirs.clone(), "default", token_store.clone()).expect("session");
+            session.restore().expect("restore");
+            session.set_identity(identity());
+        }
+        // A fresh session over the same store restores the identity offline.
+        let mut session =
+            Session::with_store(dirs.clone(), "default", token_store).expect("session 2");
+        session.restore().expect("restore");
+        assert_eq!(session.self_mri(), Some("8:orgid:aaaa"));
+        assert_eq!(
+            session.identity().map(|i| i.display_name.as_str()),
+            Some("Alice")
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // ----- M4: realtime wiring ------------------------------------------------

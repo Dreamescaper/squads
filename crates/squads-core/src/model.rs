@@ -14,7 +14,7 @@
 //! [`Message::from_info`] / `From<&ost::api::MessageInfo>`.
 //! M6 adds [`Team::from_info`] / [`Channel::from_info`] /
 //! [`TeamMember::from_info`]; M7 adds [`FileEntry::from_shared`] /
-//! [`FileVersion::from_wire`].
+//! [`FileVersion::from_wire`]; M13 adds [`Identity::from_whoami`].
 //!
 //! ## Two facts you must orient on
 //!
@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use ost::api::{
     ChannelInfo, ChatInfo, FileVersion as WireFileVersion, MeetingInfo as WireMeetingInfo,
     MessageInfo, ReactionCount, Reactor as WireReactor, SharedFile as WireSharedFile, TeamInfo,
-    TeamMemberInfo,
+    TeamMemberInfo, UserInfo,
 };
 
 /// Delivery state of a message we authored (milestone **M5**).
@@ -81,6 +81,55 @@ impl SendState {
     /// Whether the message is still awaiting a server id.
     pub fn is_pending(self) -> bool {
         matches!(self, SendState::Pending)
+    }
+}
+
+// ----- identity (M13) ------------------------------------------------------
+
+/// The signed-in user's identity (milestone **M13**).
+///
+/// Resolved from Graph `/me` (`ost::api::whoami_data`) after sign-in and cached
+/// both in memory ([`Session`](crate::Session)) and in the `accounts` row
+/// (schema v8). The MRI is what [`Message::mark_own`] compares a message's
+/// sender against, so knowing it is what makes **server-loaded history and
+/// realtime messages** render on the correct side (the M5 optimistic paths set
+/// `is_own` directly, but nothing else could).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    /// Our MRI (`8:orgid:<guid>`); empty when whoami named no id.
+    pub mri: String,
+    /// Our AAD object id (the guid part of the MRI).
+    pub oid: String,
+    /// Our display name (`"User"` when Graph named none).
+    pub display_name: String,
+    /// The AAD tenant the tokens were minted against.
+    pub tenant: String,
+}
+
+impl Identity {
+    /// Build from the vendored whoami [`UserInfo`] plus the tenant.
+    ///
+    /// The MRI is derived with the vendored [`ost::api::own_member_mri`]
+    /// (`8:orgid:<oid>`); an empty id yields an empty MRI rather than a bogus
+    /// `8:orgid:` one.
+    pub fn from_whoami(info: &UserInfo, tenant: impl Into<String>) -> Self {
+        let oid = info.id.trim().to_string();
+        let mri = if oid.is_empty() {
+            String::new()
+        } else {
+            ost::api::own_member_mri(&oid)
+        };
+        Identity {
+            mri,
+            oid,
+            display_name: info.display_name.clone(),
+            tenant: tenant.into(),
+        }
+    }
+
+    /// Whether this identity carries a usable MRI.
+    pub fn has_mri(&self) -> bool {
+        !self.mri.trim().is_empty()
     }
 }
 
@@ -1338,5 +1387,56 @@ mod tests {
         let back: Meeting =
             serde_json::from_str(&serde_json::to_string(&meeting).unwrap()).unwrap();
         assert_eq!(back, meeting);
+    }
+
+    // ----- M13: identity ----------------------------------------------------
+
+    #[test]
+    fn identity_from_whoami_derives_the_mri() {
+        let info = UserInfo {
+            display_name: "Alice Smith".into(),
+            mail: Some("alice@contoso.com".into()),
+            id: "  abc-123  ".into(),
+        };
+        let identity = Identity::from_whoami(&info, "contoso.onmicrosoft.com");
+        assert_eq!(identity.mri, "8:orgid:abc-123");
+        assert_eq!(identity.oid, "abc-123");
+        assert_eq!(identity.display_name, "Alice Smith");
+        assert_eq!(identity.tenant, "contoso.onmicrosoft.com");
+        assert!(identity.has_mri());
+
+        // An empty id yields an empty MRI, never a bogus `8:orgid:`.
+        let blank = Identity::from_whoami(
+            &UserInfo {
+                display_name: "User".into(),
+                mail: None,
+                id: "   ".into(),
+            },
+            "t",
+        );
+        assert!(blank.mri.is_empty());
+        assert!(!blank.has_mri());
+    }
+
+    #[test]
+    fn identity_marks_matching_messages_own() {
+        let identity = Identity::from_whoami(
+            &UserInfo {
+                display_name: "Alice".into(),
+                mail: None,
+                id: "aaaa".into(),
+            },
+            "t",
+        );
+        let mut mine = Message::from_info("c", &message_info());
+        mine.sender_mri = "8:orgid:aaaa".into();
+        mine.mark_own(&identity.mri);
+        assert!(mine.is_own);
+
+        // A stranger's message stays `false`.
+        let mut theirs = Message::from_info("c", &message_info());
+        theirs.sender_mri = "8:orgid:zzzz".into();
+        theirs.mark_own(&identity.mri);
+        assert!(!theirs.is_own);
     }
 }

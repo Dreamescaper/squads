@@ -80,6 +80,10 @@ pub struct Messaging {
     profile: String,
     store: Arc<Store>,
     client: Arc<ApiClient>,
+    /// The signed-in user's MRI (M13), used to mark server-loaded history as
+    /// own. Initialized from the persisted `accounts` row (so a restart keeps
+    /// it) and refreshed with [`Messaging::set_self_mri`] once whoami resolves.
+    self_mri: Mutex<Option<String>>,
     /// Backward paging cursor per chat id: `Some(link)` = an older page is
     /// available; `None` = history exhausted. Absent = [`Messaging::open`] has
     /// not been called for that chat yet.
@@ -88,13 +92,50 @@ pub struct Messaging {
 
 impl Messaging {
     /// Build the service over a shared store and protocol client.
+    ///
+    /// The self MRI is seeded from the persisted identity, when one exists, so
+    /// a service built after a restart already marks own history correctly.
     pub fn new(profile: impl Into<String>, store: Arc<Store>, client: Arc<ApiClient>) -> Self {
+        let profile = profile.into();
+        let self_mri = store
+            .get_account(&profile)
+            .ok()
+            .flatten()
+            .and_then(|account| account.self_mri)
+            .filter(|mri| !mri.trim().is_empty());
         Self {
-            profile: profile.into(),
+            profile,
             store,
             client,
+            self_mri: Mutex::new(self_mri),
             cursors: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Set the self MRI the service marks own messages with (M13).
+    pub fn with_self_mri(self, self_mri: impl Into<String>) -> Self {
+        self.set_self_mri(self_mri);
+        self
+    }
+
+    /// Update the self MRI in place. Called when whoami resolves, so an
+    /// already-built handle starts marking newly-loaded messages.
+    pub fn set_self_mri(&self, self_mri: impl Into<String>) {
+        let mri = self_mri.into();
+        let mut guard = self.self_mri.lock().unwrap_or_else(|e| e.into_inner());
+        if mri.trim().is_empty() {
+            *guard = None;
+        } else {
+            *guard = Some(mri);
+        }
+    }
+
+    /// The self MRI currently known, if any.
+    pub fn self_mri(&self) -> Option<String> {
+        self.self_mri
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The account profile this service reads/writes under.
@@ -353,10 +394,21 @@ impl Messaging {
     // ----- internals ------------------------------------------------------
 
     /// Map and upsert a wire page; returns the mapped messages (oldest-first).
+    ///
+    /// Each message is marked own against the current self MRI (M13), so
+    /// server-loaded history renders on the correct side once whoami has
+    /// resolved.
     fn upsert_page(&self, chat_id: &str, infos: &[MessageInfo]) -> Result<Vec<Message>> {
+        let self_mri = self.self_mri();
         let mapped: Vec<Message> = infos
             .iter()
-            .map(|info| Message::from_info(chat_id, info))
+            .map(|info| {
+                let mut message = Message::from_info(chat_id, info);
+                if let Some(mri) = &self_mri {
+                    message.mark_own(mri);
+                }
+                message
+            })
             .collect();
         self.store.upsert_messages(&self.profile, &mapped)?;
         Ok(mapped)
@@ -476,6 +528,7 @@ impl std::fmt::Debug for Messaging {
         let cursors = self.lock_cursors().len();
         f.debug_struct("Messaging")
             .field("profile", &self.profile)
+            .field("has_self_mri", &self.self_mri().is_some())
             .field("cursors", &cursors)
             .field("store", &self.store)
             .finish_non_exhaustive()
@@ -933,5 +986,83 @@ mod tests {
         let dbg = format!("{messaging:?}");
         assert!(dbg.contains("Messaging"));
         assert!(dbg.contains("default"));
+    }
+
+    // ----- M13: own-message recognition -----------------------------------
+
+    fn two_sender_page() -> String {
+        serde_json::json!({
+            "messages": [
+                { "id": "m1", "content": "<p>mine</p>", "messagetype": "RichText/Html",
+                  "originalarrivaltime": "2026-01-01T00:00:00Z",
+                  "from": "https://teams.microsoft.com/api/v1/users/ME/contacts/8:orgid:self" },
+                { "id": "m2", "content": "<p>theirs</p>", "messagetype": "RichText/Html",
+                  "originalarrivaltime": "2026-01-02T00:00:00Z",
+                  "from": "https://teams.microsoft.com/api/v1/users/ME/contacts/8:orgid:other" }
+            ],
+            "_metadata": { "backwardLink": serde_json::Value::Null }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn server_loaded_history_marks_own_messages_once_the_mri_is_known() {
+        let chat = "19:self@unq.gbl.spaces";
+        let (base, _seen, task) = http_stub(vec![
+            StubResponse::ok(two_sender_page()),
+            StubResponse::ok(two_sender_page()),
+        ])
+        .await;
+        let (_store, messaging) = test_messaging(&base);
+
+        // Without an MRI nothing can be recognised as own.
+        assert!(messaging.self_mri().is_none());
+        let unknown = messaging.open(chat).await.expect("open");
+        assert!(
+            unknown.messages.iter().all(|m| !m.is_own),
+            "no MRI known: nothing is own"
+        );
+
+        // Once whoami has resolved, re-reading the page marks our message.
+        messaging.set_self_mri("8:orgid:self");
+        assert_eq!(messaging.self_mri().as_deref(), Some("8:orgid:self"));
+        let page = messaging.open(chat).await.expect("re-open");
+        assert_eq!(
+            page.messages.iter().map(|m| m.is_own).collect::<Vec<_>>(),
+            vec![true, false],
+            "only our message is own"
+        );
+        task.await.expect("stub drains");
+    }
+
+    #[tokio::test]
+    async fn a_bare_oid_self_mri_still_matches() {
+        let chat = "19:self@unq.gbl.spaces";
+        let (base, _seen, task) = http_stub(vec![StubResponse::ok(two_sender_page())]).await;
+        let (_store, messaging) = test_messaging(&base);
+        messaging.set_self_mri("self"); // bare OID form
+        let page = messaging.open(chat).await.expect("open");
+        assert!(page.messages[0].is_own);
+        assert!(!page.messages[1].is_own);
+        task.await.expect("stub drains");
+    }
+
+    #[test]
+    fn a_new_handle_seeds_the_self_mri_from_the_persisted_account() {
+        let (store, _messaging) = test_messaging("http://127.0.0.1:9");
+        store
+            .put_account(&crate::store::Account {
+                profile: "default".into(),
+                tenant: None,
+                personal: false,
+                display_name: None,
+                self_mri: Some("8:orgid:self".into()),
+                oid: Some("self".into()),
+                created_at: 1,
+            })
+            .unwrap();
+        let client = Arc::new(ApiClient::from_tokens(&tokens_for("http://127.0.0.1:9")));
+        let fresh = Messaging::new("default", Arc::clone(&store), client);
+        assert_eq!(fresh.self_mri().as_deref(), Some("8:orgid:self"));
     }
 }

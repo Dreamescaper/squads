@@ -23,15 +23,16 @@
 //! without running a backend task.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use squads_core::api::JoinTarget;
-use squads_core::model::{Channel, Meeting, Message, SendState};
+use squads_core::model::{Channel, Identity, Meeting, Message, SendState};
 use squads_core::{
     Accent, AppDirs, Calendar, CallIdentity, CallLogEntry, CallService, CallState, Chat,
-    ContactPresence, FileEntry, Files, IncomingCall, Messaging, NotificationContext, RealtimeEvent,
-    Session, Settings, SignInProgress, Store, Team, Teams, Theme,
+    ContactPresence, FileEntry, Files, IncomingCall, MediaCache, Messaging, NotificationContext,
+    RealtimeEvent, Session, Settings, SignInProgress, Store, Team, Teams, Theme,
 };
 
 use crate::runtime::{AppEvent, AppRuntime};
@@ -185,6 +186,11 @@ pub enum Action {
         /// DriveItem id.
         file_id: String,
     },
+    /// Fetch and cache one inline media URL (M13).
+    LoadMedia {
+        /// The image URL extracted from a message body.
+        url: String,
+    },
     /// Place an outgoing call.
     PlaceCall {
         /// Conversation/thread to call in.
@@ -245,6 +251,21 @@ struct Toast {
     error: bool,
 }
 
+/// The load state of one inline media URL (M13).
+///
+/// The conversation view renders the cached image once [`MediaState::Loaded`],
+/// a placeholder while `Loading`, and a small "unavailable" note on `Failed`.
+/// An absent entry means the URL has not been requested yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaState {
+    /// The fetch is in flight (or no cache is available, e.g. headless tests).
+    Loading,
+    /// The bytes are cached locally.
+    Loaded(PathBuf),
+    /// The fetch failed; the view shows a placeholder.
+    Failed,
+}
+
 /// Sign-in-screen state that is not derived from the session each frame.
 #[derive(Debug, Default)]
 pub(crate) struct LoginView {
@@ -275,6 +296,11 @@ pub struct SquadsApp {
     files_svc: Option<Arc<Files>>,
     calls_svc: Option<Arc<CallService>>,
     calendar_svc: Option<Arc<Calendar>>,
+    /// The inline-media cache (M13), built once signed in. `None` in headless
+    /// mode, so the view shows placeholders instead of fetching.
+    media_cache: Option<Arc<MediaCache>>,
+    /// Per-URL inline-media load state (M13), keyed by URL.
+    media: HashMap<String, MediaState>,
 
     // Session / login
     signed_in: bool,
@@ -425,6 +451,8 @@ impl SquadsApp {
             files_svc: None,
             calls_svc: None,
             calendar_svc: None,
+            media_cache: None,
+            media: HashMap::new(),
             signed_in: false,
             signing_in: false,
             login: LoginView::default(),
@@ -787,6 +815,27 @@ impl SquadsApp {
             .unwrap_or_else(|| self.dirs.media_dir())
     }
 
+    /// The load state of one inline media URL, if it has been requested (M13).
+    pub fn media_state(&self, url: &str) -> Option<MediaState> {
+        self.media.get(url).cloned()
+    }
+
+    /// Request that an inline media URL be fetched and cached (M13).
+    ///
+    /// Idempotent: a URL already known (loading/loaded/failed) is left alone.
+    /// The view only records the intent — it inserts a `Loading` placeholder and
+    /// queues [`Action::LoadMedia`], which `apply_actions` turns into the
+    /// backend fetch (ADR-026).
+    pub fn request_media(&mut self, url: &str) {
+        if self.media.contains_key(url) {
+            return;
+        }
+        self.media.insert(url.to_string(), MediaState::Loading);
+        self.push_action(Action::LoadMedia {
+            url: url.to_string(),
+        });
+    }
+
     /// The [`NotificationContext`] the app routes realtime messages with,
     /// derived from the persisted notification settings, our own MRI (decoded
     /// from the skype token when available) and the store's muted chats.
@@ -794,7 +843,11 @@ impl SquadsApp {
         let mut ctx = NotificationContext::new()
             .with_notifications_enabled(self.settings.notifications_enabled)
             .with_notify_only_mentions(self.settings.notify_only_mentions);
-        if let Some(tokens) = self.session.tokens()
+        // Prefer the whoami identity (M13); fall back to the skype JWT before
+        // whoami resolves.
+        if let Some(mri) = self.session.self_mri() {
+            ctx = ctx.with_self_mri(mri);
+        } else if let Some(tokens) = self.session.tokens()
             && let Some(identity) = CallIdentity::from_skype_token(tokens.skype_token())
         {
             ctx = ctx.with_self_mri(identity.mri);
@@ -988,6 +1041,16 @@ impl SquadsApp {
                 Err(e) => self.push_error(e),
             }
         }
+        if self.media_cache.is_none() {
+            // The inline-media cache authenticates Microsoft hosts with the
+            // skype token (M13); build it once signed in.
+            let token = self
+                .session
+                .tokens()
+                .map(|tokens| tokens.skype_token().to_string())
+                .unwrap_or_default();
+            self.media_cache = Some(Arc::new(MediaCache::new(Arc::clone(&self.dirs), token)));
+        }
     }
 
     fn on_signed_in(&mut self) {
@@ -998,6 +1061,7 @@ impl SquadsApp {
         self.reload_chats_from_store();
         self.reload_call_log_from_store();
         self.reload_meetings_from_store();
+        self.refresh_identity();
         self.refresh_chats();
         self.start_realtime();
     }
@@ -1068,7 +1132,17 @@ impl SquadsApp {
             return;
         };
         match self.store.messages(&chat_id, TIMELINE_LIMIT) {
-            Ok(messages) => self.timeline = messages,
+            Ok(mut messages) => {
+                // M13: mark own messages against the current identity, so
+                // history cached before whoami resolved still renders on the
+                // correct side.
+                if let Some(mri) = self.session.self_mri() {
+                    for message in &mut messages {
+                        message.mark_own(mri);
+                    }
+                }
+                self.timeline = messages;
+            }
             Err(e) => self.push_error(e),
         }
     }
@@ -1107,6 +1181,58 @@ impl SquadsApp {
                 Err(e) => AppEvent::Error(format!("list chats: {e}")),
             }
         });
+    }
+
+    /// Resolve the signed-in identity from Graph `/me` (M13) and deliver it as
+    /// [`AppEvent::IdentityLoaded`]. The request runs on the backend; a session
+    /// without tokens does nothing.
+    fn refresh_identity(&mut self) {
+        let Ok(client) = self.session.client() else {
+            return;
+        };
+        let tenant = self
+            .session
+            .tokens()
+            .map(|tokens| tokens.tenant().to_string())
+            .unwrap_or_default();
+        self.runtime.spawn(async move {
+            match client.whoami().await {
+                Ok(info) => AppEvent::IdentityLoaded(Identity::from_whoami(&info, tenant)),
+                Err(e) => AppEvent::Error(format!("whoami: {e}")),
+            }
+        });
+    }
+
+    /// Fetch one inline media URL into the cache (M13), publishing the local
+    /// path (or a failure) back as an [`AppEvent`]. A session with no cache
+    /// (headless/offline) leaves the placeholder in place.
+    fn load_media(&mut self, url: String) {
+        let Some(cache) = self.media_cache.clone() else {
+            return;
+        };
+        self.runtime.spawn(async move {
+            match cache.fetch(&url).await {
+                Ok(media) => AppEvent::MediaLoaded {
+                    url,
+                    path: media.path,
+                },
+                Err(e) => AppEvent::MediaFailed {
+                    url,
+                    error: e.to_string(),
+                },
+            }
+        });
+    }
+
+    /// Restart the realtime feed so its collector picks up a newly-resolved self
+    /// MRI (M13). No-op when realtime is not running.
+    fn restart_realtime(&mut self) {
+        if !self.realtime_started {
+            return;
+        }
+        self.session.stop_realtime();
+        self.realtime_started = false;
+        self.start_realtime();
     }
 
     fn select_chat(&mut self, chat_id: String) {
@@ -1486,6 +1612,27 @@ impl SquadsApp {
                     error: false,
                 });
             }
+            AppEvent::IdentityLoaded(identity) => {
+                let mri = identity.mri.clone();
+                self.session.set_identity(identity);
+                // Push the MRI into the live services so newly-loaded history is
+                // marked own, and restart realtime so its collector does too.
+                if let Some(messaging) = &self.messaging {
+                    messaging.set_self_mri(mri);
+                }
+                self.restart_realtime();
+                // Re-open the selected chat so its history is re-marked.
+                if let Some(chat_id) = self.selected_chat.clone() {
+                    self.select_chat(chat_id);
+                }
+            }
+            AppEvent::MediaLoaded { url, path } => {
+                self.media.insert(url, MediaState::Loaded(path));
+            }
+            AppEvent::MediaFailed { url, error } => {
+                tracing::debug!(%url, %error, "inline media fetch failed");
+                self.media.insert(url, MediaState::Failed);
+            }
             AppEvent::PresenceUpdated(list) => {
                 for presence in list {
                     self.presence.insert(presence.mri.clone(), presence);
@@ -1672,6 +1819,7 @@ impl SquadsApp {
             } => self.schedule_meeting(subject, start, end, time_zone),
             Action::CancelMeeting { event_id } => self.cancel_meeting(event_id),
             Action::DownloadFile { chat_id, file_id } => self.download_file(chat_id, file_id),
+            Action::LoadMedia { url } => self.load_media(url),
             Action::PlaceCall {
                 thread_id,
                 callee,
@@ -1790,6 +1938,8 @@ impl SquadsApp {
         self.files_svc = None;
         self.calls_svc = None;
         self.calendar_svc = None;
+        self.media_cache = None;
+        self.media.clear();
         self.realtime_started = false;
         self.chats.clear();
         self.timeline.clear();

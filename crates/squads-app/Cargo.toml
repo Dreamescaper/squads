@@ -15,6 +15,7 @@ path = "src/main.rs"
 squads-core.workspace = true
 egui.workspace = true
 eframe.workspace = true
+egui_extras.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true

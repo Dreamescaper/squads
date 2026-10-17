@@ -19,6 +19,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started · ⛔ blocked (see [BLO
 | M10 | egui UI | ✅ | App shell (nav rail + list + timeline + composer + info), login/teams/files/calls/settings screens, tokio runtime bridge + Action pattern, virtualized timeline, headless `egui_kittest` tests. |
 | M11 | Polish & packaging | ✅ | Pure `shortcuts` mapping + app dispatch; expanded forward-compatible `Settings` (accent, font scale, compact, notifications, download dir) + settings screen; light/dark + accents; `docs/PACKAGING.md` + `packaging/`; CI workflow; release `strip`; docs final pass (`STATUS.md`). |
 | M12 | Calendar | ✅ | Graph `calendarView` agenda/week + schedule/cancel wrappers; offline-first `Calendar` service; schema **v7** (`meetings`); join-target resolution + lobby helper; join hand-off to `CallService`; **Calendar** page + `Ctrl/Cmd+2`. |
+| M13 | Self identity + inline media | ✅ | whoami identity cached in-memory + schema **v8** (`accounts.self_mri`/`oid`); `mark_own` applied to server-loaded history and the realtime collector; `text::image_urls` + an offline-first `MediaCache`; inline images rendered in the timeline via `egui_extras`. |
 
 ---
 
@@ -1120,3 +1121,112 @@ falls back to the browser link). **B-008** (the lobby state machine is pure and
 tested, but no realtime producer drives it: call frames are filtered out of the
 M4 bus). B-007 (meeting subjects/organizer names join chat content in the
 unencrypted store).
+
+---
+
+## M13 — Self identity + inline media
+
+**Goal.** Fix two verified defects: (a) our **own** messages were only recognised
+when *we* sent them optimistically — server-loaded history and realtime pushes
+kept `is_own = false` because nothing ever obtained the signed-in user's MRI;
+and (b) **inline images/GIFs** never loaded — nothing fetched chat media and the
+timeline rendered text only. Both fixes must stay **offline and deterministic**
+to test.
+
+**Landed.**
+
+- `api` (M2 module, extended) — `ApiClient::whoami` wraps the vendored
+  `whoami_data(client) -> UserInfo` (`GET /me`), and `ApiClient::fetch_media`
+  wraps `fetch_media_data`. Two thin, tested re-exports: `own_member_mri(oid)`
+  and the media host rule `media_needs_auth` / `media_auth_headers`.
+  `UserInfo` / `MediaBytes` / `MAX_BYTES` are re-exported.
+- `model` — `Identity { mri, oid, display_name, tenant }` with
+  `Identity::from_whoami(&UserInfo, tenant)` (MRI derived via
+  `own_member_mri`; an empty id yields an empty MRI, never a bogus one).
+- `store` — **schema v8**. `accounts.self_mri` and `accounts.oid` (guarded
+  `ALTER TABLE`, existing rows default `NULL`), round-tripped by
+  `put_account` / `get_account`. `SCHEMA_VERSION = 8`; the v7→v8 migration is
+  forward-only and re-entrant.
+- `session` — `Session` caches the identity in memory and in the account row:
+  `restore()` rebuilds it from the store (offline), `set_identity()` persists it,
+  `identity()` / `self_mri()` expose it, and `client()` hands out the shared
+  `Arc<ApiClient>` so the app can spawn the whoami fetch without borrowing the
+  session across a frame. `messaging()` seeds the service with the MRI;
+  `start_realtime()` threads it into the collector.
+- `messaging` — carries the self MRI (`with_self_mri` / `set_self_mri`, seeded
+  from the persisted account so a restart keeps it) and calls
+  `Message::mark_own(self_mri)` on **every** mapped page (`open` /
+  `load_older`), so server-loaded history renders on the correct side once
+  whoami resolves.
+- `realtime` — `collect_once` / `apply_event` / `RealtimeService::start` take
+  the self MRI; a pushed `NewMessage` whose sender matches is marked own
+  **before** it is cached and published.
+- `text` — `image_urls(raw_html) -> Vec<String>` extracts `<img src=…>` tags
+  (any quoting/attribute order, case-insensitive) plus obvious image links;
+  HTML entities in the `src` are decoded while percent-encoding is preserved.
+  Pure and total (never panics), de-duplicated, first-seen order.
+- `media` (new) — the offline-first `MediaCache { dirs, token, client }`:
+  `fetch(url)` writes the bytes under `AppDirs::media_dir()` at a
+  **deterministic** path (`sha256(url)[..16]` + an image extension) and returns
+  `CachedMedia { url, path, mime, from_cache }`; a second call sees the file and
+  returns it **without a request**. The Skype token is attached **only** when
+  `media_needs_auth(url)` says the host is Microsoft's (the vendored
+  object-store vs. chat-service scheme), so it never leaks to third parties.
+  `with_client` injects the HTTP client for the local-stub tests; writes are
+  atomic (temp + rename) and capped at `MAX_BYTES`.
+- `crates/squads-app` — `egui_extras` (feature `image`) is added and its
+  loaders installed in `theme::install`; the app owns a `MediaCache` (built once
+  signed in) and a per-URL `MediaState` map; the conversation timeline renders
+  each `image_urls(message.raw)` entry as an `egui::Image` (bounded to
+  320×320) or a "Loading image…" placeholder, fetching through the existing
+  runtime/`AppEvent` bridge (`Action::LoadMedia` → `AppEvent::MediaLoaded` /
+  `MediaFailed`, repainting only when something changed — ADR-027). A new
+  `AppEvent::IdentityLoaded` sets the session identity, pushes the MRI into the
+  live services, restarts realtime and re-opens the selected chat. The app also
+  re-marks the timeline against `Session::self_mri()` on every reload, so
+  history cached before whoami resolved still renders on the own side.
+
+**Decisions.** **ADR-034** (self identity: whoami → cached identity, schema-v8
+`accounts` columns, and where `mark_own` is applied), **ADR-035** (inline media:
+`text::image_urls` + the deterministic `MediaCache` + `egui_extras` image
+loading).
+
+**Tests.** `cargo test -p squads-core` — **326** (302 from M1–M12 + **24** new:
+2 `model`, 1 `store` migration (+ the account identity round-trip folded into the
+existing test), 3 `api`, 5 `media`, 3 `messaging`, 2 `realtime`, 2 `session`,
+6 `text`). `cargo test -p squads-app` — **23** (21 from M10–M12 + **2** new: an
+own message marked/rendered from the injected identity, and an `<img>` message
+rendering a placeholder plus a queued `LoadMedia`). `cargo test -p
+squads-protocol` still passes **377**. `cargo build --workspace` (default
+features) succeeds and `cargo fmt -p squads-core -p squads-app -- --check` is
+clean. New coverage includes: `Identity::from_whoami` (MRI derivation + the
+empty-id case); `whoami` mapping against a local stub (the `GET /me` request
+line and the Graph bearer); the media host rule (Microsoft hosts authenticate,
+public/evil hosts never do); `image_urls` (multiple images, every quoting style,
+object-store srcs with no extension, obvious links vs. other links, entities +
+percent-encoding, malformed input never panics); the `MediaCache` against a
+stub (fetch writes bytes + returns the content type, a **second call makes no
+request**, an http loopback URL sends no token, a 404 caches nothing,
+deterministic extension-aware paths, redacting `Debug`); server-loaded history
+`is_own` correct once the MRI is known (and `false` when unknown, including the
+bare-OID form); a new `Messaging` handle seeding the MRI from the persisted
+account; a realtime `NewMessage` marked own (and left `false` when unknown); the
+**v7→v8 upgrade** (a hand-built v7 database gains the identity columns and an
+existing account reads/updates/reopens); `Session::set_identity` persisting and
+reaching the messaging service; and `restore` recovering the persisted identity.
+
+**How to verify manually** (real tenant; not runnable here): sign in and confirm
+`session.identity()` names your MRI (from `GET /me`); open a chat you have
+posted in and confirm your messages render on the own side (the store rows carry
+`is_own`); send yourself a message from another client and confirm the realtime
+bubble is also on the own side. Open a chat with an image/GIF and confirm it
+renders (and that `~/.cache/squads/media/` fills with hashed files, one per URL,
+with no refetch on scroll); confirm a Microsoft-hosted image loads authenticated
+while a Giphy link loads without the token.
+
+**Blockers.** **U-008** (live whoami and inline-media acceptance — the real
+`GET /me` identity and whether the real media hosts/`Content-Type`s match — is
+unverified; see B-002). **B-007** (the media cache writes fetched image bytes
+**unencrypted** into `~/.cache/squads/media/`, joining the rest of the local
+cache). B-001/B-012 (the timeline's actual pixels are verified by the headless
+`egui_kittest` placeholder test, not by a screenshot).

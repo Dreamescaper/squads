@@ -39,6 +39,9 @@
 //!   call-history API through the reverse-engineered surfaces). See ADR-025.
 //! * **v7** (M12) — `meetings`, the Graph `calendarView` cache for the calendar
 //!   agenda/week views (keyed `(id, profile)`). See ADR-033.
+//! * **v8** (M13) — `accounts.self_mri` / `accounts.oid`, the signed-in
+//!   identity that lets server-loaded history and realtime messages be marked
+//!   own. See ADR-034.
 //!
 //! ## Who writes what
 //!
@@ -80,7 +83,9 @@ use crate::model::{
 /// * **v5** (M8) — `chats.muted`, the local per-chat notification mute.
 /// * **v6** (M9) — `call_log`, the local call-history table.
 /// * **v7** (M12) — `meetings`, the Graph `calendarView` cache.
-pub const SCHEMA_VERSION: i32 = 7;
+/// * **v8** (M13) — `accounts.self_mri` / `accounts.oid`, the signed-in
+///   identity [`Message::mark_own`] needs.
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// Timeout for a busy database before `SQLITE_BUSY` is surfaced.
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -288,7 +293,9 @@ CREATE INDEX IF NOT EXISTS idx_meetings_start
 /// `profile` is the account key the rest of the core uses (see
 /// [`DEFAULT_PROFILE`](crate::auth::store::DEFAULT_PROFILE)); `tenant` and
 /// `display_name` are optional because a personal account may know neither at
-/// first write.
+/// first write. `self_mri`/`oid` (schema v8, M13) cache the signed-in identity
+/// resolved from Graph `/me`, so `mark_own` survives a restart without a fresh
+/// whoami.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     /// Account key (the token-store profile name).
@@ -299,6 +306,10 @@ pub struct Account {
     pub personal: bool,
     /// Cached display name, when known.
     pub display_name: Option<String>,
+    /// Cached own MRI (`8:orgid:<guid>`), when known (M13).
+    pub self_mri: Option<String>,
+    /// Cached AAD object id, when known (M13).
+    pub oid: Option<String>,
     /// Unix seconds when the row was first written.
     pub created_at: i64,
 }
@@ -378,17 +389,22 @@ impl Store {
     pub fn put_account(&self, account: &Account) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO accounts (profile, tenant, personal, display_name, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO accounts
+                (profile, tenant, personal, display_name, self_mri, oid, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(profile) DO UPDATE SET
                 tenant = excluded.tenant,
                 personal = excluded.personal,
-                display_name = excluded.display_name",
+                display_name = excluded.display_name,
+                self_mri = excluded.self_mri,
+                oid = excluded.oid",
             params![
                 account.profile,
                 account.tenant,
                 account.personal as i64,
                 account.display_name,
+                account.self_mri,
+                account.oid,
                 account.created_at
             ],
         )?;
@@ -400,7 +416,7 @@ impl Store {
         let conn = self.lock();
         let account = conn
             .query_row(
-                "SELECT profile, tenant, personal, display_name, created_at
+                "SELECT profile, tenant, personal, display_name, self_mri, oid, created_at
                  FROM accounts WHERE profile = ?1",
                 params![profile],
                 |row| {
@@ -409,7 +425,9 @@ impl Store {
                         tenant: row.get(1)?,
                         personal: row.get::<_, i64>(2)? != 0,
                         display_name: row.get(3)?,
-                        created_at: row.get(4)?,
+                        self_mri: row.get(4)?,
+                        oid: row.get(5)?,
+                        created_at: row.get(6)?,
                     })
                 },
             )
@@ -1485,6 +1503,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if current < 7 {
         migrate_v7(&tx)?;
     }
+    if current < 8 {
+        migrate_v8(&tx)?;
+    }
     // Record the version *after* the DDL inside the same transaction, so a
     // crash can never leave a version marker ahead of the schema.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1552,6 +1573,20 @@ fn migrate_v6(tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// re-entrant even if the version marker was reset.
 fn migrate_v7(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(MIGRATION_V7_TABLES)?;
+    Ok(())
+}
+
+/// Apply the v8 additions: the signed-in identity columns on `accounts` (M13).
+///
+/// Like the v2 `send_state` / v5 `muted` columns, `ALTER TABLE … ADD COLUMN` has
+/// no `IF NOT EXISTS`, so each probe guards re-running after a version reset.
+fn migrate_v8(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    if !column_exists(tx, "accounts", "self_mri")? {
+        tx.execute_batch("ALTER TABLE accounts ADD COLUMN self_mri TEXT;")?;
+    }
+    if !column_exists(tx, "accounts", "oid")? {
+        tx.execute_batch("ALTER TABLE accounts ADD COLUMN oid TEXT;")?;
+    }
     Ok(())
 }
 
@@ -2124,6 +2159,8 @@ mod tests {
             tenant: Some("contoso.onmicrosoft.com".into()),
             personal: false,
             display_name: Some("Alice".into()),
+            self_mri: Some("8:orgid:aaaa".into()),
+            oid: Some("aaaa".into()),
             created_at: 1_700_000_000,
         };
         store.put_account(&account).unwrap();
@@ -2137,6 +2174,9 @@ mod tests {
         let back = store.get_account("default").unwrap().unwrap();
         assert_eq!(back.display_name.as_deref(), Some("Alice Smith"));
         assert_eq!(back.created_at, 1_700_000_000, "created_at is preserved");
+        // The M13 identity columns round-trip too.
+        assert_eq!(back.self_mri.as_deref(), Some("8:orgid:aaaa"));
+        assert_eq!(back.oid.as_deref(), Some("aaaa"));
     }
 
     #[test]
@@ -2148,6 +2188,8 @@ mod tests {
                 tenant: None,
                 personal: true,
                 display_name: None,
+                self_mri: None,
+                oid: None,
                 created_at: 1,
             })
             .unwrap();
@@ -2968,6 +3010,75 @@ mod tests {
         let store = Store::open(&path).expect("reopen v7 database");
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(store.upcoming_meetings("default", 0, 10).unwrap().len(), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn v7_database_upgrades_to_v8_adding_identity_columns() {
+        let path = temp_path("v7-to-v8");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            // Build a genuine v7 database: the v1 accounts DDL (no identity
+            // columns), every later table/column, version marker 7, and an
+            // account row.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN send_state TEXT NOT NULL DEFAULT 'sent';",
+            )
+            .unwrap();
+            conn.execute_batch(MIGRATION_V2_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V3_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V4_TABLES).unwrap();
+            conn.execute_batch("ALTER TABLE chats ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;")
+                .unwrap();
+            conn.execute_batch(MIGRATION_V6_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V7_TABLES).unwrap();
+            conn.execute(
+                "INSERT INTO accounts (profile, tenant, personal, display_name, created_at)
+                 VALUES ('default','contoso.onmicrosoft.com',0,'Alice',1700000000)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 7).unwrap();
+        }
+
+        let store = Store::open(&path).expect("open the v7 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        // The v8 columns exist; the pre-existing account reads with no identity.
+        {
+            let conn = store.lock();
+            assert!(column_exists(&conn, "accounts", "self_mri").unwrap());
+            assert!(column_exists(&conn, "accounts", "oid").unwrap());
+        }
+        let account = store.get_account("default").unwrap().unwrap();
+        assert_eq!(account.display_name.as_deref(), Some("Alice"));
+        assert!(account.self_mri.is_none());
+        assert!(account.oid.is_none());
+
+        // The identity round-trips through an update.
+        let mut with_identity = account.clone();
+        with_identity.self_mri = Some("8:orgid:aaaa".into());
+        with_identity.oid = Some("aaaa".into());
+        store.put_account(&with_identity).unwrap();
+        let back = store.get_account("default").unwrap().unwrap();
+        assert_eq!(back.self_mri.as_deref(), Some("8:orgid:aaaa"));
+        assert_eq!(back.oid.as_deref(), Some("aaaa"));
+        assert_eq!(back.created_at, 1_700_000_000, "created_at is preserved");
+
+        // Reopening again is a clean no-op.
+        drop(store);
+        let store = Store::open(&path).expect("reopen v8 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            store
+                .get_account("default")
+                .unwrap()
+                .unwrap()
+                .self_mri
+                .as_deref(),
+            Some("8:orgid:aaaa")
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
