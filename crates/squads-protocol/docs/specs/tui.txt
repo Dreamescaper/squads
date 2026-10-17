@@ -1,0 +1,98 @@
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  🧀 OST Client                                        [?] Help   ◉ online   M. Ped ▼│
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│  🔍 Search channels, chats... (Ctrl+K)                                               │
+╠══════════════════╦═══════════════════════════════════════════════════════════════════╣
+║ >> TEAMS         ║  Engineering Team > #general                           ⋮  📌  ─  ║
+╠══════════════════╬═══════════════════════════════════════════════════════════════════╣
+║                  ║                                                                   ║
+║  ▼ Engineering   ║  ┌─────────────────────────────────────────────────────────────┐  ║
+║    # general  3  ║  │ 👤 Sarah Chen                                9:15 AM today │  ║
+║    # dev         ║  │                                                             │  ║
+║    # announce    ║  │ Hey team! Just pushed the new authentication module to     │  ║
+║                  ║  │ staging. Can someone help review? @Alex @Sam               │  ║
+║  ▼ Design        ║  │                                                             │  ║
+║    # general     ║  │ 📎 auth-module-v2.zip                                       │  ║
+║    # mockups  1  ║  │                                                             │  ║
+║                  ║  │ 👍 3   ❤️ 1   💬 2 replies ↓                                │  ║
+║  ▶ Marketing     ║  └─────────────────────────────────────────────────────────────┘  ║
+║  ▶ HR            ║     ↳ ┌──────────────────────────────────────────────────────┐    ║
+║                  ║       │ 👤 Alex Rivera                            9:22 AM   │    ║
+║ ── CHATS ─────── ║       │ Looks good! Found one edge case - what happens      │    ║
+║                  ║       │ when the token expires mid-session?                  │    ║
+║  👤 Dave      •  ║       └──────────────────────────────────────────────────────┘    ║
+║  👤 Eve       2  ║     ↳ ┌──────────────────────────────────────────────────────┐    ║
+║  👤 Frank        ║       │ 👤 Sarah Chen                            9:25 AM   │    ║
+║  👥 Project X    ║       │ Good catch! Added refresh handler. See a3f2d1       │    ║
+║                  ║       └──────────────────────────────────────────────────────┘    ║
+║                  ║                                                              ↓[+] ║
+║  [4 unread]   ↓  ║  ┌─────────────────────────────────────────────────────────────┐  ║
+╠══════════════════╣  │ 👤 Sam Wright                                9:45 AM today │  ║
+║ NAVIGATION       ║  │ Reminder: Sprint planning at 2pm! 📊                       │  ║
+║ ↑↓ Move          ║  │ Please update your tickets before the meeting.             │  ║
+║ ←→ Switch pane   ║  │ 👍 5   👀 2                                                │  ║
+║ Enter Select     ║  └─────────────────────────────────────────────────────────────┘  ║
+║ ? Help  q Quit   ║                                                                   ║
+╠══════════════════╩═══════════════════════════════════════════════════════════════════╣
+│ ┌──────────────────────────────────────────────────────────────────────────────────┐ │
+│ │  𝐁  𝐼  U  ~  🔗  📎  😊                                              📷  🎤  ➤ │ │
+│ ├──────────────────────────────────────────────────────────────────────────────────┤ │
+│ │ Type a message to #general...                                                    │ │
+│ └──────────────────────────────────────────────────────────────────────────────────┘ │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│ ◉ Connected to ost.example.com │ #general │ 12 members │ Tab: compose │ ?: help     │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+
+
+┌─────────────────────────────── HELP (? to close) ────────────────────────────────────┐
+│                                                                                      │
+│  NAVIGATION                          MESSAGING                                       │
+│  ──────────────────────────────────  ──────────────────────────────────────────────  │
+│  ↑/↓      Move within pane           Enter     Send message / Open thread            │
+│  ←/→      Switch between panes       Ctrl+Enter  New line in compose                 │
+│  Tab      Cycle focus forward        Esc       Cancel / Close popup                  │
+│  Shift+Tab  Cycle focus backward     Ctrl+U    Clear compose box                     │
+│  g g      Jump to top                                                                │
+│  G        Jump to bottom             ACTIONS                                         │
+│  /        Search in current view     ──────────────────────────────────────────────  │
+│  Ctrl+K   Global search              r         Reply to message                      │
+│                                      e         Edit your message                     │
+│  PANES                               d         Delete your message (confirm)         │
+│  ──────────────────────────────────  +         Add reaction                          │
+│  1        Teams/Channels pane        @         Mention user                          │
+│  2        Chat/Messages pane         Ctrl+P    Attach file                           │
+│  3        Compose pane                                                               │
+│                                      MISC                                            │
+│  VIEWS                               ──────────────────────────────────────────────  │
+│  ──────────────────────────────────  Ctrl+R    Refresh                               │
+│  F1       Activity                   Ctrl+N    New chat                              │
+│  F2       Chats                      Ctrl+T    New channel post                      │
+│  F3       Teams                      Ctrl+,    Settings                              │
+│  F4       Calendar                   q         Quit (confirm)                        │
+│  F5       Calls                      ?         Toggle this help                      │
+│                                                                                      │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│                              Press any key to close                                  │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+
+
+WIDGET FOCUS STATES:
+────────────────────
+When a widget is focused, its border changes to double-line (══) or bold,
+and the status bar shows which pane is active.
+
+Example - Teams pane focused:
+╔══════════════════╗
+║ >> TEAMS         ║  ← ">>" marker + double border indicates focus
+╠══════════════════╣
+║  ▼ Engineering   ║  ← highlighted item shown with inverse/bold
+║ ►  # general  3  ║  ← "►" shows cursor position within list
+
+Example - Compose focused:
+┌────────────────────────────────────────┐
+│ Type a message...                    │ │  ← cursor visible
+└────────────────────────────────────────┘
+  ▲ single line becomes double when focused:
+╔════════════════════════════════════════╗
+║ Type a message... █                    ║
+╚════════════════════════════════════════╝

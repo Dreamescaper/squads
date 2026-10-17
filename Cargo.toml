@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/squads-protocol",
+    "crates/squads-core",
+    "crates/squads-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Dreamescaper/squads"
+authors = ["Squads contributors"]
+
+[workspace.dependencies]
+# Internal crates
+squads-core = { path = "crates/squads-core" }
+
+# egui / eframe (immediate-mode, event-driven; glow/OpenGL backend)
+egui = "0.37"
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+
+# Async / networking
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Storage / config
+directories = "6"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# egui is immediate-mode: dependencies compiled in debug mode make layout and
+# text shaping noticeably laggy, so optimize them even in dev builds.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

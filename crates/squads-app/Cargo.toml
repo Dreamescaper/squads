@@ -1,0 +1,24 @@
+[package]
+name = "squads-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Squads — an alternative Microsoft Teams client built with Rust + egui"
+publish = false
+
+[[bin]]
+name = "squads"
+path = "src/main.rs"
+
+[dependencies]
+squads-core.workspace = true
+egui.workspace = true
+eframe.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# Headless UI testing (works without a display server).
+egui_kittest = "0.37"

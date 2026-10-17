@@ -1,6 +1,6 @@
 # Squads — High-Level Plan of Work
 
-> An alternative, cross-platform Microsoft Teams client written in **Rust + GPUI**.
+> An alternative, cross-platform Microsoft Teams client written in **Rust + egui**.
 
 ## 1. Product goal
 
@@ -11,7 +11,7 @@ Build a fast, native, cross-platform (Linux/macOS/Windows) Teams client:
 - **Files** — browse/upload/download files shared in chats and channels (OneDrive/SharePoint via Microsoft Graph).
 - **Calls** — 1:1 and group audio/video calls, screen share, call recording/transcripts (as far as the protocol allows).
 - **Presence, notifications, search.**
-- **Native GPUI UI** — chat-rail + list + timeline + composer, theming, keyboard-driven.
+- **Native egui UI** — chat-rail + list + timeline + composer, theming, keyboard-driven.
 
 Non-goals (for now): full Teams admin features, third-party app hosting (TeamsJS frames), mobile.
 
@@ -40,7 +40,7 @@ squads/
 ├── crates/
 │   ├── squads-protocol/      # vendored `ost` core (auth, api, trouter, calling, models)
 │   ├── squads-core/          # our session layer: client lifecycle, event bus, store, settings
-│   └── squads-app/           # GPUI application binary
+│   └── squads-app/           # egui application binary
 └── docs/                     # this plan + decisions/progress/blockers
 ```
 
@@ -52,7 +52,7 @@ Each milestone is an independent work item for the implementation loop: **implem
 - Convert repo to a Cargo workspace; add `squads-core` and `squads-app` crates; vendor `squads-protocol`.
 - Error types, logging/tracing, config paths, `docs/` skeleton.
 - CI task list (fmt, clippy, test, build) documented; `cargo check` green on Linux.
-- **Exit:** workspace builds; GPUI window stub launches (headless CI cannot display it).
+- **Exit:** workspace builds; egui window stub launches (headless CI cannot display it).
 
 ### M1 — Authentication
 - Device-code (RFC 8628) flow **and** browser PKCE flow.
@@ -98,11 +98,11 @@ Each milestone is an independent work item for the implementation loop: **implem
 - Audio capture/playback (cpal) and PCMU/PCMU+H.264; incoming-call handling; call recording/transcripts.
 - **Exit:** SDP parse/generate and SRTP keying tested; media loopback test where possible.
 
-### M10 — GPUI UI
+### M10 — egui UI
 - App shell: window, theming, layout (nav rail + chat list + timeline + composer + info panel).
 - Virtualized message timeline, message bubbles, avatar/image async loading, composer with attachments.
 - Login screen, teams/channels browser, files browser, call screen.
-- **Exit:** all views compile; logic covered by GPUI test contexts where feasible.
+- **Exit:** all views compile; logic covered by `egui_kittest` headless tests where feasible.
 
 ### M11 — Polish & packaging
 - Settings, keyboard shortcuts, themes, cross-platform build/packaging, docs, README.
@@ -122,7 +122,7 @@ Documentation is updated continuously:
 
 ## 5. Known constraints & risks
 
-- **Headless environment:** the GPUI window cannot be displayed here; verification is
+- **Headless environment:** the GUI window cannot be displayed here; verification is
   compile + unit tests + review. Documented in `docs/BLOCKERS.md`.
 - **No live tenant:** real auth/chat/calls cannot be exercised end-to-end without
   Microsoft credentials; network paths are built testable with fake transports.
@@ -135,7 +135,7 @@ Documentation is updated continuously:
 
 ## 6. Milestone checklist
 
-- [ ] M0 — Workspace & scaffolding
+- [x] M0 — Workspace & scaffolding
 - [ ] M1 — Authentication
 - [ ] M2 — Protocol clients & session core
 - [ ] M3 — Local persistence & offline cache
@@ -145,5 +145,5 @@ Documentation is updated continuously:
 - [ ] M7 — Files
 - [ ] M8 — Presence & notifications
 - [ ] M9 — Audio/video calls
-- [ ] M10 — GPUI UI
+- [ ] M10 — egui UI
 - [ ] M11 — Polish & packaging

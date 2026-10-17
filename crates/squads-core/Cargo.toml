@@ -1,0 +1,26 @@
+[package]
+name = "squads-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Session, storage and event layer for the Squads Teams client"
+publish = false
+
+[dependencies]
+# Vendored Teams protocol core (lib name `ost`).
+ost = { package = "squads-protocol", path = "../squads-protocol" }
+
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+directories.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
