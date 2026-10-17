@@ -4,10 +4,11 @@ Concrete build and packaging notes for Squads. The assets referenced here live
 in [`packaging/`](../packaging/); the honest state of what is actually verified
 is in [`STATUS.md`](STATUS.md).
 
-> **Scope.** These are *instructions*, not scripts. There is no CI-produced
-> installer, and none of the platform bundles below can be built or verified in
-> this headless, credential-free environment (B-001/B-002). A contributor with
-> the toolchain and a display runs them.
+> **Scope.** Sections 1–5 are *instructions* for building and packaging by hand;
+> the platform bundles below (AppImage, Flatpak, `.app`, MSI) cannot be built or
+> verified in this headless, credential-free environment (B-001/B-002). A
+> contributor with the toolchain and a display runs them. What CI **does** now
+> produce automatically is described in [section 6](#6-ci-release-artifacts).
 
 ## 0. The binary
 
@@ -188,3 +189,41 @@ Files:
 
 Uninstall removes the binary and the `.desktop`/icon; delete the config/data/
 cache directories above to remove local state.
+
+## 6. CI release artifacts
+
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) builds a
+downloadable archive per platform on **native runners** (no cross-compilation):
+
+| Runner | Target | Artifact (Actions) | Contents |
+|---|---|---|---|
+| `ubuntu-latest` | `x86_64-unknown-linux-gnu` | `squads-linux-x86_64` | `squads-<version>-linux-x86_64.tar.gz` — `squads`, `squads-cli`, `LICENSE`, `NOTICE`, `README.md`, `packaging/` (`.desktop` + icon) |
+| `macos-14` | `aarch64-apple-darwin` | `squads-macos-arm64` | `squads-macos-arm64.zip` (`Squads.app`, ad-hoc signed) + `squads-macos-arm64-cli.zip` (`squads-cli` + docs) |
+| `macos-13` | `x86_64-apple-darwin` | `squads-macos-x86_64` | same layout as `arm64` |
+| `windows-latest` | `x86_64-pc-windows-msvc` | `squads-windows-x86_64` | `squads-windows-x86_64.zip` — `squads.exe`, `squads-cli.exe`, `LICENSE`, `NOTICE`, `README.md` |
+
+**Triggers**
+
+- `push` to `main` — validates packaging and uploads artifacts (no release).
+- `push` of a `v*` tag — same, then a `release` job downloads every artifact and
+  publishes a GitHub Release with them attached.
+- `workflow_dispatch` — run on demand.
+
+**Cutting a release**
+
+```sh
+# version comes from the tag (falls back to [workspace.package].version otherwise)
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The build is `cargo build --locked --release --target <triple>` with **default
+features** (the `audio`, `video-capture`, `keyring` and `desktop-notifications`
+features stay off), so the artifacts need no ALSA/SDL2/DBus and match the state
+verified in [`STATUS.md`](STATUS.md).
+
+**Not done by CI (and why).** No signing/notarization (needs Developer ID /
+Authenticode secrets), no MSI/AppImage/Flatpak (need extra tooling and per-distro
+testing), and the macOS `.app` is only *ad-hoc* signed so it launches locally
+rather than passing Gatekeeper for distribution. Those remain manual steps in
+sections 2–4.

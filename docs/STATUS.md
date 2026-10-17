@@ -18,6 +18,12 @@ offline:
 
 `cargo build --workspace` and `cargo build --workspace --release` both succeed.
 
+**Release artifacts:** [`.github/workflows/release.yml`](../.github/workflows/release.yml)
+builds a per-platform archive on native runners — Linux `.tar.gz`, macOS `.zip`
+(`Squads.app`, ad-hoc signed, Intel + Apple Silicon) and Windows `.zip` — and
+attaches them to a GitHub Release on `v*` tags. Installers (AppImage/Flatpak/MSI)
+and real signing/notarization are still manual (B-013, `PACKAGING.md` §6).
+
 **What works (verified here, offline):** workspace + CI config; the full auth
 token model and device-code flow; the session/client facade and region routing;
 the SQLite store with migrations v1→v6; realtime decode/fan-out/write-through;
@@ -71,6 +77,7 @@ Newest last; full text in [`DECISIONS.md`](DECISIONS.md).
 - **ADR-029** — Keyboard shortcuts: a pure mapping, app-owned dispatch.
 - **ADR-030** — Settings forward-compatibility: container-level serde defaults.
 - **ADR-031** — CI scope (our crates only) and the release profile.
+- **ADR-032** — Cross-platform release artifacts on native runners.
 
 ## Open blockers (summary)
 

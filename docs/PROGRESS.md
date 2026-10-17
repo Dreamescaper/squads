@@ -995,3 +995,15 @@ squads-app -- --check` is clean.
 headless `egui_kittest` tests, not by pixels). **B-010** (notification *delivery*
 is still a log notifier; the settings switch gates routing, not a real toast).
 The mute shortcut and the attachment picker remain placeholders (B-011/B-012).
+
+### Post-M11 — cross-platform release pipeline
+
+Added [`.github/workflows/release.yml`](../.github/workflows/release.yml) (ADR-032):
+a native-runner matrix builds a downloadable archive for Linux (`.tar.gz`),
+macOS Intel + Apple Silicon (`.zip` containing an ad-hoc-signed `Squads.app`) and
+Windows (`.zip`), uploads them as Actions artifacts, and on `v*` tags publishes a
+GitHub Release with all of them attached. Builds use `--locked --release` with
+**default features**, matching the verified state. Installers
+(AppImage/Flatpak/MSI) and real signing/notarization remain manual — see
+`PACKAGING.md` §6 and B-013. Cutting a release: `git tag v0.1.0 && git push
+origin v0.1.0`.

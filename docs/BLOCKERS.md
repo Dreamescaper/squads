@@ -503,12 +503,15 @@ but three things are deliberately bounded:
    app's realtime path, but the default notifier is still a `LogNotifier`: real
    desktop toasts need the default-off `desktop-notifications` feature and a
    session bus (B-010). Quiet hours remain unimplemented.
-3. **No bundle is produced or verified.** `docs/PACKAGING.md` gives concrete
-   Linux/macOS/Windows instructions and `packaging/` holds the `.desktop` file
-   and a placeholder icon, but no AppImage/Flatpak/`.app`/MSI is built in CI —
-   that needs platform runners, a display and signing credentials this
-   environment lacks. The `strip = "symbols"` release profile and the CI
-   `cargo build --release` are the only packaging-adjacent things verified here.
+3. **Archives are built by CI; installers and signing are not.**
+   `.github/workflows/release.yml` now builds a per-platform archive on native
+   runners (Linux `.tar.gz`, macOS `.zip` with an ad-hoc-signed `Squads.app`,
+   Windows `.zip`) and attaches them to a GitHub Release on `v*` tags. What is
+   still *not* produced or verified: AppImage/Flatpak/MSI, and any real
+   signing/notarization (needs Developer ID / Authenticode secrets). The macOS
+   `.app` is only ad-hoc signed, so it runs locally but will not pass Gatekeeper
+   for distribution. See `docs/PACKAGING.md` §6. The `strip = "symbols"` release
+   profile and the CI `cargo build --release` are verified here.
 
 **Impact:** the M11 *surface* (mapping, settings, persistence, theming, docs,
 CI) is verified offline; the *features behind the placeholders* and the

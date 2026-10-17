@@ -1,0 +1,205 @@
+name: Release
+
+# Builds downloadable artifacts for Linux, macOS (Intel + Apple Silicon) and
+# Windows. Runs on version tags (and publishes a GitHub Release), and can be
+# triggered manually or on every push to main to validate the packaging.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # One binary is the app; squads-cli is the headless protocol client.
+  BIN_CRATES: "-p squads-app -p squads-protocol"
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
+            artifact: squads-linux-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            label: macos-arm64
+            artifact: squads-macos-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            label: macos-x86_64
+            artifact: squads-macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x86_64
+            artifact: squads-windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VERSION}"
+
+      # Build dependencies for the default (device-free) build:
+      #  - OpenSSL: reqwest/native-tls links the system OpenSSL on Linux only.
+      #  - X11/Wayland/GL: eframe/egui (glow). ALSA/SDL2 are NOT needed because
+      #    the `audio` / `video-capture` features are default-off (ADR-024).
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libssl-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libgl1-mesa-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (release)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "${{ matrix.target }}" ${{ env.BIN_CRATES }}
+
+      # ---------------------------------------------------------------- Linux
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="dist/squads-${{ steps.ver.outputs.version }}-${{ matrix.label }}"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/squads"        "$STAGE/"
+          cp "target/${{ matrix.target }}/release/squads-cli"    "$STAGE/"
+          cp LICENSE NOTICE README.md                            "$STAGE/"
+          mkdir -p "$STAGE/packaging"
+          cp packaging/dev.squads.squads.desktop packaging/dev.squads.squads.svg "$STAGE/packaging/"
+          tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "$(basename "$STAGE")"
+
+      # ---------------------------------------------------------------- macOS
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          REL="target/${{ matrix.target }}/release"
+          APP="dist/Squads.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$REL/squads" "$APP/Contents/MacOS/squads"
+          chmod +x "$APP/Contents/MacOS/squads"
+          cp packaging/dev.squads.squads.svg "$APP/Contents/Resources/"
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Squads</string>
+            <key>CFBundleDisplayName</key><string>Squads</string>
+            <key>CFBundleIdentifier</key><string>dev.squads.squads</string>
+            <key>CFBundleExecutable</key><string>squads</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+
+          # Ad-hoc signature so Gatekeeper allows a local run. Real distribution
+          # needs a Developer ID + notarization (see docs/PACKAGING.md).
+          codesign --force --deep --sign - "$APP" || echo "ad-hoc codesign skipped"
+
+          mkdir -p "dist/squads-${VERSION}-${{ matrix.label }}"
+          cp "$REL/squads-cli" LICENSE NOTICE README.md "dist/squads-${VERSION}-${{ matrix.label }}/"
+          # ditto preserves the bundle structure and resource forks.
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/${{ matrix.artifact }}.zip"
+          ( cd "dist/squads-${VERSION}-${{ matrix.label }}" && zip -q -r "../${{ matrix.artifact }}-cli.zip" . )
+
+      # -------------------------------------------------------------- Windows
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.ver.outputs.version }}"
+          $stage = "dist/squads-$version-${{ matrix.label }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/squads.exe"     "$stage/"
+          Copy-Item "target/${{ matrix.target }}/release/squads-cli.exe" "$stage/"
+          Copy-Item LICENSE, NOTICE, README.md                            "$stage/"
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/${{ matrix.artifact }}.zip" -Force
+
+      - name: Upload artifact (macOS/Windows archives)
+        if: runner.os != 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload artifact (Linux tarball)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -laR dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**
+          generate_release_notes: true
+          fail_on_unmatched_files: true

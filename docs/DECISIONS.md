@@ -1246,3 +1246,41 @@ profile the tests use is untouched.
 - Cross-platform bundles are *documented* (ADR/PACKAGING) but not built in CI;
   producing and signing installers needs platform runners and credentials this
   environment does not have.
+
+---
+
+## ADR-032 — Cross-platform release artifacts on native runners
+
+**Status:** accepted (post-M11)
+
+**Context.** M11 shipped packaging *instructions* but nothing downloadable: there
+was no CI job producing artifacts, so a user had to build from source on each OS.
+Cross-compiling the whole stack (egui/glow, winit, `native-tls`, bundled SQLite)
+is fragile and would still not validate the platform's own linker/signing story.
+
+**Decision.** Add `.github/workflows/release.yml` with a build matrix over
+**native runners**:
+
+- `ubuntu-latest` → `x86_64-unknown-linux-gnu` → `.tar.gz`
+- `macos-14` → `aarch64-apple-darwin` → `.zip` (`Squads.app`)
+- `macos-13` → `x86_64-apple-darwin` → `.zip` (`Squads.app`)
+- `windows-latest` → `x86_64-pc-windows-msvc` → `.zip`
+
+It builds with `cargo build --locked --release --target <triple>` using **default
+features** (so `audio`/`video-capture`/`keyring`/`desktop-notifications` stay off
+and no ALSA/SDL2/DBus is required), packages a per-platform archive that includes
+`LICENSE`/`NOTICE`, and uploads it as an Actions artifact. On `v*` tags a final
+job downloads every artifact and publishes a GitHub Release.
+
+**Consequences.**
+
+- Users get runnable archives for all three OSes without a toolchain; macOS ships
+  a real `.app` bundle (ad-hoc signed so it launches locally).
+- No signing/notarization and no AppImage/Flatpak/MSI: those need
+  Developer ID / Authenticode secrets and extra tooling, and remain manual
+  (B-013, `PACKAGING.md` §6). The macOS bundle therefore will not pass Gatekeeper
+  for distribution.
+- The matrix duplicates a per-target cache key and installs Linux system deps only
+  on Linux; Windows/macOS need none for the default feature set.
+- Releases are driven by tags (`git tag v0.1.0 && git push origin v0.1.0`); the
+  version is taken from the tag, falling back to `[workspace.package].version`.

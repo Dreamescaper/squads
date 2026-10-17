@@ -53,7 +53,7 @@ crates/
 | Notifications | Pure routing, unread/activity, settings switches | Desktop toasts (need DBus, B-010) | Quiet hours |
 | Calls | State machine, epconv signalling, SDP/SRTP/RTP, loopback, call log | Live calls + real media devices (B-011/U-006) | Hardware video (D-002) |
 | UI | egui shell + all screens, keyboard shortcuts, light/dark + accents, compact mode | Actual pixels/layout (B-012) | Attachment picker (B-012) |
-| Packaging | `cargo build --release`, `.desktop`+icon, docs | No installer is built/signed here (B-013) | AppImage/Flatpak/MSI |
+| Packaging | `cargo build --release`, `.desktop`+icon, docs; CI builds Linux/macOS/Windows archives and attaches them to `v*` releases | No installer (AppImage/Flatpak/MSI) and no real signing/notarization (B-013) | Signed/notarized bundles |
 
 The full blocker list is in [`docs/BLOCKERS.md`](docs/BLOCKERS.md).
 
