@@ -459,3 +459,30 @@ proven; the media path is exercised only offline.
 and media behind `MediaSession`; the deterministic stub tests pin the request
 shapes so a regression is caught; fix B-008 to drive the state machine from the
 wire and add a live-device media implementation.
+
+### B-012 — UI verification is wiring-only headlessly (M10)
+
+The M10 UI cannot be shown here (B-001), so it is verified by compilation, static
+review and `egui_kittest` **headless** tests (ADR-028). Those tests drive the real
+`eframe::App` through AccessKit and assert rendered labels and the app's applied
+`Action` log, but they do **not** render pixels — layout/overlap/colour/spacing
+regressions and visual polish are not caught.
+
+Two UI paths are also deliberately incomplete:
+
+- **Attachment picker is a stub.** The composer's **Attach** button queues
+  `Action::Attach`, which currently only surfaces a toast; the real file dialog
+  (and the `Files::upload` call behind it) is a follow-up. The upload *service*
+  is complete and tested (M7); only the picker UI is missing.
+- **Calls are signalling-only in the UI.** The call screen drives the real
+  `CallService` state machine, but there is no media device in this build
+  (B-011), so it says so and exposes a manual "Mark connected" step; the remote
+  answer still cannot arrive over the M4 bus (B-008).
+
+**Impact:** the UI's *behaviour* is covered; its *appearance* and the picker/live
+media are not.
+
+**Mitigation:** a developer on a machine with a display should run
+`cargo run -p squads-app` and walk the checklist in `docs/PROGRESS.md` ("M10 —
+egui UI → How to run the GUI locally"); wire the picker and real media as
+follow-ups (M11).

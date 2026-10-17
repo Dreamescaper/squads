@@ -17,9 +17,11 @@ authors = ["Squads contributors"]
 # Internal crates
 squads-core = { path = "crates/squads-core" }
 
-# egui / eframe (immediate-mode, event-driven; glow/OpenGL backend)
+# egui / eframe (immediate-mode, event-driven; glow/OpenGL backend).
+# `accesskit` is enabled so the accessibility tree is built even in the normal
+# binary (it also backs the headless `egui_kittest` UI tests).
 egui = "0.37"
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit", "wayland", "x11"] }
 
 # Async / networking
 anyhow = "1"

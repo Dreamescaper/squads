@@ -145,5 +145,5 @@ Documentation is updated continuously:
 - [x] M7 — Files
 - [x] M8 — Presence & notifications
 - [x] M9 — Audio/video calls
-- [ ] M10 — egui UI
+- [x] M10 — egui UI
 - [ ] M11 — Polish & packaging

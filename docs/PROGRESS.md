@@ -16,7 +16,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started · ⛔ blocked (see [BLO
 | M7 | Files | ✅ | Graph files wrappers + `FileEntry`/`FileVersion`/`SharedLink` model; schema **v4** (`files`); offline-first `Files` (chat/folder/recents list, coarse download progress, upload simple-PUT vs resumable, links, versions, manage); `Session::files()`. |
 | M8 | Presence & notifications | ✅ | Two presence backends (Graph + unified `presence.teams.microsoft.com`) behind one `Presence`; `text::mentions`; pure notification routing + `Notifier` (desktop behind a default-off feature); schema **v5** (`chats.muted`) + unread/activity derivation; `Session::presence()`/`notifications()`. |
 | M9 | Audio/video calls | ✅ | `calls` layer: UI `CallState` machine + `CallDirection`; injectable epconv `CallSignaller` (create→join-SDP→invite, accept→media-answer, end); SDP/SRTP/RTP offline tests; `MediaSession` seam with `LoopbackMedia` (runs `macav::call_dry_run`), real audio behind default-off `audio`/`video-capture`; `on_notification` incoming calls (B-008 noted); recording wrappers; schema **v6** `call_log`; `Session::calls()`. |
-| M10 | egui UI | ⬜ | |
+| M10 | egui UI | ✅ | App shell (nav rail + list + timeline + composer + info), login/teams/files/calls/settings screens, tokio runtime bridge + Action pattern, virtualized timeline, headless `egui_kittest` tests. |
 | M11 | Polish & packaging | ⬜ | |
 
 ---
@@ -816,3 +816,88 @@ Trouter session, not `region_gtms`; live call acceptance/recording and real
 device media cannot be exercised here). **U-006** (live acceptance of the
 signalling/recording shapes, the remote-answer transition and the actual media
 path are unverified).
+
+---
+
+## M10 — egui UI
+
+**Goal.** Turn the UI-free core into a real egui application: an app shell
+(nav rail + chat list + timeline + composer + info), the login / teams / files /
+calls / settings screens, an async runtime bridge, and headless `egui_kittest`
+tests — all compiling and testable **without a display, network or tenant**.
+
+**Landed.** `crates/squads-app/src/` was restructured from the M0 stub into:
+
+- `runtime.rs` — `AppRuntime`: owns a multi-threaded `tokio::runtime::Runtime`
+  (ADR-004) and bridges it to the UI with a `tokio::sync::mpsc` channel of
+  `AppEvent`s. `spawn(future)` runs a future that resolves to one `AppEvent` and
+  sends it back; `spawn_task(future)` runs a fire-and-forget task that publishes
+  through a cloneable `EventSender`; `drain()` returns everything pending with a
+  non-blocking `try_recv`. `EventSender::send` calls `ctx.request_repaint()`
+  once, so a background result wakes the UI without polling (ADR-027).
+- `app.rs` — `SquadsApp` holds the `Session`, the shared `Arc<Store>`, the
+  service handles (`Arc<Messaging>`/`Arc<Teams>`/`Arc<Files>`/`Arc<CallService>`,
+  built from the session once signed in), the view state (page, selection,
+  drafts, caches, toasts) and a `Vec<Action>`. `impl eframe::App`:
+  - `logic` drains `AppEvent`s (and forwards `RealtimeEvent`s from the M4 bus
+    through a spawned forwarding task), applies them, and requests a repaint
+    **only when something changed**; while a device-code sign-in runs it polls
+    `Session::poll_sign_in` on a 250 ms timer (the sign-in task reports over a
+    std channel that cannot wake the UI).
+  - `ui` composes the panels, then runs `apply_actions()` — the zapfast
+    "UI → Action → apply" pattern (ADR-026). Views never touch the network.
+- `theme.rs` — a small semantic `Palette` (own/other bubble, pending/failed,
+  presence dots, accent) plus `install(ctx)` / `apply(ctx)`; dark by default, a
+  `Settings::theme` override, re-applied on toggle and persisted.
+- `views/` — one module per screen: `login` (device-code flow, work/personal
+  toggle, user code + verification URL, errors), `shell` (top bar, nav rail,
+  list column, central page), `chat_list` (store chats with preview, time,
+  unread badge and pending/failed markers), `conversation` (a
+  `ScrollArea::show_rows` **virtualized** timeline: own/other bubbles, sender,
+  time, edited flag, reply context, reactions, `SendState` styling with a retry
+  button, and a "load older" affordance wired to `Messaging::load_older`),
+  `composer` (multiline input: **Enter sends, Shift+Enter newline**, Send
+  disabled while empty, an Attach button whose action path exists), `teams`
+  (expand a team → its channels → open a channel conversation), `files`
+  (`Files::list_chat_files` cache with size/date and a Download action),
+  `call` (place/accept/decline/end driven by `CallService` + `CallState`, the
+  local recents list, and an explicit device-not-available note), and
+  `settings` (theme toggle, profile, sign-out, version).
+- `main.rs` — boot: tracing, `AppDirs::discover()`, `Settings::load`, build the
+  app, `eframe::run_native` with the existing viewport options.
+- `tests.rs` — headless UI tests via `egui_kittest` + AccessKit
+  (`Harness::new_eframe`), built over an in-memory `Store` and a
+  `Session` on a `MemoryTokenStore` (no network, no services): the login screen
+  renders when signed out; the shell renders seeded chats and selecting one
+  shows its seeded messages; typing in the composer and pressing Enter queues a
+  send; the teams and files views render seeded rows; and switching nav sections
+  updates the page. `eframe`'s `accesskit` feature is enabled and every input
+  widget carries an AccessKit label.
+
+**Decisions.** **ADR-026** (app architecture: one tokio runtime + channel
+bridge, and the UI → Action → apply pattern), **ADR-027** (`request_repaint`
+discipline: only on an applied event, never unconditionally), **ADR-028**
+(headless UI testing via `egui_kittest` + `accesskit`).
+
+**Tests.** `cargo test -p squads-app` — 5 headless UI tests. `cargo test -p
+squads-core` still passes **281**; `cargo test -p squads-protocol` still passes
+**377**. `cargo build --workspace` (default features) is device/network-free.
+
+**How to run the GUI locally** (needs a display; not possible here — B-001):
+
+1. `cargo run -p squads-app` (binary name `squads`). It opens the login screen
+   when no credentials are stored; with no display this step fails (B-001).
+2. Press **Sign in**; AAD shows a device code + `https://microsoft.com/devicelogin`
+   in the window. Complete it and the shell appears with the cached chat list,
+   then the live list arrives.
+3. Click a chat: the timeline renders (cached instantly, then refreshed), the
+   composer sends optimistically (pending → sent; a failure keeps a retry
+   button), and the info toggle shows the side panel.
+4. Nav to **Teams** (expand a team → open a channel), **Files** (select a chat →
+   its files, Download), **Calls** (place/accept/end; recency list), and
+   **Settings** (theme toggle persists, sign-out clears the session).
+
+**Blockers.** **B-001** (the window cannot be shown or visually verified here;
+verification is compile + the `egui_kittest` tests). **B-012** (the attachment
+picker is a stub — the `Files::upload` action path exists but no file dialog
+opens; device media is absent so calls are signalling-only, B-011).

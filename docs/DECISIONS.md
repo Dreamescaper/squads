@@ -1006,3 +1006,127 @@ observe locally: a call we placed, accepted, declined or missed.
   protocol wrapper.
 - No encryption change: call participant names join chat content in the
   plaintext store (B-007).
+
+---
+
+## ADR-026 — App architecture: one tokio runtime + channel bridge, and the UI → Action → apply pattern
+
+**Status:** accepted (M10)
+
+**Context.** egui has no async executor: `eframe::App::ui` is a synchronous
+paint pass and `logic` runs even while the window is hidden. The whole core is
+async on tokio (`reqwest`, `tokio-tungstenite`, the Trouter loop). ADR-004
+already fixed the direction — the core owns a runtime and the UI drains a
+channel — but M10 had to realise it and decide how a view turns a click into a
+network call without holding a borrow of the app across an `.await` and without
+mutating shared state mid-layout.
+
+**Decision.**
+
+1. `squads-app::runtime::AppRuntime` owns a multi-threaded `tokio::runtime::Runtime`
+   and an unbounded `tokio::sync::mpsc` channel of `AppEvent`s. `spawn(future)`
+   runs a future that resolves to one `AppEvent` and sends it back;
+   `spawn_task(future)` runs a fire-and-forget task that publishes through a
+   cloneable `EventSender` (used for the realtime forwarding loop and the
+   multi-event call actions); `drain()` returns everything pending via
+   `try_recv`.
+2. The services are held as `Arc<Messaging>` / `Arc<Teams>` / `Arc<Files>` /
+   `Arc<CallService>` so a spawned future can own a handle past the frame and
+   the borrow checker is never fought: `dispatch` clones the `Arc`, moves the
+   owned arguments into the `async move` block, and returns.
+3. **UI → Action → apply** (the pattern `zapfast` documents): a view only reads
+   state through `SquadsApp` accessors and records intent with
+   `SquadsApp::push_action(Action::…)`. After the frame is drawn,
+   `apply_actions()` drains the queue, logs each action and calls `dispatch`,
+   which either mutates local view state or spawns the backend call. Views never
+   call the network and never mutate shared state beyond local widget state.
+
+**Consequences.**
+
+- One runtime per app (multi-account ready, ADR-004); the UI thread never blocks
+  and never awaits.
+- Actions are inspectable: the applied log
+  (`SquadsApp::applied_actions`) is what the headless tests assert against, so a
+  widget's contract is testable without a backend.
+- The bridge is executor-agnostic in both directions: the UI drains a channel it
+  does not block on, and background tasks only send.
+- A future multi-account UI would hold several `(Session, services)` bundles
+  behind the same bridge; nothing in `AppRuntime` assumes one account.
+
+---
+
+## ADR-027 — `request_repaint` discipline: repaint only on an applied event
+
+**Status:** accepted (M10)
+
+**Context.** ADR-006 chose egui specifically to keep idle RAM/CPU low, and made
+strict event-driven repainting an explicit design rule. Immediate-mode UIs
+redraw every frame they are asked to; a naive app calls `request_repaint()`
+every frame (or animates gratuitously) and the CPU advantage disappears. M10
+adds background work whose results arrive asynchronously, which is exactly where
+apps drift into polling.
+
+**Decision.**
+
+1. The app **never** requests a repaint unconditionally. `logic` drains the
+   event channel, and requests a repaint **only when at least one event was
+   applied** (`changed = !events.is_empty()`).
+2. When a background task publishes an `AppEvent`, `EventSender::send` calls
+   `egui::Context::request_repaint()` once. That call is conditional on there
+   being an event, so an idle backend and an idle UI both cost nothing.
+3. The one deliberate exception is a **device-code sign-in in progress**: the
+   sign-in task reports over a `std::sync::mpsc` channel that cannot wake egui,
+   so while `signing_in` the app calls `request_repaint_after(250 ms)` to poll
+   `Session::poll_sign_in`. The timer is armed only during sign-in and is
+   dropped the moment the flow reaches `Ready`/`Failed`.
+
+**Consequences.**
+
+- An idle window (signed out, or signed in with no traffic) repaints only on
+  input, so idle CPU stays ~0% — the property ADR-006 set out to protect.
+- Views must not animate for decoration; a spinner is acceptable only in a
+  genuinely transient state (the sign-in progress indicator).
+- The rule is documented at the top of `main.rs`, `runtime.rs` and `app.rs` so a
+  future contributor does not "fix" a missing repaint by adding a global timer.
+
+---
+
+## ADR-028 — Headless UI testing with `egui_kittest` + `accesskit`
+
+**Status:** accepted (M10)
+
+**Context.** This environment is headless (B-001): no display, no compositor,
+so the window can never be opened or screenshotted here. ADR-006 anticipated
+this and cited `egui_kittest` (AccessKit-driven, no display) as the mitigation.
+M10 needs to prove the screens render and respond, and the tests must be offline
+and deterministic (B-002: no tenant).
+
+**Decision.**
+
+1. Enable `eframe`'s **`accesskit`** feature (so the accessibility tree is built
+   in the normal binary too) and add `egui_kittest` with its **`eframe`** feature
+   as a dev-dependency; tests drive the real `eframe::App` through
+   `Harness::new_eframe`.
+2. Give every input widget an AccessKit label (`ui.label(...).labelled_by(...)`
+   for text fields, plain text for buttons/checkboxes), so
+   `harness.get_by_label("…")` finds it and the harness's accessibility check
+   passes.
+3. Construct the app for tests with `SquadsApp::headless(..)`: an in-memory
+   `Store` seeded directly, a `Session` on a `MemoryTokenStore`, and **no
+   services, no network tasks and no realtime**. The shell is shown whenever the
+   injected session reports `Ready`; everything rendered comes from the store.
+4. Tests interact by label (`get_by_label(..).click()`, `type_text`, `key_press`)
+   and assert either a rendered label or the app's applied-action log.
+
+**Consequences.**
+
+- The UI is exercised for real (layout, widget wiring, the Enter-to-send path)
+  without a display, and the tests are deterministic and offline.
+- The tests cover **wiring, not pixels**: they do not catch visual regressions
+  (overlap, colour, spacing). Screenshot/snapshot testing would need the `wgpu`
+  renderer and is out of scope here; manual QA remains a developer step
+  (B-001/B-012).
+- Adding a widget without a label breaks the accessibility check, which is a
+  useful forcing function for accessible UI.
+- The action log is a first-class test seam: a widget can be verified to have
+  queued the right `Action` even when the backend call itself cannot run.
