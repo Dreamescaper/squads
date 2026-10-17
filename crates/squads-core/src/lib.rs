@@ -21,6 +21,7 @@ pub mod notifications;
 pub mod paths;
 pub mod presence;
 pub mod realtime;
+pub mod search;
 pub mod session;
 pub mod settings;
 pub mod store;
@@ -41,7 +42,7 @@ pub use media::{CachedMedia, MediaCache};
 pub use messaging::{HistoryPage, Messaging};
 pub use model::{
     CallDirection, CallLogEntry, CallOutcome, Channel, Chat, FileEntry, FileVersion, Identity,
-    Meeting, Message, Reaction, Reactor, SendState, SharedLink, Team, TeamMember,
+    Meeting, Message, Reaction, Reactor, SearchHit, SendState, SharedLink, Team, TeamMember,
     is_channel_conversation_id,
 };
 pub use notifications::{
@@ -54,9 +55,10 @@ pub use presence::{
     UnifiedBackend,
 };
 pub use realtime::{EventBus, RealtimeEvent, RealtimeService};
+pub use search::{Search, escape_like, like_pattern, snippet};
 pub use session::{Session, SessionState};
 pub use settings::{Accent, Settings, Theme, WindowSettings};
-pub use store::{Account, Counts, Store};
+pub use store::{Account, Counts, SearchRow, Store};
 pub use teams::Teams;
 pub use text::{Mention, html_escape, mentions, strip_html};
 

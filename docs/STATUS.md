@@ -1,20 +1,22 @@
 # Project status — one screen
 
-> Snapshot for the **M13 (Self identity + inline media)** milestone. The detailed
+> Snapshot for the **M13 (Self identity + inline media)** milestone plus backlog
+> item **B1 (Message search)**. The detailed
 > per-milestone history is in [`PROGRESS.md`](PROGRESS.md); constraints are in
 > [`BLOCKERS.md`](BLOCKERS.md).
 
 ## Where the project is
 
-All fourteen planned milestones (**M0–M13**) are implemented. The workspace
+All fourteen planned milestones (**M0–M13**) are implemented, plus backlog item
+**B1 (message search)**. The workspace
 builds device- and network-free with default features, and the test suite passes
 offline:
 
 | Crate | Role | Tests |
 |---|---|---|
 | `squads-protocol` (vendored `ost`, lib `ost`) | protocol core (auth, api, trouter, calling) | 377 (unchanged) |
-| `squads-core` | session, store, settings, realtime, services | 326 |
-| `squads-app` (`squads` binary) | egui UI | 23 |
+| `squads-core` | session, store, settings, realtime, services | 344 |
+| `squads-app` (`squads` binary) | egui UI | 25 |
 
 `cargo build --workspace` and `cargo build --workspace --release` both succeed.
 
@@ -26,20 +28,23 @@ and real signing/notarization are still manual (B-013, `PACKAGING.md` §6).
 
 **What works (verified here, offline):** workspace + CI config; the full auth
 token model and device-code flow; the session/client facade and region routing;
-the SQLite store with migrations v1→v8; realtime decode/fan-out/write-through;
+the SQLite store with migrations v1→v9; realtime decode/fan-out/write-through;
 messaging (optimistic sends, paging, edit/delete/react/receipts); teams &
 channels; files (Graph list/upload/download/links/versions); presence and
 notification routing; call signalling/media primitives/loopback/call log; the
 calendar agenda/week view, scheduling/cancelling and the join hand-off; the
 signed-in identity (whoami → `mark_own` on server history and realtime) and the
-inline-media cache with timeline image rendering; the egui shell and every
+inline-media cache with timeline image rendering; **local-first message search**
+(schema-v9 index, `Search` service, the **Search** page and jump-to-message —
+B1); the egui shell and every
 screen; M11 keyboard shortcuts, expanded settings, light theme + accents, and
 headless UI tests.
 
 **What is unverified (needs a live tenant / devices / a display):** every
 network write shape (U-002…U-006), the calendar's live Graph acceptance and the
 browser-only join-by-id fallback (U-007), the live whoami and media-host
-acceptance (U-008), the unified presence token audience (B-009), desktop
+acceptance (U-008), the optional Graph message-search fallback (expected to 403
+— U-009), the unified presence token audience (B-009), desktop
 notifications and quiet hours (B-010), real call media (B-011), and the UI's
 actual pixels (B-012). See [`BLOCKERS.md`](BLOCKERS.md).
 
@@ -86,6 +91,7 @@ Newest last; full text in [`DECISIONS.md`](DECISIONS.md).
 - **ADR-033** — Calendar service, schema-v7 `meetings`, and the join hand-off to calls.
 - **ADR-034** — Self identity: whoami → cached identity, schema-v8 `accounts`, and where `mark_own` is applied.
 - **ADR-035** — Inline media: `text::image_urls` + a deterministic `MediaCache` + `egui_extras` image loading.
+- **ADR-036** — Message search is local-first (schema-v9 index), with the Graph server path as an optional, expected-to-403 fallback.
 
 ## Open blockers (summary)
 
@@ -98,8 +104,9 @@ media cache unencrypted), **B-008** (call frames filtered from the hub; global
 hub; reconnect token staleness), **B-009** (unified presence token unverified),
 **B-010** (desktop notifications / quiet hours), **B-011** (live calls + real
 media), **B-012** (UI verified by wiring, not pixels; attachment picker stub),
-and unverified aspects **U-001…U-008** (U-007: live calendar acceptance and the
-browser-only join-by-id fallback; U-008: live whoami and media-host acceptance).
+and unverified aspects **U-001…U-009** (U-007: live calendar acceptance and the
+browser-only join-by-id fallback; U-008: live whoami and media-host acceptance;
+U-009: the optional Graph message-search fallback, expected to 403).
 
 ## How to verify by hand
 
@@ -108,8 +115,8 @@ browser-only join-by-id fallback; U-008: live whoami and media-host acceptance).
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --workspace                 # default features, no device/network
-cargo test -p squads-core               # 326
-cargo test -p squads-app                # 23 (headless egui_kittest)
+cargo test -p squads-core               # 344
+cargo test -p squads-app                # 25 (headless egui_kittest)
 cargo test -p squads-protocol           # 377
 cargo fmt -p squads-core -p squads-app -- --check
 cargo clippy -p squads-core -p squads-app --all-targets
@@ -121,7 +128,8 @@ cargo build --workspace --release
 1. `cargo run -p squads-app` (binary `squads`); the login screen appears.
 2. Sign in (device code) and confirm the shell, chat list and timeline render.
 3. Exercise the M11 shortcuts: `Ctrl/Cmd+K` (quick switcher), `Ctrl/Cmd+F`
-   (in-conversation search), `Esc` (close/clear), `Ctrl/Cmd+,` (settings),
+   (in-conversation search), `Ctrl/Cmd+Shift+F` (search all messages — B1),
+   `Esc` (close/clear), `Ctrl/Cmd+,` (settings),
    `Ctrl/Cmd+Shift+M` (mute placeholder), `Ctrl/Cmd+1`…`5` (jump to Chats /
    Calendar / Teams / Files / Calls), `j`/`k` (chat navigation),
    `Ctrl/Cmd+Enter` (send).

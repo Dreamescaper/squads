@@ -13,7 +13,14 @@ Legend: ⬜ not started · 🟡 in progress · ✅ done · 🚫 won't do (docume
 
 ---
 
-## B1 — Message search ⬜
+## B1 — Message search ✅
+
+**Landed.** Local-first search over the cached store (`Store::search_messages` +
+`Search` service + `model::SearchHit`), a schema-v9 search index, an optional
+Graph server fallback (`ApiClient::search_messages`, expected to 403 live), and
+a `Page::Search` UI (nav rail + `Ctrl/Cmd+Shift+F`; `Ctrl/Cmd+F` keeps its
+in-conversation meaning) with click/Enter-to-jump and highlight. See ADR-036 and
+PROGRESS (B1).
 
 **Gap.** `api::search` is unused; the app can only filter chat *names* (quick
 switcher). There is no way to find a message.

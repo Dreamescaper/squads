@@ -18,7 +18,7 @@
 //!
 //! ## Schema & migrations
 //!
-//! The schema version lives in `PRAGMA user_version`; this build knows **v5**.
+//! The schema version lives in `PRAGMA user_version`; this build knows **v9**.
 //! Migrations are forward-only and re-entrant: statements are `IF NOT EXISTS`
 //! (or guarded by a schema probe, for `ALTER TABLE`), so re-running is a no-op.
 //! A database whose `user_version` is **newer** than this build understands is
@@ -42,6 +42,8 @@
 //! * **v8** (M13) — `accounts.self_mri` / `accounts.oid`, the signed-in
 //!   identity that lets server-loaded history and realtime messages be marked
 //!   own. See ADR-034.
+//! * **v9** (B1) — the `messages(profile, timestamp)` message-search index. See
+//!   ADR-036.
 //!
 //! ## Who writes what
 //!
@@ -85,7 +87,8 @@ use crate::model::{
 /// * **v7** (M12) — `meetings`, the Graph `calendarView` cache.
 /// * **v8** (M13) — `accounts.self_mri` / `accounts.oid`, the signed-in
 ///   identity [`Message::mark_own`] needs.
-pub const SCHEMA_VERSION: i32 = 8;
+/// * **v9** (B1) — `messages(profile, timestamp)`, the message-search index.
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// Timeout for a busy database before `SQLITE_BUSY` is surfaced.
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -288,6 +291,18 @@ CREATE INDEX IF NOT EXISTS idx_meetings_start
     ON meetings (profile, start);
 "#;
 
+/// v9 schema: the message-search index (backlog item **B1**). Plain
+/// `CREATE INDEX IF NOT EXISTS`, so the migration is re-entrant.
+///
+/// `messages(profile, timestamp)` lets a search filter by profile and walk rows
+/// in recency order without a temp sort. A leading-wildcard `LIKE` cannot use an
+/// index for the *match* itself, so this is a scan-support index, not a lookup
+/// one — see [`Store::search_messages`] and ADR-036.
+const MIGRATION_V9_INDEX: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_messages_profile_time
+    ON messages (profile, timestamp);
+"#;
+
 /// One local account record.
 ///
 /// `profile` is the account key the rest of the core uses (see
@@ -312,6 +327,27 @@ pub struct Account {
     pub oid: Option<String>,
     /// Unix seconds when the row was first written.
     pub created_at: i64,
+}
+
+/// One message-search hit as it comes out of the store (backlog item **B1**).
+///
+/// The store returns the raw `content` (not a snippet) and the owning
+/// `chat_id`; the [`Search`](crate::search::Search) service resolves the chat
+/// name and builds the snippet into a [`SearchHit`](crate::model::SearchHit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchRow {
+    /// Owning conversation id.
+    pub chat_id: String,
+    /// Server message id.
+    pub message_id: String,
+    /// Sender display name.
+    pub sender: String,
+    /// Plain-text message body.
+    pub content: String,
+    /// ISO-8601 arrival timestamp.
+    pub timestamp: String,
+    /// Whether the message was sent by the signed-in user.
+    pub is_own: bool,
 }
 
 /// Row counts, for diagnostics and tests.
@@ -736,6 +772,55 @@ impl Store {
             params![state.as_str(), now, message_id, chat_id, profile],
         )?;
         Ok(changed > 0)
+    }
+
+    // ----- search (B1) ----------------------------------------------------
+
+    /// Search the cached messages of `profile` for `query`, **newest first**.
+    ///
+    /// A bounded, local-first `LIKE` scan over `messages.content`: matching is
+    /// case-insensitive for ASCII (SQLite's default `LIKE` semantics), the
+    /// query's `LIKE` metacharacters (`%`, `_`, `\`) are escaped so user input
+    /// matches literally, and the results are ordered by `timestamp DESC` then
+    /// `rowid DESC` so ties are stable. `chat_id` optionally narrows the search
+    /// to one conversation. An empty/whitespace query (or `limit == 0`) returns
+    /// no rows — never "everything".
+    ///
+    /// The index added in schema **v9** (`messages(profile, timestamp)`) lets
+    /// SQLite filter by profile and walk rows in recency order; a leading-
+    /// wildcard `LIKE` still scans, which is why the cap is caller-supplied.
+    /// The snippet/chat-name shaping happens in [`crate::search`].
+    pub fn search_messages(
+        &self,
+        profile: &str,
+        query: &str,
+        chat_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SearchRow>> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let pattern = crate::search::like_pattern(trimmed);
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT chat_id, id, sender_name, content, timestamp, is_own
+             FROM messages
+             WHERE profile = ?1
+               AND content LIKE ?2 ESCAPE '\\'
+               AND (?3 IS NULL OR chat_id = ?3)
+             ORDER BY timestamp DESC, rowid DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![profile, pattern, chat_id, limit as i64],
+            row_to_search_row,
+        )?;
+        let mut hits = Vec::new();
+        for hit in rows {
+            hits.push(hit?);
+        }
+        Ok(hits)
     }
 
     // ----- read state (M5) ------------------------------------------------
@@ -1506,6 +1591,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if current < 8 {
         migrate_v8(&tx)?;
     }
+    if current < 9 {
+        migrate_v9(&tx)?;
+    }
     // Record the version *after* the DDL inside the same transaction, so a
     // crash can never leave a version marker ahead of the schema.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1590,6 +1678,15 @@ fn migrate_v8(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Apply the v9 additions: the message-search index on `messages` (B1).
+///
+/// `CREATE INDEX IF NOT EXISTS`, so the migration is re-entrant even if the
+/// version marker was reset.
+fn migrate_v9(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(MIGRATION_V9_INDEX)?;
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column` (case-insensitive).
 fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -1633,6 +1730,17 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         edited: row.get::<_, i64>(10)? != 0,
         is_own: row.get::<_, i64>(11)? != 0,
         send_state: SendState::from_db(&row.get::<_, String>(12)?),
+    })
+}
+
+fn row_to_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchRow> {
+    Ok(SearchRow {
+        chat_id: row.get(0)?,
+        message_id: row.get(1)?,
+        sender: row.get(2)?,
+        content: row.get(3)?,
+        timestamp: row.get(4)?,
+        is_own: row.get::<_, i64>(5)? != 0,
     })
 }
 
@@ -3167,5 +3275,265 @@ mod tests {
         // The Graph `start` text (no timezone, fractional seconds) still sorts
         // after an earlier UTC boundary.
         assert!("2026-09-28T09:00:00.0000000" >= iso8601_from_unix(1_790_553_600).as_str());
+    }
+
+    // ----- B1: message search ----------------------------------------------
+
+    fn search_msg(chat_id: &str, id: &str, content: &str, ts: &str) -> Message {
+        let mut m = message(id, chat_id, ts);
+        m.content = content.into();
+        m.raw = format!("<p>{content}</p>");
+        m
+    }
+
+    fn index_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            > 0
+    }
+
+    #[test]
+    fn v8_database_upgrades_to_v9_adding_the_search_index() {
+        let path = temp_path("v8-to-v9");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            // Build a genuine v8 database: v1 DDL, the v2 `send_state` column +
+            // `read_state`, v3/v4/v6/v7 tables, the v5 mute column, the v8
+            // identity columns, version marker 8, and a searchable message.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN send_state TEXT NOT NULL DEFAULT 'sent';",
+            )
+            .unwrap();
+            conn.execute_batch(MIGRATION_V2_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V3_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V4_TABLES).unwrap();
+            conn.execute_batch("ALTER TABLE chats ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;")
+                .unwrap();
+            conn.execute_batch(MIGRATION_V6_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V7_TABLES).unwrap();
+            conn.execute_batch("ALTER TABLE accounts ADD COLUMN self_mri TEXT;")
+                .unwrap();
+            conn.execute_batch("ALTER TABLE accounts ADD COLUMN oid TEXT;")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO messages
+                    (id, chat_id, profile, sender_mri, sender_name, timestamp, content,
+                     raw, reactions_json, edited, is_own, send_state, updated_at)
+                 VALUES ('m1','c1','default','8:orgid:aaaa','Alice',
+                     '2026-01-01T00:00:00Z','a needle here','<p>x</p>','[]',0,0,'sent',1)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 8).unwrap();
+        }
+
+        let store = Store::open(&path).expect("open the v8 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        // The v9 index exists ...
+        {
+            let conn = store.lock();
+            assert!(index_exists(&conn, "idx_messages_profile_time"));
+        }
+        // ... and the pre-existing row is searchable.
+        let hits = store
+            .search_messages("default", "needle", None, 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id, "m1");
+        assert_eq!(hits[0].sender, "Alice");
+
+        // Reopening again is a clean no-op.
+        drop(store);
+        let store = Store::open(&path).expect("reopen v9 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            store
+                .search_messages("default", "needle", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn search_messages_matches_case_insensitively_newest_first() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_messages(
+                "default",
+                &[
+                    search_msg("c1", "old", "Ship it", "2026-01-01T00:00:00Z"),
+                    search_msg("c2", "new", "we shipped", "2026-01-03T00:00:00Z"),
+                    search_msg("c1", "mid", "SHIPPING", "2026-01-02T00:00:00Z"),
+                    search_msg("c1", "no", "unrelated", "2026-01-04T00:00:00Z"),
+                ],
+            )
+            .unwrap();
+
+        let hits = store.search_messages("default", "ship", None, 10).unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|h| h.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new", "mid", "old"],
+            "case-insensitive, newest first"
+        );
+
+        // `limit` and the chat filter are honoured.
+        assert_eq!(
+            store
+                .search_messages("default", "ship", None, 2)
+                .unwrap()
+                .len(),
+            2
+        );
+        let c1 = store
+            .search_messages("default", "ship", Some("c1"), 10)
+            .unwrap();
+        assert_eq!(
+            c1.iter().map(|h| h.message_id.as_str()).collect::<Vec<_>>(),
+            vec!["mid", "old"]
+        );
+
+        // Profile isolation.
+        assert!(
+            store
+                .search_messages("work", "ship", None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_messages_orders_ties_by_rowid_and_escapes_wildcards() {
+        let store = Store::open_in_memory().unwrap();
+        // Identical timestamps: rowid DESC (later insert first) keeps it stable.
+        store
+            .upsert_messages(
+                "default",
+                &[
+                    search_msg("c1", "first", "tie", "2026-01-01T00:00:00Z"),
+                    search_msg("c1", "second", "tie", "2026-01-01T00:00:00Z"),
+                ],
+            )
+            .unwrap();
+        let hits = store.search_messages("default", "tie", None, 10).unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|h| h.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+
+        // `%` is a literal, not "match everything".
+        store
+            .upsert_messages(
+                "default",
+                &[
+                    search_msg("c2", "pct", "100% sure", "2026-02-01T00:00:00Z"),
+                    search_msg("c2", "plain", "no percent", "2026-02-02T00:00:00Z"),
+                ],
+            )
+            .unwrap();
+        let pct = store.search_messages("default", "%", None, 10).unwrap();
+        assert_eq!(
+            pct.iter()
+                .map(|h| h.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pct"]
+        );
+
+        // `_` matches only a literal underscore, not any single character.
+        store
+            .upsert_messages(
+                "default",
+                &[
+                    search_msg("c3", "under", "a_b", "2026-03-01T00:00:00Z"),
+                    search_msg("c3", "axb", "axb", "2026-03-02T00:00:00Z"),
+                ],
+            )
+            .unwrap();
+        let under = store.search_messages("default", "a_b", None, 10).unwrap();
+        assert_eq!(
+            under
+                .iter()
+                .map(|h| h.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["under"]
+        );
+
+        // A backslash is literal too (and cannot swallow a wildcard's escape).
+        store
+            .upsert_messages(
+                "default",
+                &[search_msg(
+                    "c4",
+                    "slash",
+                    r"path\to",
+                    "2026-04-01T00:00:00Z",
+                )],
+            )
+            .unwrap();
+        let slash = store
+            .search_messages("default", r"path\to", None, 10)
+            .unwrap();
+        assert_eq!(slash.len(), 1);
+        assert_eq!(slash[0].message_id, "slash");
+    }
+
+    #[test]
+    fn search_messages_blank_query_is_empty_and_unicode_never_panics() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_messages(
+                "default",
+                &[search_msg(
+                    "c1",
+                    "u",
+                    "café ☕ 日本語 😀",
+                    "2026-01-01T00:00:00Z",
+                )],
+            )
+            .unwrap();
+
+        // Empty/whitespace queries never mean "everything"; limit 0 is empty.
+        assert!(
+            store
+                .search_messages("default", "", None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .search_messages("default", "   ", None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .search_messages("default", "x", None, 0)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A unicode substring matches exactly.
+        let hits = store
+            .search_messages("default", "日本語", None, 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].content, "café ☕ 日本語 😀");
+        assert!(!hits[0].is_own);
+
+        // Odd queries never panic.
+        for query in ["%", "_", "\\", "😀", "café", "%%", "__", "\\\\", "a%b_c"] {
+            let _ = store.search_messages("default", query, None, 10);
+        }
     }
 }

@@ -1479,3 +1479,77 @@ from the raw body, and how bytes are fetched/cached and rendered.
   (U-008 / B-012).
 - `egui_extras`/`image` are pure-Rust decoders (png/jpeg/gif/webp/…), so the
   default build gains no system dependency.
+
+---
+
+## ADR-036 — Message search is local-first (schema-v9 index), with the Graph server path as an optional, expected-to-403 fallback
+
+**Status:** accepted (B1)
+
+**Context.** Backlog item **B1** adds message search; before it the app could
+only filter chat *names*. The vendored `ost::api::search` wraps Graph
+`POST /search/query` (entity `chatMessage`), but that route needs the
+`Chat.Read` delegated scope, which the Teams first-party sign-in token does
+**not** carry — the vendored crate's own notes flag the lane as unproven, and it
+is expected to **403** live (the same class of gap as Graph presence, ADR-021,
+and join-by-id, ADR-033). The store, however, already holds the cached history
+(`messages`), so a search that never touches the network is both possible and
+the better default.
+
+**Decision.**
+
+1. **Local-first is the primary path.** `Store::search_messages(profile, query,
+   chat_id, limit)` runs a bounded `LIKE` scan over `messages.content`, matching
+   case-insensitively (SQLite's default `LIKE`, i.e. ASCII case folding), with
+   the query's `LIKE` metacharacters escaped so user input matches literally.
+   It is ordered `timestamp DESC, rowid DESC` (newest first, ties stable), takes
+   an optional `chat_id` filter, and returns **no rows** for an
+   empty/whitespace query (never "everything").
+2. **Schema v9** adds the index `messages(profile, timestamp)` (forward-only,
+   `CREATE INDEX IF NOT EXISTS`, re-entrant; the "newer `user_version` is a hard
+   error" rule is unchanged). It lets SQLite filter by profile and walk rows in
+   recency order without a temp sort. It is a **scan-support** index, not a
+   lookup one: a leading-wildcard `LIKE` cannot use an index for the match
+   itself, so the caller supplies the result `limit`. **FTS5 is deliberately not
+   used** even though bundled SQLite ships it: `LIKE` gives the substring and
+   literal-wildcard semantics the UI wants with no tokenizer, no external-content
+   table and no write-path triggers to keep in sync, and the store is small.
+3. **`Search` service** (`squads_core::search`) holds the shared `Arc<Store>`
+   and an **optional** `Arc<ApiClient>`. `Search::local` is synchronous and
+   offline (resolves each hit's chat name and builds a snippet); `Search::server`
+   is the async Graph path; `Search::search` is local-first and only falls back
+   to the server when the local store had **no** hits, logging and swallowing a
+   server error so the feature never depends on it. The pure helpers
+   `escape_like` / `like_pattern` / `snippet` live here (unit-tested).
+4. **`model::SearchHit`** (`chat_id`, `chat_name`, `message_id`, `sender`,
+   `snippet`, `timestamp`, `is_own`) is the shared shape the local rows and the
+   mapped server hits both produce. `ApiClient::search_messages` wraps the
+   vendored call. `Session::search()` is the entry point and, unlike the other
+   services, **never fails**: a signed-out session gets a local-only handle.
+5. **App.** A `Page::Search` with a nav-rail entry and `Ctrl/Cmd+Shift+F`. The
+   M11 `Ctrl/Cmd+F` keeps its meaning (filter the open conversation); the global
+   search gets the `Shift` variant so the two are distinct. Typing runs the
+   synchronous local query (queued as `Action::SearchMessages`) and renders rows
+   (snippet, chat name, sender, time); `Up`/`Down`/`j`/`k` move the selection and
+   Enter/click queues `Action::OpenSearchHit`, which opens the chat and
+   highlights the message. If the message is outside the loaded window the app
+   pulls older pages until it appears or history is exhausted, and then says so
+   rather than silently doing nothing. Repaints happen only when something
+   changed (ADR-027); the local query is cheap.
+
+**Consequences.**
+
+- Search works **offline over cached history** and never depends on the server.
+  The Graph path is a best-effort secondary that is expected to 403 live (see
+  U-009); in practice only the local path runs.
+- The v9 index is scan-support, so a search is linear in the profile's message
+  count (bounded in *results*, not in *scan*). For very large histories an FTS5
+  index is the documented future option; the `Store` API would not change.
+- Case-insensitivity is **ASCII** (SQLite `LIKE`); a non-ASCII letter matches
+  exactly. This is documented rather than silently different from what a user
+  might expect of unicode.
+- The jump-to-message highlight pulls one older page per event; a match older
+  than the fetched chain is reported (a toast), not missed silently.
+- No encryption change: a search exposes cached content in-process only (B-007).
+- `crates/squads-protocol` is untouched; the search surface was already
+  re-exported by `ost::api`.

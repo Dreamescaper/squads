@@ -46,6 +46,7 @@ crates/
 |---|---|---|---|
 | Auth | Device-code flow, five-token model, 0600 token store, refresh | Real AAD/`authsvc` exchange | Browser PKCE loopback (B-004) |
 | Chat | Offline-first store + paging, optimistic send, edit/delete/reply/react/receipts; own messages rendered on the own side from the whoami identity | Server acceptance of the write shapes (U-002); live whoami (U-008) | — |
+| Search | Local-first message search over the cached store (case-insensitive `LIKE`, wildcard-escaped, newest-first), a **Search** page + `Ctrl/Cmd+Shift+F`, click/Enter-to-jump with the match highlighted | The optional Graph `/search/query` fallback (expected to 403 with the Teams sign-in — U-009) | FTS5 index for very large histories |
 | Inline media | `<img>`/GIF extraction, one-fetch-per-URL `MediaCache` (Skype token only on Microsoft hosts), images rendered in the timeline | Live media hosts/`Content-Type`s and rendered pixels (U-008/B-012) | Streaming; per-account cache |
 | Realtime | Trouter wrap, typed event bus, write-through | Live push; call frames are filtered upstream (B-008) | — |
 | Teams/channels | Metadata cache, channel history, thread replies, middle-tier writes | Write acceptance; channel reactions/receipts (U-003) | — |
@@ -79,7 +80,8 @@ and for AppImage/Flatpak/macOS/Windows packaging notes.
 
 ### Keyboard shortcuts
 
-`Ctrl/Cmd+K` quick chat switcher · `Ctrl/Cmd+F` search in conversation · `Esc`
+`Ctrl/Cmd+K` quick chat switcher · `Ctrl/Cmd+F` search in conversation ·
+`Ctrl/Cmd+Shift+F` search all messages · `Esc`
 close overlays / clear search · `Ctrl/Cmd+,` settings · `Ctrl/Cmd+Shift+M`
 mute (placeholder) · `Ctrl/Cmd+1`…`5` jump to Chats / Calendar / Teams / Files /
 Calls · `j`/`k` or `↓`/`↑` chat navigation · `Ctrl/Cmd+Enter` send.

@@ -602,3 +602,81 @@ fn a_message_with_an_image_renders_a_placeholder_not_only_text() {
         harness.state().applied_actions()
     );
 }
+
+// ----- B1: global message search ---------------------------------------------
+
+#[test]
+fn search_page_renders_results_and_opening_one_selects_the_chat() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+        store
+            .upsert_messages(
+                "default",
+                &[
+                    message("c1", "m1", "Alice", "hello from alice", false),
+                    message("c1", "m2", "Alice", "another hello", false),
+                ],
+            )
+            .expect("messages");
+    });
+    harness.run();
+
+    // The nav rail exposes the Search page.
+    harness.get_by_label("Search").click();
+    harness.run();
+    assert_eq!(harness.state().page(), Page::Search);
+
+    // Typing a query runs the local search and renders the matching rows.
+    harness.get_by_label("Search messages").click();
+    harness.run();
+    harness.get_by_label("Search messages").type_text("hello");
+    harness.run();
+    assert_eq!(
+        harness.state().search_results().len(),
+        2,
+        "both messages match; got {:?}",
+        harness.state().search_results()
+    );
+    harness.get_by_label("hello from alice");
+    harness.get_by_label("another hello");
+
+    // Arrow navigation moves the result selection, not the chat list.
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run();
+    assert_eq!(harness.state().search_selected(), 1);
+    assert_eq!(
+        harness.state().selected_chat(),
+        None,
+        "Up/Down on the Search page must not navigate chats"
+    );
+
+    // Selecting a row opens its chat and highlights the message.
+    harness.get_by_label("hello from alice").click();
+    harness.run();
+    assert_eq!(harness.state().page(), Page::Chats);
+    assert_eq!(harness.state().selected_chat(), Some("c1"));
+    assert_eq!(harness.state().highlight_message(), Some("m1"));
+    // The highlighted message renders its marker in the timeline.
+    harness.get_by_label("match");
+}
+
+#[test]
+fn global_search_shortcut_opens_the_search_page() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+    });
+    harness.run();
+
+    // Ctrl/Cmd+Shift+F opens the global Search page (B1); plain Ctrl/Cmd+F
+    // keeps its in-conversation meaning.
+    harness.key_press_modifiers(
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        egui::Key::F,
+    );
+    harness.run();
+    assert_eq!(harness.state().page(), Page::Search);
+}

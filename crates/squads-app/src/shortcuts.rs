@@ -30,6 +30,10 @@ pub enum Shortcut {
     QuickSwitcher,
     /// Show the in-conversation message search (`Ctrl/Cmd+F`).
     SearchInChat,
+    /// Open the global message-search page (`Ctrl/Cmd+Shift+F`) — backlog item
+    /// B1. The in-conversation filter keeps `Ctrl/Cmd+F`; the global search gets
+    /// the `Shift` variant so the two meanings stay distinct (ADR-036).
+    GlobalSearch,
     /// Close overlays and clear the active search (`Esc`).
     CloseOverlay,
     /// Jump to the settings page (`Ctrl/Cmd+,`).
@@ -54,6 +58,7 @@ impl Shortcut {
         match self {
             Shortcut::QuickSwitcher => "quick_switcher",
             Shortcut::SearchInChat => "search_in_chat",
+            Shortcut::GlobalSearch => "global_search",
             Shortcut::CloseOverlay => "close_overlay",
             Shortcut::OpenSettings => "open_settings",
             Shortcut::ToggleMute => "toggle_mute",
@@ -92,6 +97,9 @@ pub fn resolve(key: Key, modifiers: Modifiers) -> Option<Shortcut> {
         Key::M if cmd && shift => Some(Shortcut::ToggleMute),
         Key::Enter if cmd => Some(Shortcut::Send),
         Key::K if cmd => Some(Shortcut::QuickSwitcher),
+        // `Ctrl/Cmd+Shift+F` searches *all* messages; plain `Ctrl/Cmd+F` keeps
+        // its M11 meaning (filter the open conversation).
+        Key::F if cmd && shift => Some(Shortcut::GlobalSearch),
         Key::F if cmd => Some(Shortcut::SearchInChat),
         // Page slots: Ctrl/Cmd+1…5 (see `PageSlot`).
         Key::Num1 if cmd => Some(Shortcut::PageSlot(1)),
@@ -127,10 +135,14 @@ mod tests {
     }
 
     #[test]
-    fn command_shift_maps_mute_and_not_the_plain_ones() {
+    fn command_shift_maps_mute_and_global_search() {
         assert_eq!(resolve(Key::M, cmd_shift()), Some(Shortcut::ToggleMute));
         // Without shift, `M` is unbound.
         assert_eq!(resolve(Key::M, cmd()), None);
+        // `Ctrl/Cmd+Shift+F` is the global message search (B1); plain
+        // `Ctrl/Cmd+F` stays the in-conversation filter.
+        assert_eq!(resolve(Key::F, cmd_shift()), Some(Shortcut::GlobalSearch));
+        assert_eq!(resolve(Key::F, cmd()), Some(Shortcut::SearchInChat));
         // Shift does not change the other command shortcuts.
         assert_eq!(resolve(Key::K, cmd_shift()), Some(Shortcut::QuickSwitcher));
     }
@@ -174,6 +186,7 @@ mod tests {
     #[test]
     fn labels_and_placeholders() {
         assert_eq!(Shortcut::QuickSwitcher.label(), "quick_switcher");
+        assert_eq!(Shortcut::GlobalSearch.label(), "global_search");
         assert!(Shortcut::ToggleMute.is_placeholder());
         assert!(!Shortcut::Send.is_placeholder());
     }

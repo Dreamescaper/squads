@@ -174,6 +174,14 @@ fn bubble(app: &mut SquadsApp, ui: &mut Ui, message: &Message, index: usize) {
                             }
                             SendState::Sent => {}
                         }
+                        if app.highlight_message() == Some(message.id.as_str()) {
+                            ui.label(
+                                RichText::new("match")
+                                    .small()
+                                    .strong()
+                                    .color(app.palette().accent),
+                            );
+                        }
                     });
                     if let Some(parent) = &message.reply_to {
                         ui.label(RichText::new(format!("reply to {parent}")).weak().small());

@@ -98,6 +98,14 @@ pub use ost::api::{
     validate_schedule,
 };
 
+/// Protocol types and pure helpers surfaced by the **B1** server message search
+/// (Graph `/search/query`). Re-exported so `search` and the tests can pin the
+/// request/response shapes without reaching into the vendored crate.
+pub use ost::api::{
+    SEARCH_MAX_SIZE, SearchHitInfo, SearchPage, clamp_size, next_from, parse_search_response,
+    search_body,
+};
+
 use crate::auth::tokens::{StoredToken, TokenSet};
 use crate::error::Result;
 use crate::model::SharedLink;
@@ -1097,6 +1105,30 @@ impl ApiClient {
             .await?;
         tracing::debug!(len = bytes.data.len(), call, "fetched inline media");
         Ok(bytes)
+    }
+
+    // ----- B1: message search (Graph) -------------------------------------
+
+    /// Search the signed-in user's messages through Graph
+    /// (`POST /search/query`, entity `chatMessage`).
+    ///
+    /// **Optional secondary path.** This needs the `Chat.Read` delegated scope,
+    /// which the Teams first-party sign-in token does **not** carry, so it is
+    /// expected to 403 live (the vendored crate's own notes flag it as
+    /// unproven). The local-first [`Search`](crate::Search) over the cached
+    /// store is the primary path (see ADR-036); this wrapper is kept for a
+    /// suitably-scoped token and for the offline stub tests. `limit` is clamped
+    /// to Graph's `1..=25` window by the vendored call.
+    pub async fn search_messages(&self, query: &str, limit: usize) -> Result<SearchPage> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span =
+            tracing::debug_span!(target: "squads_core::api", "api.search_messages", limit, call);
+        let page = ost::api::search_messages_data(&self.client, query, 0, limit)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = page.hits.len(), call, "searched messages");
+        Ok(page)
     }
 }
 

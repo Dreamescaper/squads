@@ -41,6 +41,7 @@ use crate::notifications::{LogNotifier, Notifications, Notifier};
 use crate::paths::AppDirs;
 use crate::presence::{Presence, presence_base_from_region};
 use crate::realtime::{RealtimeEvent, RealtimeService};
+use crate::search::Search;
 use crate::store::{Account, Store};
 use crate::teams::Teams;
 
@@ -363,6 +364,26 @@ impl Session {
             Arc::clone(&self.store),
             client,
         ))
+    }
+
+    /// The B1 message-search service for this session.
+    ///
+    /// Shares the session's [`Store`] (the **local-first** path — the store
+    /// already holds the cached history) and, when a token set is loaded, the
+    /// shared [`ApiClient`] for the **optional** server fallback (Graph
+    /// `/search/query`, which is expected to 403 with the Teams sign-in — see
+    /// ADR-036).
+    ///
+    /// Unlike the other services this **never fails**: a signed-out session gets
+    /// a local-only handle, because search does not depend on the server path.
+    /// Building is offline.
+    pub fn search(&mut self) -> Search {
+        let client = self.api_arc().ok();
+        let mut service = Search::new(self.profile.clone(), Arc::clone(&self.store));
+        if let Some(client) = client {
+            service = service.with_client(client);
+        }
+        service
     }
 
     /// The M9 call service for this session.
@@ -1194,6 +1215,39 @@ mod tests {
         assert!(session.has_api());
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&tmp2).ok();
+    }
+
+    // ----- B1: message search ------------------------------------------------
+
+    #[test]
+    fn search_is_local_first_and_offline_without_tokens() {
+        let (tmp, dirs) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs, "default", store).expect("session");
+        // No tokens: the handle is still built (local-only), no network.
+        let search = session.search();
+        assert_eq!(search.profile(), "default");
+        assert!(Arc::ptr_eq(search.store(), session.store()));
+        assert!(!search.has_client(), "no tokens: local-only");
+        assert!(!session.has_api(), "search must not force a client build");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn search_attaches_the_client_when_signed_in() {
+        let (tmp, dirs) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        store.save("work", &sample_set()).unwrap();
+        let mut session = Session::with_store(dirs, "work", store).expect("session");
+        session.restore().expect("restore");
+        let search = session.search();
+        assert_eq!(search.profile(), "work");
+        assert!(
+            search.has_client(),
+            "signed in: the server fallback is available"
+        );
+        assert_eq!(search.client().unwrap().request_count(), 0);
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // ----- M13: identity -----------------------------------------------------

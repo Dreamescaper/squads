@@ -915,6 +915,35 @@ impl std::fmt::Debug for Message {
     }
 }
 
+// ----- search (B1) --------------------------------------------------------
+
+/// One message-search result (backlog item **B1**).
+///
+/// The **local-first** search ([`crate::search::Search`]) builds these from the
+/// cached [`Message`] rows in the [`Store`](crate::store::Store); the optional
+/// server fallback maps a vendored `ost::api::SearchHitInfo` into the same shape
+/// so the UI renders both identically. `snippet` is a short, plain-text excerpt
+/// centred on the match (built by [`crate::search::snippet`]); `chat_name` is
+/// resolved from the cached [`Chat`], falling back to the id when the chat is
+/// not cached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchHit {
+    /// Owning conversation id — open it to jump to the message.
+    pub chat_id: String,
+    /// Display name of the conversation (the id when the chat is not cached).
+    pub chat_name: String,
+    /// Server message id (the jump target).
+    pub message_id: String,
+    /// Sender display name.
+    pub sender: String,
+    /// Plain-text excerpt centred on the match, ellipsised when truncated.
+    pub snippet: String,
+    /// ISO-8601 arrival timestamp.
+    pub timestamp: String,
+    /// Whether the message was sent by the signed-in user.
+    pub is_own: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

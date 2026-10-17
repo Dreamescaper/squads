@@ -28,11 +28,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use squads_core::api::JoinTarget;
-use squads_core::model::{Channel, Identity, Meeting, Message, SendState};
+use squads_core::model::{Channel, Identity, Meeting, Message, SearchHit, SendState};
 use squads_core::{
     Accent, AppDirs, Calendar, CallIdentity, CallLogEntry, CallService, CallState, Chat,
     ContactPresence, FileEntry, Files, IncomingCall, MediaCache, Messaging, NotificationContext,
-    RealtimeEvent, Session, Settings, SignInProgress, Store, Team, Teams, Theme,
+    RealtimeEvent, Search, Session, Settings, SignInProgress, Store, Team, Teams, Theme,
 };
 
 use crate::runtime::{AppEvent, AppRuntime};
@@ -59,6 +59,8 @@ pub enum Page {
     Files,
     /// Calls: place/accept/end + recents.
     Calls,
+    /// Search: local-first message search (backlog item B1).
+    Search,
     /// Settings: theme, account, sign-out.
     Settings,
 }
@@ -72,19 +74,21 @@ impl Page {
             Page::Teams => "Teams",
             Page::Files => "Files",
             Page::Calls => "Calls",
+            Page::Search => "Search",
             Page::Settings => "Settings",
         }
     }
 
     /// Every page, in nav-rail order (also the `Ctrl/Cmd+1`…`5` slot order;
-    /// Settings has its own `Ctrl/Cmd+,`).
-    pub fn all() -> [Page; 6] {
+    /// Search and Settings have their own bindings).
+    pub fn all() -> [Page; 7] {
         [
             Page::Chats,
             Page::Calendar,
             Page::Teams,
             Page::Files,
             Page::Calls,
+            Page::Search,
             Page::Settings,
         ]
     }
@@ -240,6 +244,19 @@ pub enum Action {
     SendDraft,
     /// Mute/unmute — a placeholder with no media device (`Ctrl/Cmd+Shift+M`).
     ToggleMute,
+    /// Run a local-first message search for `query` (B1).
+    SearchMessages(String),
+    /// Move the search-result selection down (B1).
+    NextSearchResult,
+    /// Move the search-result selection up (B1).
+    PrevSearchResult,
+    /// Open a search result's chat and highlight the matched message (B1).
+    OpenSearchHit {
+        /// Owning conversation.
+        chat_id: String,
+        /// The matched message id.
+        message_id: String,
+    },
     /// Clear the transient toasts.
     DismissToasts,
 }
@@ -335,6 +352,18 @@ pub struct SquadsApp {
     pending: HashSet<String>,
     /// Chats whose newest cached messages include a failed send.
     failed: HashSet<String>,
+
+    /// Message search (B1): the local-first service handle (always built), the
+    /// query, the results, the selected row, whether the optional server
+    /// fallback is in flight, and a one-shot focus request for the query box.
+    search_svc: Arc<Search>,
+    search_query: String,
+    search_results: Vec<SearchHit>,
+    search_selected: usize,
+    search_loading: bool,
+    focus_search: bool,
+    /// The message id to highlight after jumping from a search result (B1).
+    highlight_message: Option<String>,
 
     teams: Vec<Team>,
     expanded_teams: HashSet<String>,
@@ -434,6 +463,10 @@ impl SquadsApp {
         let palette = theme::install(&ctx, &settings);
         let store = Arc::clone(session.store());
         let profile = session.profile().to_string();
+        // The local-first search handle is always available (even signed out);
+        // `ensure_services` attaches the client for the optional server
+        // fallback once tokens exist (B1).
+        let search_svc = Arc::new(Search::new(profile.clone(), Arc::clone(&store)));
         let runtime = AppRuntime::new()?;
         runtime.set_context(ctx.clone());
 
@@ -474,6 +507,13 @@ impl SquadsApp {
             unread: HashMap::new(),
             pending: HashSet::new(),
             failed: HashSet::new(),
+            search_svc,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_selected: 0,
+            search_loading: false,
+            focus_search: false,
+            highlight_message: None,
             teams: Vec::new(),
             expanded_teams: HashSet::new(),
             channels: HashMap::new(),
@@ -698,6 +738,43 @@ impl SquadsApp {
         &self.search
     }
 
+    // ----- B1: global message search ----------------------------------------
+
+    /// The global message-search query.
+    pub fn search_query(&self) -> &str {
+        &self.search_query
+    }
+
+    /// Mutable global message-search query (the search view edits it directly).
+    pub fn search_query_mut(&mut self) -> &mut String {
+        &mut self.search_query
+    }
+
+    /// The current search results (newest first).
+    pub fn search_results(&self) -> &[SearchHit] {
+        &self.search_results
+    }
+
+    /// The selected search-result row index.
+    pub fn search_selected(&self) -> usize {
+        self.search_selected
+    }
+
+    /// Whether the optional server search fallback is in flight.
+    pub fn search_loading(&self) -> bool {
+        self.search_loading
+    }
+
+    /// Take the one-shot search-box focus request.
+    pub fn take_search_focus(&mut self) -> bool {
+        std::mem::take(&mut self.focus_search)
+    }
+
+    /// The message id to highlight after jumping from a search result, if any.
+    pub fn highlight_message(&self) -> Option<&str> {
+        self.highlight_message.as_deref()
+    }
+
     /// Whether a sign-in flow is currently running.
     pub fn signing_in(&self) -> bool {
         self.signing_in
@@ -895,10 +972,27 @@ impl SquadsApp {
                 .collect()
         });
         let text_focused = ctx.egui_wants_keyboard_input();
+        let on_search = self.page == Page::Search;
         for (key, modifiers) in events {
             let Some(shortcut) = shortcuts::resolve(key, modifiers) else {
                 continue;
             };
+            // On the Search page the plain navigation keys move the *result*
+            // selection, not the chat list — even while the query box is
+            // focused (a single-line field has no use for Up/Down) (B1).
+            if on_search {
+                match shortcut {
+                    Shortcut::NextChat => {
+                        self.push_action(Action::NextSearchResult);
+                        continue;
+                    }
+                    Shortcut::PrevChat => {
+                        self.push_action(Action::PrevSearchResult);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             if text_focused
                 && matches!(
                     shortcut,
@@ -922,6 +1016,7 @@ impl SquadsApp {
         match shortcut {
             Shortcut::QuickSwitcher => self.push_action(Action::ToggleQuickSwitcher),
             Shortcut::SearchInChat => self.push_action(Action::FocusTimelineSearch),
+            Shortcut::GlobalSearch => self.push_action(Action::SetPage(Page::Search)),
             Shortcut::CloseOverlay => self.push_action(Action::CloseOverlays),
             Shortcut::OpenSettings => self.push_action(Action::OpenSettings),
             Shortcut::ToggleMute => self.push_action(Action::ToggleMute),
@@ -954,6 +1049,79 @@ impl SquadsApp {
         };
         let id = self.chats[next].id.clone();
         self.push_action(Action::SelectChat(id));
+    }
+
+    // ----- B1: global message search ----------------------------------------
+
+    /// Run the local-first search for `query`, then (only when the local store
+    /// had no hits and a client is attached) kick off the optional server
+    /// fallback. The store query is synchronous and cheap, so the local results
+    /// are ready in this frame; the server answer arrives as
+    /// [`AppEvent::SearchResults`] and repaints only then (ADR-027).
+    fn run_search(&mut self, query: String) {
+        self.search_query = query;
+        self.search_selected = 0;
+        self.search_loading = false;
+        let trimmed = self.search_query.trim().to_string();
+        match self
+            .search_svc
+            .local(&trimmed, None, squads_core::search::SEARCH_LIMIT)
+        {
+            Ok(hits) => self.search_results = hits,
+            Err(e) => {
+                self.push_error(e);
+                self.search_results.clear();
+            }
+        }
+        if self.search_results.is_empty() && !trimmed.is_empty() && self.search_svc.has_client() {
+            let search = Arc::clone(&self.search_svc);
+            self.search_loading = true;
+            self.runtime.spawn(async move {
+                let hits = search
+                    .server(&trimmed, squads_core::search::SEARCH_LIMIT)
+                    .await
+                    .unwrap_or_default();
+                AppEvent::SearchResults {
+                    query: trimmed,
+                    hits,
+                }
+            });
+        }
+    }
+
+    /// Move the search-result selection by `delta`, clamped to the list.
+    fn select_relative_result(&mut self, delta: i32) {
+        if self.search_results.is_empty() {
+            return;
+        }
+        let len = self.search_results.len() as i32;
+        let next = (self.search_selected as i32 + delta).clamp(0, len - 1) as usize;
+        self.search_selected = next;
+    }
+
+    /// After a jump from a search result, make sure the matched message is in
+    /// the loaded timeline: if it is not, pull older pages until it appears or
+    /// history is exhausted — and, when exhausted, say so rather than silently
+    /// doing nothing (B1).
+    fn resolve_highlight(&mut self) {
+        let Some(message_id) = self.highlight_message.clone() else {
+            return;
+        };
+        if self.timeline.iter().any(|message| message.id == message_id) {
+            return;
+        }
+        if self.has_older {
+            if let Some(chat_id) = self.selected_chat.clone() {
+                self.load_older(chat_id);
+            }
+            return;
+        }
+        // Not cached and no older page to fetch: document the limitation.
+        self.highlight_message = None;
+        self.toasts.push(Toast {
+            text: "The matched message is outside the cached history window.".into(),
+            error: false,
+        });
     }
 
     /// Re-install the theme from the current settings (after a preference
@@ -1050,6 +1218,14 @@ impl SquadsApp {
                 .map(|tokens| tokens.skype_token().to_string())
                 .unwrap_or_default();
             self.media_cache = Some(Arc::new(MediaCache::new(Arc::clone(&self.dirs), token)));
+        }
+        // Attach the protocol client to the local-first search handle so its
+        // optional server fallback is available (B1). The store-only handle is
+        // fine when signed out.
+        if let Ok(client) = self.session.client() {
+            self.search_svc = Arc::new(
+                Search::new(self.profile.clone(), Arc::clone(&self.store)).with_client(client),
+            );
         }
     }
 
@@ -1532,6 +1708,8 @@ impl SquadsApp {
                         .as_ref()
                         .map(|m| m.cursor(&chat_id).is_some())
                         .unwrap_or(false);
+                    // A search jump may need older pages (B1).
+                    self.resolve_highlight();
                 }
                 self.reload_chats_from_store();
             }
@@ -1546,6 +1724,8 @@ impl SquadsApp {
                 if self.selected_chat.as_deref() == Some(chat_id.as_str()) {
                     self.reload_timeline();
                     self.has_older = has_more;
+                    // Keep pulling until the search jump target is found (B1).
+                    self.resolve_highlight();
                 }
             }
             AppEvent::TeamsLoaded(teams) => {
@@ -1632,6 +1812,17 @@ impl SquadsApp {
             AppEvent::MediaFailed { url, error } => {
                 tracing::debug!(%url, %error, "inline media fetch failed");
                 self.media.insert(url, MediaState::Failed);
+            }
+            AppEvent::SearchResults { query, hits } => {
+                // Ignore a stale response for a query the user has since
+                // changed; either way the loading flag is cleared (B1).
+                if self.search_query.trim() == query.trim() {
+                    self.search_results = hits;
+                    self.search_selected = self
+                        .search_selected
+                        .min(self.search_results.len().saturating_sub(1));
+                }
+                self.search_loading = false;
             }
             AppEvent::PresenceUpdated(list) => {
                 for presence in list {
@@ -1780,10 +1971,16 @@ impl SquadsApp {
                     Page::Calls => {
                         self.reload_call_log_from_store();
                     }
+                    Page::Search => {
+                        // Focus the query box so the user can type immediately.
+                        self.focus_search = true;
+                    }
                     _ => {}
                 }
             }
             Action::SelectChat(chat_id) => {
+                // A manual selection clears any search jump highlight.
+                self.highlight_message = None;
                 self.select_chat(chat_id);
                 self.page = Page::Chats;
             }
@@ -1896,6 +2093,12 @@ impl SquadsApp {
                 self.timeline_search_open = false;
                 self.timeline_filter.clear();
                 self.search.clear();
+                // Also clear the global message search (B1).
+                self.search_query.clear();
+                self.search_results.clear();
+                self.search_selected = 0;
+                self.search_loading = false;
+                self.highlight_message = None;
                 self.show_info = false;
             }
             Action::OpenSettings => self.dispatch(Action::SetPage(Page::Settings)),
@@ -1921,6 +2124,17 @@ impl SquadsApp {
                     },
                     error: false,
                 });
+            }
+            Action::SearchMessages(query) => self.run_search(query),
+            Action::NextSearchResult => self.select_relative_result(1),
+            Action::PrevSearchResult => self.select_relative_result(-1),
+            Action::OpenSearchHit {
+                chat_id,
+                message_id,
+            } => {
+                self.select_chat(chat_id);
+                self.page = Page::Chats;
+                self.highlight_message = Some(message_id);
             }
             Action::DismissToasts => self.toasts.clear(),
         }
@@ -1958,6 +2172,14 @@ impl SquadsApp {
         self.join_passcode.clear();
         self.call_state = CallState::Idle;
         self.incoming = None;
+        // Drop the search client (the handle is local-only until the next
+        // sign-in) and any results (B1).
+        self.search_svc = Arc::new(Search::new(self.profile.clone(), Arc::clone(&self.store)));
+        self.search_query.clear();
+        self.search_results.clear();
+        self.search_selected = 0;
+        self.search_loading = false;
+        self.highlight_message = None;
         self.page = Page::Chats;
     }
 }

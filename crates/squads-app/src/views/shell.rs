@@ -62,6 +62,7 @@ pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
             views::files::show(app, ui);
         }
         Page::Calls => views::call::show(app, ui),
+        Page::Search => views::search::show(app, ui),
         Page::Settings => views::settings::show(app, ui),
     }
 }

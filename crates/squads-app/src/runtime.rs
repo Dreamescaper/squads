@@ -27,7 +27,7 @@ use tokio::runtime::{Handle, Runtime};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use squads_core::api::JoinTarget;
-use squads_core::model::{CallLogEntry, Chat, FileEntry, Meeting, Message, Team};
+use squads_core::model::{CallLogEntry, Chat, FileEntry, Meeting, Message, SearchHit, Team};
 use squads_core::{CallState, Channel, ContactPresence, Identity, RealtimeEvent, SignInProgress};
 
 /// Everything the backend can tell the UI about.
@@ -98,6 +98,15 @@ pub enum AppEvent {
         /// A short, token-free reason.
         error: String,
     },
+    /// The **optional** server message search returned (B1). The app only uses
+    /// this when the local store had no hits; `query` guards against a stale
+    /// response landing after the user changed the query.
+    SearchResults {
+        /// The query these hits answer.
+        query: String,
+        /// The mapped hits (possibly empty).
+        hits: Vec<SearchHit>,
+    },
     /// Batch presence for a set of contacts. No producer is wired yet (the M11
     /// presence panel will emit it); the variant is part of the event vocabulary.
     #[allow(dead_code)]
@@ -132,6 +141,7 @@ impl AppEvent {
             AppEvent::IdentityLoaded(_) => "identity_loaded",
             AppEvent::MediaLoaded { .. } => "media_loaded",
             AppEvent::MediaFailed { .. } => "media_failed",
+            AppEvent::SearchResults { .. } => "search_results",
             AppEvent::PresenceUpdated(_) => "presence_updated",
             AppEvent::Realtime(_) => "realtime",
             AppEvent::CallState(_) => "call_state",

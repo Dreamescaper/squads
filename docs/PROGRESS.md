@@ -1230,3 +1230,79 @@ unverified; see B-002). **B-007** (the media cache writes fetched image bytes
 **unencrypted** into `~/.cache/squads/media/`, joining the rest of the local
 cache). B-001/B-012 (the timeline's actual pixels are verified by the headless
 `egui_kittest` placeholder test, not by a screenshot).
+
+---
+
+## B1 — Message search
+
+**Goal.** Let the user find a **message**, not just a chat name: a **local-first**
+search over the cached history (the vendored Graph `/search/query` needs
+`Chat.Read`, which the Teams sign-in token does not carry, so server search is
+expected to 403 live and must not be required), with a `Page::Search` UI, a jump
+to the matched message, and offline tests throughout.
+
+**Landed.**
+
+- `store` — **schema v9**. `Store::search_messages(profile, query, chat_id,
+  limit) -> Result<Vec<SearchRow>>`: a bounded `LIKE` scan over `messages.content`
+  (case-insensitive — SQLite's default `LIKE` — with `%`/`_`/`\` escaped via
+  `crate::search::like_pattern`), ordered `timestamp DESC, rowid DESC`, with an
+  optional `chat_id` filter. An empty/whitespace query (or `limit == 0`) returns
+  no rows. The v9 migration adds the index `messages(profile, timestamp)`
+  (`CREATE INDEX IF NOT EXISTS`, re-entrant; a newer `user_version` is still a
+  hard error). **FTS5 is deliberately not used** — `LIKE` gives the substring +
+  literal-wildcard semantics the UI wants with no tokenizer/triggers, and the
+  store is small (see ADR-036).
+- `search` (new) — the local-first `Search { profile, Arc<Store>,
+  Option<Arc<ApiClient>> }`: `local` (sync, offline, primary — resolves the chat
+  name and builds a snippet), `server` (async, Graph `/search/query`),
+  `search` (local-first; falls back to the server only when local is empty and
+  logs/swallows a server error). Pure helpers `escape_like`, `like_pattern` and
+  `snippet(content, query, max_len)` (≈120 chars centred on the match,
+  ellipsised, unicode-safe) live here. `Debug` is redacting.
+- `model` — `SearchHit { chat_id, chat_name, message_id, sender, snippet,
+  timestamp, is_own }`, the shared shape for local and mapped server hits.
+- `api` — `ApiClient::search_messages(query, limit)` wraps the vendored
+  `search_messages_data`; the search types/pure helpers (`SearchHitInfo`,
+  `SearchPage`, `SEARCH_MAX_SIZE`, `clamp_size`, `next_from`, `search_body`,
+  `parse_search_response`) are re-exported.
+- `session` — `Session::search()` mirrors the other services but **never fails**:
+  it shares the store and, when tokens are loaded, the shared `Arc<ApiClient>`;
+  a signed-out session gets a local-only handle.
+- `crates/squads-app` — a **Search** page: `Page::Search` (nav rail, after
+  Calls), the `Ctrl/Cmd+Shift+F` binding (plain `Ctrl/Cmd+F` keeps its M11
+  in-conversation meaning), a query box, a result list (snippet, chat name,
+  sender, time) with the selected row highlighted, `Up`/`Down`/`j`/`k`
+  selection, and Enter/click → `Action::OpenSearchHit`, which opens the chat and
+  highlights the message (`Action::SearchMessages` / `NextSearchResult` /
+  `PrevSearchResult`; `AppEvent::SearchResults` for the optional server
+  fallback). If the matched message is outside the loaded window the app pulls
+  older pages until it appears or history is exhausted, then says so; repaints
+  only when something changed (ADR-027).
+
+**Decisions.** **ADR-036** (local-first search, the schema-v9 index and why not
+FTS5, and the optional Graph server fallback + the `Chat.Read` limitation).
+
+**Tests.** `cargo test -p squads-core` — **344** (326 from M1–M13 + **18** new: 4
+`store` (v8→v9 migration, case-insensitivity/order/limit/chat-filter, wildcard
+escaping + rowid ties, blank-query/unicode), 12 `search` (escape/pattern, the
+snippet cases, the local service, the server wrapper against a stub, the
+local-first fallback, no-client), 2 `session`). `cargo
+test -p squads-app` — **25** (23 from M10–M13 + **2** new: the Search page renders
+results, ArrowDown moves the selection without navigating chats, and selecting a
+row opens the chat + highlights the message; and `Ctrl/Cmd+Shift+F` opens the
+Search page). `cargo test -p squads-protocol` still passes **377**. `cargo build
+--workspace` (default features) succeeds and `cargo fmt -p squads-core -p
+squads-app -- --check` is clean.
+
+**How to verify manually** (real tenant; not runnable here): sign in, browse a
+few chats so the store is populated, press `Ctrl/Cmd+Shift+F` (or the **Search**
+nav entry), type a word and confirm matching messages render with their chat and
+sender; click a result and confirm the chat opens with the message highlighted
+(and that a very old match triggers "load older" until it appears, or the
+"outside the cached history window" note). The server fallback (Graph
+`/search/query`) is expected to 403 live — see U-009.
+
+**Blockers.** **U-009** (the live Graph `/search/query` acceptance is unverified
+and expected to 403 with the Teams sign-in; the local path is the supported one).
+B-007 (a snippet exposes cached content in-process only; nothing new is written).

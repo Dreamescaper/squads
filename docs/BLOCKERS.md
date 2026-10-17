@@ -591,3 +591,35 @@ vendored crate + stubs, not proven against Teams.
 contained; the deterministic stub tests pin the request shapes and the cache-hit
 property; the media host rule is the vendored one, so a scheme change comes from
 upstream.
+
+### U-009 — B1 server message search is unverified (and expected to 403 live)
+
+B1's **local-first** search over the cached store is fully tested offline (the
+`LIKE` scan, the escaping, the ordering/limit/chat filter, the snippet helpers,
+the schema-v9 migration, and the Search page through `egui_kittest`). The
+**optional server fallback** is a thin wrapper over the vendored
+`search_messages_data` (Graph `POST /search/query`, entity `chatMessage`), tested
+offline against a local TCP stub (request line + `entityTypes`/`queryString`
+body + the mapped `SearchHit`). The following cannot be exercised here
+(B-002 — no live tenant):
+
+- **Live Graph search acceptance.** Graph `POST /search/query` needs the
+  `Chat.Read` delegated scope, which the Teams first-party sign-in token does
+  **not** carry, so it is expected to **403** live (the vendored crate's own notes
+  flag the lane as unproven). The wrapper is kept for a suitably-scoped token and
+  for the stub tests, but the **supported** path is the local one. Because the
+  app only falls back to the server when the local store has no hits and swallows
+  the error, a live 403 degrades to "no results", never a failure.
+- **Server result fidelity.** The mapping of a real `chatMessage` hit
+  (`summary` → snippet, `chatId`/`channelIdentity` → the open target, sender
+  name/address fallback) is assumed from the vendored parser + a stub, not proven
+  against Teams.
+
+**Impact:** server search correctness is assumed from the vendored crate + stubs,
+not proven; in practice the local path is what runs, and the feature is designed
+not to depend on the server.
+
+**Mitigation:** keep the call behind `ApiClient`/`Search` so a live fix is
+contained; the local path is the primary, fully-tested one; the stub test pins
+the request shape so a regression is caught; if a suitably-scoped token ever
+appears, only the fallback branch changes.
