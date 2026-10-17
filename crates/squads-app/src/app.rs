@@ -28,11 +28,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use squads_core::api::JoinTarget;
-use squads_core::model::{Channel, Identity, Meeting, Message, SearchHit, SendState};
+use squads_core::model::{Channel, Identity, Meeting, Message, Person, SearchHit, SendState};
 use squads_core::{
     Accent, AppDirs, Calendar, CallIdentity, CallLogEntry, CallService, CallState, Chat,
     ContactPresence, FileEntry, Files, IncomingCall, MediaCache, Messaging, NotificationContext,
-    RealtimeEvent, Search, Session, Settings, SignInProgress, Store, Team, Teams, Theme,
+    People, RealtimeEvent, Search, Session, Settings, SignInProgress, Store, Team, Teams, Theme,
 };
 
 use crate::runtime::{AppEvent, AppRuntime};
@@ -44,6 +44,10 @@ use crate::views;
 pub const CHAT_LIMIT: usize = 200;
 /// How many messages to keep in the timeline.
 pub const TIMELINE_LIMIT: usize = 300;
+/// How many global drive file-search hits to request (Graph caps at 25).
+pub const FILE_SEARCH_LIMIT: usize = 25;
+/// How many directory people to request for the picker (Graph caps at 25).
+pub const PEOPLE_LIMIT: usize = 25;
 
 /// Which top-level section the nav rail selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -156,6 +160,16 @@ pub enum Action {
     ToggleTeam(String),
     /// Refresh the files for a conversation.
     RefreshFiles(String),
+    /// Run a global drive file search for `query` (B3).
+    SearchFiles(String),
+    /// Run a directory people search for `query` (B3) — the people picker.
+    SearchPeople(String),
+    /// Add or remove a [`Person`] from the people-picker selection (B3).
+    TogglePersonSelected(Person),
+    /// Clear the people-picker selection (B3).
+    ClearPeopleSelection,
+    /// Open/close the reusable people-picker overlay (B3).
+    TogglePeoplePicker,
     /// Refresh the upcoming meetings from the calendar service (M12).
     RefreshCalendar,
     /// Refresh the calendar **week** view (M12): the next 7 days.
@@ -311,6 +325,8 @@ pub struct SquadsApp {
     messaging: Option<Arc<Messaging>>,
     teams_svc: Option<Arc<Teams>>,
     files_svc: Option<Arc<Files>>,
+    /// The directory people-search service (B3), built once signed in.
+    people_svc: Option<Arc<People>>,
     calls_svc: Option<Arc<CallService>>,
     calendar_svc: Option<Arc<Calendar>>,
     /// The inline-media cache (M13), built once signed in. `None` in headless
@@ -370,6 +386,23 @@ pub struct SquadsApp {
     channels: HashMap<String, Vec<Channel>>,
 
     files: Vec<FileEntry>,
+    /// Global drive file search (B3): the query, the results, and whether a
+    /// search is in flight. A non-empty query switches the Files page from the
+    /// chat's files to the global results.
+    file_search_query: String,
+    file_search_results: Vec<FileEntry>,
+    file_search_loading: bool,
+
+    /// Reusable people picker (B3): the query, the async directory results, the
+    /// multi-select set (what a caller reads to create a chat — B2a), whether a
+    /// search is in flight, whether the overlay is open, and a one-shot focus
+    /// request for its query box.
+    people_query: String,
+    people_results: Vec<Person>,
+    people_selected: Vec<Person>,
+    people_loading: bool,
+    people_picker_open: bool,
+    focus_people_search: bool,
 
     /// Calendar (M12): the cached upcoming meetings, whether a fetch is in
     /// flight, the last resolved join target, the agenda/week toggle, and the
@@ -482,6 +515,7 @@ impl SquadsApp {
             messaging: None,
             teams_svc: None,
             files_svc: None,
+            people_svc: None,
             calls_svc: None,
             calendar_svc: None,
             media_cache: None,
@@ -518,6 +552,15 @@ impl SquadsApp {
             expanded_teams: HashSet::new(),
             channels: HashMap::new(),
             files: Vec::new(),
+            file_search_query: String::new(),
+            file_search_results: Vec::new(),
+            file_search_loading: false,
+            people_query: String::new(),
+            people_results: Vec::new(),
+            people_selected: Vec::new(),
+            people_loading: false,
+            people_picker_open: false,
+            focus_people_search: false,
             meetings: Vec::new(),
             calendar_loading: false,
             join_target: None,
@@ -594,6 +637,86 @@ impl SquadsApp {
     /// The files for the selected conversation.
     pub fn files(&self) -> &[FileEntry] {
         &self.files
+    }
+
+    // ----- B3: file search & the reusable people picker ----------------------
+
+    /// The global drive file-search query.
+    pub fn file_search_query(&self) -> &str {
+        &self.file_search_query
+    }
+
+    /// Mutable global drive file-search query (the Files view edits it).
+    pub fn file_search_query_mut(&mut self) -> &mut String {
+        &mut self.file_search_query
+    }
+
+    /// The global drive file-search results (wire order).
+    pub fn file_search_results(&self) -> &[FileEntry] {
+        &self.file_search_results
+    }
+
+    /// Whether a global drive file search is in flight.
+    pub fn file_search_loading(&self) -> bool {
+        self.file_search_loading
+    }
+
+    /// The people-picker query.
+    pub fn people_query(&self) -> &str {
+        &self.people_query
+    }
+
+    /// Mutable people-picker query (the picker edits it).
+    pub fn people_query_mut(&mut self) -> &mut String {
+        &mut self.people_query
+    }
+
+    /// The directory results currently shown by the people picker.
+    pub fn people_results(&self) -> &[Person] {
+        &self.people_results
+    }
+
+    /// The people picked so far — the value **B2a**'s "new chat" flow reads to
+    /// create a 1:1 (one) or group (several) chat.
+    pub fn selected_people(&self) -> &[Person] {
+        &self.people_selected
+    }
+
+    /// Whether `id` is currently in the people-picker selection.
+    pub fn is_person_selected(&self, id: &str) -> bool {
+        self.people_selected.iter().any(|person| person.id == id)
+    }
+
+    /// Whether a directory people search is in flight.
+    pub fn people_loading(&self) -> bool {
+        self.people_loading
+    }
+
+    /// Whether the people-picker overlay is open.
+    pub fn people_picker_open(&self) -> bool {
+        self.people_picker_open
+    }
+
+    /// Take the one-shot people-picker focus request.
+    pub fn take_people_focus(&mut self) -> bool {
+        std::mem::take(&mut self.focus_people_search)
+    }
+
+    /// Test-only: seed the global file-search query and results (the headless
+    /// harness has no service to run a real search).
+    #[cfg(test)]
+    pub(crate) fn set_file_search(&mut self, query: &str, files: Vec<FileEntry>) {
+        self.file_search_query = query.to_string();
+        self.file_search_results = files;
+        self.file_search_loading = false;
+    }
+
+    /// Test-only: seed the people-picker query and results.
+    #[cfg(test)]
+    pub(crate) fn set_people_results(&mut self, query: &str, people: Vec<Person>) {
+        self.people_query = query.to_string();
+        self.people_results = people;
+        self.people_loading = false;
     }
 
     /// The upcoming meetings (cached + fetched), soonest first.
@@ -1124,6 +1247,73 @@ impl SquadsApp {
         });
     }
 
+    // ----- B3: global file search & the reusable people picker --------------
+
+    /// Run the global drive file search for `query`. The results arrive as
+    /// [`AppEvent::FileSearchResults`] (a repaint only then — ADR-027). An
+    /// empty query clears the results and never hits the network.
+    fn run_file_search(&mut self, query: String) {
+        self.file_search_query = query;
+        let trimmed = self.file_search_query.trim().to_string();
+        if trimmed.is_empty() {
+            self.file_search_results.clear();
+            self.file_search_loading = false;
+            return;
+        }
+        let Some(files) = self.files_svc.clone() else {
+            return;
+        };
+        self.file_search_loading = true;
+        self.runtime.spawn(async move {
+            match files.search_files(&trimmed, FILE_SEARCH_LIMIT).await {
+                Ok(list) => AppEvent::FileSearchResults {
+                    query: trimmed,
+                    files: list,
+                },
+                Err(e) => AppEvent::Error(format!("search files: {e}")),
+            }
+        });
+    }
+
+    /// Run the directory people search for `query` (the people picker). The
+    /// results arrive as [`AppEvent::PeopleResults`]. An empty query clears the
+    /// results and never hits the network.
+    fn run_people_search(&mut self, query: String) {
+        self.people_query = query;
+        let trimmed = self.people_query.trim().to_string();
+        if trimmed.is_empty() {
+            self.people_results.clear();
+            self.people_loading = false;
+            return;
+        }
+        let Some(people) = self.people_svc.clone() else {
+            return;
+        };
+        self.people_loading = true;
+        self.runtime.spawn(async move {
+            match people.search(&trimmed, PEOPLE_LIMIT).await {
+                Ok(list) => AppEvent::PeopleResults {
+                    query: trimmed,
+                    people: list,
+                },
+                Err(e) => AppEvent::Error(format!("search people: {e}")),
+            }
+        });
+    }
+
+    /// Add `person` to the picker selection, or remove it if already picked.
+    fn toggle_person_selected(&mut self, person: Person) {
+        if let Some(index) = self
+            .people_selected
+            .iter()
+            .position(|picked| picked.id == person.id)
+        {
+            self.people_selected.remove(index);
+        } else {
+            self.people_selected.push(person);
+        }
+    }
+
     /// Re-install the theme from the current settings (after a preference
     /// change) and persist them.
     fn reinstall_theme(&mut self) {
@@ -1194,6 +1384,12 @@ impl SquadsApp {
         if self.files_svc.is_none() {
             match self.session.files() {
                 Ok(service) => self.files_svc = Some(Arc::new(service)),
+                Err(e) => self.push_error(e),
+            }
+        }
+        if self.people_svc.is_none() {
+            match self.session.people() {
+                Ok(service) => self.people_svc = Some(Arc::new(service)),
                 Err(e) => self.push_error(e),
             }
         }
@@ -1532,13 +1728,22 @@ impl SquadsApp {
         let Some(files) = self.files_svc.clone() else {
             return;
         };
-        let Some(entry) = self
-            .store
-            .files_for_chat(&self.profile, &chat_id)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|f| f.id == file_id)
-        else {
+        // Resolve the row from the in-memory views first (the selected chat's
+        // files, then the global search results), falling back to the store.
+        let entry = self
+            .files
+            .iter()
+            .chain(self.file_search_results.iter())
+            .find(|file| file.id == file_id)
+            .cloned()
+            .or_else(|| {
+                self.store
+                    .files_for_chat(&self.profile, &chat_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|file| file.id == file_id)
+            });
+        let Some(entry) = entry else {
             return;
         };
         let dest = self.download_target().join(&entry.name);
@@ -1824,6 +2029,22 @@ impl SquadsApp {
                 }
                 self.search_loading = false;
             }
+            AppEvent::FileSearchResults { query, files } => {
+                // Ignore a stale response for a query the user has changed;
+                // either way the loading flag is cleared (B3).
+                if self.file_search_query.trim() == query.trim() {
+                    self.file_search_results = files;
+                }
+                self.file_search_loading = false;
+            }
+            AppEvent::PeopleResults { query, people } => {
+                // Ignore a stale response for a query the user has changed;
+                // either way the loading flag is cleared (B3).
+                if self.people_query.trim() == query.trim() {
+                    self.people_results = people;
+                }
+                self.people_loading = false;
+            }
             AppEvent::PresenceUpdated(list) => {
                 for presence in list {
                     self.presence.insert(presence.mri.clone(), presence);
@@ -2005,6 +2226,16 @@ impl SquadsApp {
             Action::RefreshTeams => self.refresh_teams(),
             Action::ToggleTeam(team_id) => self.toggle_team(team_id),
             Action::RefreshFiles(chat_id) => self.refresh_files(chat_id),
+            Action::SearchFiles(query) => self.run_file_search(query),
+            Action::SearchPeople(query) => self.run_people_search(query),
+            Action::TogglePersonSelected(person) => self.toggle_person_selected(person),
+            Action::ClearPeopleSelection => self.people_selected.clear(),
+            Action::TogglePeoplePicker => {
+                self.people_picker_open = !self.people_picker_open;
+                if self.people_picker_open {
+                    self.focus_people_search = true;
+                }
+            }
             Action::RefreshCalendar => self.refresh_calendar(),
             Action::RefreshCalendarWeek => self.refresh_calendar_week(),
             Action::JoinMeeting { target, passcode } => self.join_meeting(target, passcode),
@@ -2099,6 +2330,9 @@ impl SquadsApp {
                 self.search_selected = 0;
                 self.search_loading = false;
                 self.highlight_message = None;
+                // The people picker closes but keeps its selection, so a caller
+                // can still read the picked people (B3).
+                self.people_picker_open = false;
                 self.show_info = false;
             }
             Action::OpenSettings => self.dispatch(Action::SetPage(Page::Settings)),
@@ -2150,6 +2384,7 @@ impl SquadsApp {
         self.messaging = None;
         self.teams_svc = None;
         self.files_svc = None;
+        self.people_svc = None;
         self.calls_svc = None;
         self.calendar_svc = None;
         self.media_cache = None;
@@ -2164,6 +2399,14 @@ impl SquadsApp {
         self.expanded_teams.clear();
         self.channels.clear();
         self.files.clear();
+        self.file_search_query.clear();
+        self.file_search_results.clear();
+        self.file_search_loading = false;
+        self.people_query.clear();
+        self.people_results.clear();
+        self.people_selected.clear();
+        self.people_loading = false;
+        self.people_picker_open = false;
         self.meetings.clear();
         self.calendar_loading = false;
         self.join_target = None;
@@ -2226,6 +2469,8 @@ impl eframe::App for SquadsApp {
         }
         // The quick switcher is a floating overlay, drawn after the shell.
         views::quick_switcher::show(self, ui.ctx());
+        // The reusable people picker is a floating overlay too (B3).
+        views::people_picker::show(self, ui.ctx());
         self.apply_actions();
     }
 }

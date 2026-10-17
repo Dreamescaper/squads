@@ -15,7 +15,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 use squads_core::auth::MemoryTokenStore;
-use squads_core::model::{Channel, FileEntry, Identity, Meeting, Message, SendState};
+use squads_core::model::{Channel, FileEntry, Identity, Meeting, Message, Person, SendState};
 use squads_core::{AppDirs, Chat, Session, SessionState, Settings, Store, Team};
 
 use crate::app::{Action, Page, SquadsApp};
@@ -679,4 +679,117 @@ fn global_search_shortcut_opens_the_search_page() {
     );
     harness.run();
     assert_eq!(harness.state().page(), Page::Search);
+}
+
+// ----- B3: file search & the reusable people picker --------------------------
+
+fn person(id: &str, name: &str, email: Option<&str>) -> Person {
+    Person {
+        id: id.into(),
+        display_name: name.into(),
+        email: email.map(str::to_string),
+        job_title: None,
+    }
+}
+
+#[test]
+fn people_picker_search_renders_results_and_selection_yields_an_id() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+    });
+    harness.run();
+
+    // The picker is reachable from the Search page (B3), where B2a will also
+    // open it.
+    harness.get_by_label("Search").click();
+    harness.run();
+    harness.get_by_label("Find people").click();
+    harness.run();
+    assert!(
+        harness.state().people_picker_open(),
+        "the Find people button should open the picker"
+    );
+
+    // Seed the async directory results (headless has no directory service).
+    harness.state_mut().set_people_results(
+        "ava",
+        vec![
+            person("u1", "Ava Lindqvist", Some("ava@contoso.com")),
+            person("u2", "Tom Becker", None),
+        ],
+    );
+    harness.run();
+
+    // The rows render (name + email).
+    harness.get_by_label("Ava Lindqvist <ava@contoso.com>");
+    harness.get_by_label("Tom Becker");
+
+    // Selecting a person adds them to the selection, which carries the id a
+    // caller (B2a) needs to start a chat.
+    harness
+        .get_by_label("Ava Lindqvist <ava@contoso.com>")
+        .click();
+    harness.run();
+    assert_eq!(harness.state().selected_people().len(), 1);
+    assert_eq!(harness.state().selected_people()[0].id, "u1");
+    assert!(harness.state().is_person_selected("u1"));
+    // The picked person renders as a removable chip.
+    harness.get_by_label("Remove Ava Lindqvist");
+
+    // Clicking the chip toggles the pick back off.
+    harness.get_by_label("Remove Ava Lindqvist").click();
+    harness.run();
+    assert!(harness.state().selected_people().is_empty());
+}
+
+#[test]
+fn files_page_search_renders_global_results_and_downloads() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+    });
+    harness.run();
+    harness.get_by_label("Files").click();
+    harness.run();
+    assert_eq!(harness.state().page(), Page::Files);
+
+    // A non-empty query switches the page to the global results; seed them
+    // (headless has no drive service).
+    harness.state_mut().set_file_search(
+        "quarterly",
+        vec![FileEntry {
+            id: "f1".into(),
+            drive_id: Some("d1".into()),
+            name: "quarterly.pdf".into(),
+            size: 2048,
+            mime: None,
+            web_url: None,
+            download_url: None,
+            is_folder: false,
+            created: None,
+            modified: None,
+            sender: None,
+            share_url: None,
+            attachment_id: None,
+        }],
+    );
+    harness.run();
+    harness.get_by_label("quarterly.pdf");
+
+    // Download reuses the existing action; it is resolved from the in-memory
+    // search results.
+    harness.get_by_label("Download").click();
+    harness.run();
+    let downloading =
+        harness.state().applied_actions().iter().any(
+            |action| matches!(action, Action::DownloadFile { file_id, .. } if file_id == "f1"),
+        );
+    assert!(
+        downloading,
+        "expected a DownloadFile action; got {:?}",
+        harness.state().applied_actions()
+    );
 }

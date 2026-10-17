@@ -19,6 +19,7 @@ pub mod messaging;
 pub mod model;
 pub mod notifications;
 pub mod paths;
+pub mod people;
 pub mod presence;
 pub mod realtime;
 pub mod search;
@@ -42,14 +43,15 @@ pub use media::{CachedMedia, MediaCache};
 pub use messaging::{HistoryPage, Messaging};
 pub use model::{
     CallDirection, CallLogEntry, CallOutcome, Channel, Chat, FileEntry, FileVersion, Identity,
-    Meeting, Message, Reaction, Reactor, SearchHit, SendState, SharedLink, Team, TeamMember,
-    is_channel_conversation_id,
+    Meeting, Message, Person, Reaction, Reactor, SearchHit, SendState, SharedLink, Team,
+    TeamMember, is_channel_conversation_id,
 };
 pub use notifications::{
     ActivityItem, LogNotifier, Notification, NotificationContext, NotificationKind, Notifications,
     Notifier, RecordingNotifier, UnreadSummary, route,
 };
 pub use paths::AppDirs;
+pub use people::People;
 pub use presence::{
     Activity, Availability, ContactPresence, GraphBackend, OwnPresence, Presence, PresenceBackend,
     UnifiedBackend,

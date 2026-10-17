@@ -623,3 +623,38 @@ not to depend on the server.
 contained; the local path is the primary, fully-tested one; the stub test pins
 the request shape so a regression is caught; if a suitably-scoped token ever
 appears, only the fallback branch changes.
+
+### U-010 — B3 file/people search not exercised offline (live acceptance unverified)
+
+B3's two Graph search lanes are thin wrappers over the vendored
+`search_files_data` / `search_people_data`, tested offline against local TCP
+stubs (request line incl. the `$top` clamp, the `ConsistencyLevel: eventual`
+header on the people lane, the Graph bearer, and the mapped
+`FileEntry`/`Person`). The following cannot be exercised here (B-002 — no live
+tenant):
+
+- **Live Graph drive-search acceptance.** Whether the Teams first-party Graph
+  token carries the delegated `Files.Read` scope for
+  `GET /me/drive/root/search(q='…')`, and whether the real driveItems match the
+  projection we parse (`id`/`name`/`size`/`file.mimeType`/`folder`/
+  `parentReference.driveId`/`@microsoft.graph.downloadUrl`) are unproven. A 403
+  surfaces as the vendored error unchanged.
+- **Live `/users` `$search` acceptance.** Whether the token carries
+  `User.ReadBasic.All` for the directory search, and whether the real response
+  matches the `id,displayName,mail,userPrincipalName` projection (and that
+  `ConsistencyLevel: eventual` is accepted) are unproven. The mapping is
+  deliberately tolerant (an id-less row is skipped; `mail` falls back to
+  `userPrincipalName`).
+- **Single-window only.** The vendored helpers expose no paging cursor, so both
+  searches return at most 25 rows and the picker re-searches rather than pages;
+  whether a live directory query needs `$count`/`$top` adjustments for a
+  predictable result set is unverified.
+
+**Impact:** search correctness is assumed from the vendored crate + stubs, not
+proven against Teams; the picker and Files-page search are designed not to depend
+on a particular result count.
+
+**Mitigation:** keep both behind `ApiClient`/`Files`/`People` so a live fix is
+contained; the deterministic stub tests pin the exact paths/headers so a
+regression is caught; the pure path builders and parsers are re-exported and
+unit-tested.

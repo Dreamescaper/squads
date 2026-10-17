@@ -53,6 +53,15 @@
 //! (M13)** is [`ApiClient::fetch_media`] plus the pure host rule
 //! ([`media_needs_auth`] / [`media_auth_headers`]). The cached, one-fetch
 //! variant lives in [`crate::MediaCache`].
+//!
+//! **File & people search (B3)** is **Graph** too, and **single-window**:
+//! [`ApiClient::search_files`] wraps `GET /me/drive/root/search(q='…')` and
+//! [`ApiClient::search_people`] wraps `GET /users?$search="displayName:…"`
+//! (which sends `ConsistencyLevel: eventual`). The vendored helpers expose no
+//! paging cursor, so a limit is clamped to Graph's `1..=25` window
+//! ([`FIND_MAX_LIMIT`]). [`crate::Files::search_files`] and
+//! [`crate::People::search`] map the wire rows into
+//! [`FileEntry`](crate::model::FileEntry) / [`Person`](crate::model::Person).
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -104,6 +113,18 @@ pub use ost::api::{
 pub use ost::api::{
     SEARCH_MAX_SIZE, SearchHitInfo, SearchPage, clamp_size, next_from, parse_search_response,
     search_body,
+};
+
+/// Pure helpers surfaced by the **B3** file & people search (Graph drive search
+/// + `/users` `$search`). Re-exported so [`Files`](crate::Files) /
+/// [`People`](crate::People) and the tests can pin the request shapes without
+/// reaching into the vendored crate. Both searches are **single-window**: the
+/// vendored helpers expose no paging cursor, so a limit is clamped to Graph's
+/// `1..=25` window ([`FIND_MAX_LIMIT`]) and one call returns at most that many
+/// rows.
+pub use ost::api::{
+    FIND_MAX_LIMIT, clamp_limit, drive_search_path, parse_drive_search_response,
+    parse_people_search_response, people_search_path,
 };
 
 use crate::auth::tokens::{StoredToken, TokenSet};
@@ -1129,6 +1150,48 @@ impl ApiClient {
             .await?;
         tracing::debug!(count = page.hits.len(), call, "searched messages");
         Ok(page)
+    }
+
+    // ----- B3: file & people search (Graph) -------------------------------
+
+    /// Search the signed-in user's OneDrive by file name/content (Graph
+    /// `GET /me/drive/root/search(q='…')`).
+    ///
+    /// **Single window.** The vendored path builder clamps `limit` to Graph's
+    /// `1..=25` window ([`FIND_MAX_LIMIT`]) and there is no paging cursor, so
+    /// one call returns at most that many driveItems. Hits are driveItems, so
+    /// [`Files::search_files`](crate::Files::search_files) maps them into
+    /// [`FileEntry`](crate::model::FileEntry).
+    pub async fn search_files(&self, query: &str, limit: usize) -> Result<Vec<SharedFile>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span =
+            tracing::debug_span!(target: "squads_core::api", "api.search_files", limit, call);
+        let files = ost::api::search_files_data(&self.client, query, limit)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = files.len(), call, "searched files");
+        Ok(files)
+    }
+
+    /// Search the directory by display name (Graph
+    /// `GET /users?$search="displayName:…"`).
+    ///
+    /// **Single window**, like [`ApiClient::search_files`]. The vendored helper
+    /// sends `ConsistencyLevel: eventual` (Graph 400s without it for `$search`).
+    /// Rows are the vendored `TeamMemberInfo` projection;
+    /// [`People::search`](crate::People::search) maps them into
+    /// [`Person`](crate::model::Person).
+    pub async fn search_people(&self, query: &str, limit: usize) -> Result<Vec<TeamMemberInfo>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span =
+            tracing::debug_span!(target: "squads_core::api", "api.search_people", limit, call);
+        let people = ost::api::search_people_data(&self.client, query, limit)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = people.len(), call, "searched people");
+        Ok(people)
     }
 }
 

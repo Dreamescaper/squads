@@ -1306,3 +1306,81 @@ sender; click a result and confirm the chat opens with the message highlighted
 **Blockers.** **U-009** (the live Graph `/search/query` acceptance is unverified
 and expected to 403 with the Teams sign-in; the local path is the supported one).
 B-007 (a snippet exposes cached content in-process only; nothing new is written).
+
+---
+
+## B3 — File & people search
+
+**Goal.** Add the two unused Graph search lanes — **drive file search** and
+**directory people search** — and turn the people lane into a **reusable picker**
+that B2a's "new chat" flow will consume. Both are single-window Graph calls and
+must be testable **offline** against local TCP stubs.
+
+**Landed.**
+
+- `api` (M2 module, extended) — typed, instrumented Graph wrappers in the
+  existing `ApiClient` style (redacting `Debug`, request counter, `tracing`
+  spans): `search_files` (`GET /me/drive/root/search(q='…')`) and `search_people`
+  (`GET /users?$search="displayName:…"`, which sends
+  `ConsistencyLevel: eventual` — Graph 400s without it). Both are **single
+  window**: the vendored helpers expose no paging cursor, so a limit is clamped
+  by the vendored path builder to Graph's `1..=25` window (`FIND_MAX_LIMIT`).
+  The pure helpers and `FIND_MAX_LIMIT`/`clamp_limit` are re-exported
+  (`drive_search_path`, `people_search_path`, `parse_drive_search_response`,
+  `parse_people_search_response`).
+- `model` — `Person { id, display_name, email, job_title }`
+  (`Person::from_member` / `From<&TeamMemberInfo>` + a `label()` helper). The
+  directory `$select` is `id,displayName,mail,userPrincipalName`, so `email` is
+  `mail` when present else `userPrincipalName`; `job_title` is modeled for
+  forward-compatibility and is **always `None` from the wire** (the projection
+  does not select it) — documented rather than guessed.
+- `files` — `Files::search_files(query, limit) -> Vec<FileEntry>`: wraps
+  `search_files_data`, maps the driveItem hits with the existing
+  `FileEntry::from_shared`, caches them **chatlessly** (additively, so an
+  existing chat association survives) and returns wire order.
+- `people` (new) — the `People { profile, Arc<ApiClient> }` service:
+  `search(query, limit) -> Vec<Person>` maps the vendored `TeamMemberInfo` rows
+  into [`Person`]. Redacting `Debug`; single-window/bounded (no `load_more`).
+- `session` — `Session::people()` mirrors the other services (shares the cached
+  `Arc<ApiClient>`, offline to build, `NotSignedIn` without tokens).
+- `crates/squads-app` — a **Files-page search box** (B3): a non-empty query
+  switches the page from the chat's files to **global drive results**, rendered
+  with the same `FileEntry` row + **Download** action (a searched file is
+  downloadable — the download resolves the row from the in-memory results);
+  empty/loading/no-results states; clearing the query returns to the chat's
+  files. Plus a **reusable people picker** overlay
+  (`views/people_picker.rs`): a query box (queues `Action::SearchPeople`),
+  async directory results (`AppEvent::PeopleResults`), multi-select, removable
+  selected chips, and `SquadsApp::selected_people()` for the caller. It is
+  reachable now from the **Search** page's "Find people" button (and via
+  `Action::TogglePeoplePicker`); `Esc` closes it but keeps the selection.
+  Repaints only when something changed (ADR-027).
+
+**Decisions.** **ADR-037** (file/people search wrappers + the schema-free
+`People` service, and the **people-picker contract** B2a consumes).
+
+**Tests.** `cargo test -p squads-core` — **353** (344 from M1–M13/B1 + **9**
+new: 2 `model` (`Person` conversion + label/serde), 5 `people` (the directory
+stub incl. the `ConsistencyLevel` header, the limit clamp, the empty-query guard,
+unknown shapes, `Send + Sync`/redacting `Debug`), 1 `files`
+(`search_files` path/`$top=25` clamp/parse/cache), 1 `session` (`people` requires
+tokens + shares the client)). `cargo test -p squads-app` — **27** (25 from
+M10–M13/B1 + **2** new: the people picker renders a query's results and a
+selection yields the person's id (and the chip toggles it back off); the
+Files-page search renders global results and queues the Download action).
+`cargo test -p squads-protocol` still passes **377**. `cargo build --workspace`
+(default features) succeeds and `cargo fmt -p squads-core -p squads-app --
+--check` is clean.
+
+**How to verify manually** (real tenant; not runnable here): sign in, open
+**Files**, type a filename into the search box and confirm the global OneDrive
+results render and download; clear it and confirm the selected chat's files
+return. On the **Search** page press **Find people**, type a colleague's name
+and confirm directory results render; select one (or several) and read
+`SquadsApp::selected_people()`.
+
+**Blockers.** **U-010** (the live Graph drive-search and `/users` `$search`
+acceptance — the actual response shapes and whether the Teams first-party Graph
+token carries the delegated `Files.Read`/`User.ReadBasic.All` scopes for these
+routes — is unverified; the request shapes are pinned offline). B-007 (directory
+names/emails are transient in-process only; nothing new is persisted).

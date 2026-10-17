@@ -9,6 +9,10 @@ Process: **one item at a time** — implement → review → `fmt`/`test`/`build
 commit → push — updating the status here and in
 [`PROGRESS.md`](PROGRESS.md)/[`DECISIONS.md`](DECISIONS.md) as each lands.
 
+**Ordering note.** B1 landed first. **B3 is processed before B2a** because B2a's
+"new chat" flow consumes B3's people picker; the remaining order is B2b → B4 →
+B5.
+
 Legend: ⬜ not started · 🟡 in progress · ✅ done · 🚫 won't do (documented)
 
 ---
@@ -57,6 +61,7 @@ or see pinned messages. (`api::chat` extras + `api::teams` member routes.)
 **Split into two items.**
 
 ### B2a — New chat, leave, mute/hide ⬜
+**Depends on B3** (the people picker) — B3 is processed first.
 - `core`: wrappers for `create_one_to_one_chat_data`, `create_group_chat_data`,
   `leave_chat_with_client`, `set_chat_muted_with_client`,
   `set_chat_hidden_with_client`, `alerts_body`/`alerts_muted`, and chat roster
@@ -80,7 +85,13 @@ tabs.
 
 ---
 
-## B3 — File & people search ⬜
+## B3 — File & people search ✅
+
+**Landed.** Graph wrappers (`ApiClient::search_files` / `search_people`, both
+single-window, clamped to Graph's 25), `Files::search_files` + a `People` service
+returning the new `model::Person`, a global search box on the Files page, and a
+reusable **people picker** overlay (query + async results + multi-select) that
+**B2a** reads via `SquadsApp::selected_people()`. See ADR-037 and PROGRESS (B3).
 
 **Gap.** `api::filesearch` is unused.
 

@@ -13,6 +13,7 @@ pub mod composer;
 pub mod conversation;
 pub mod files;
 pub mod login;
+pub mod people_picker;
 pub mod quick_switcher;
 pub mod search;
 pub mod settings;

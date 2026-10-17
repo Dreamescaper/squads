@@ -1553,3 +1553,82 @@ the better default.
 - No encryption change: a search exposes cached content in-process only (B-007).
 - `crates/squads-protocol` is untouched; the search surface was already
   re-exported by `ost::api`.
+
+---
+
+## ADR-037 — File/people search wrappers, a schema-free `People` service, and the people-picker contract B2a consumes
+
+**Status:** accepted (B3)
+
+**Context.** Backlog item **B3** adds the two `api::filesearch` lanes — Graph
+**drive file search** (`GET /me/drive/root/search(q='…')`) and **directory
+people search** (`GET /users?$search="displayName:…"`, which needs
+`ConsistencyLevel: eventual` or Graph answers `400`) — and, from the people lane,
+a **reusable picker** that **B2a**'s "new chat" flow will consume. Two questions
+had to be settled: how the searches are shaped (paging, limits), and what
+contract the picker exposes to a caller that wants to create a chat.
+
+The vendored helpers (`search_files_data` / `search_people_data`) are explicit
+about their bounds: both are **single-window** — no paging cursor, one `$top`,
+capped at `FIND_MAX_LIMIT = 25` by the pure `clamp_limit`/`*_search_path`
+builders. They return wire rows (`SharedFile` / `TeamMemberInfo`), which the
+store and the UI must not touch (the M3 model rule).
+
+**Decision.**
+
+1. **Wrappers, single window.** `ApiClient::search_files` / `search_people` are
+   thin, instrumented (redacting `Debug`, request counter, `tracing` spans)
+   wrappers over the vendored calls. They do **not** invent paging: a limit is
+   clamped to Graph's `1..=25` window by the vendored path builder, and there is
+   no `load_more`. The picker and the Files page re-search as the query changes
+   instead of paging. The pure helpers (`drive_search_path`,
+   `people_search_path`, `parse_*_search_response`, `FIND_MAX_LIMIT`,
+   `clamp_limit`) are re-exported so their shapes are pinned without a network.
+2. **Owned models.** `model::Person { id, display_name, email, job_title }`
+   (`Person::from_member` / `From<&TeamMemberInfo>`), mirroring the owned-model
+   rule. The directory projection selects `id,displayName,mail,userPrincipalName`,
+   so `email` is `mail` when present else `userPrincipalName`; `job_title` is
+   modeled for forward-compatibility and is **always `None` from the wire**
+   (the projection does not select it) — documented, not guessed. File hits
+   reuse the existing `FileEntry` (they are driveItems).
+3. **A `People` service, not a store cache.** `People { profile,
+   Arc<ApiClient> }` mirrors the other services' shape but keeps **no store**:
+   directory people are not cached, so **no schema bump** and no new table. It
+   exposes `search(query, limit) -> Vec<Person>`; `Session::people()` builds it
+   (offline; `NotSignedIn` without tokens). `Files::search_files` *does* cache
+   its driveItem hits **chatlessly** (the existing additive `upsert_files` with
+   `chat_id = None`), so a searched file can be downloaded, without ever
+   stealing a chat association (`COALESCE` protects it).
+4. **The people-picker contract (for B2a).** The picker is a self-contained
+   component whose *state* lives on `SquadsApp`, whose *intents* are `Action`s,
+   and whose *result* is one accessor:
+   - state: `people_query`, `people_results`, `people_selected`,
+     `people_loading`, `people_picker_open`;
+   - actions: `SearchPeople(String)` (typing), `TogglePersonSelected(Person)`
+     (add/remove one), `ClearPeopleSelection`, `TogglePeoplePicker` (open/close);
+   - async delivery: `AppEvent::PeopleResults { query, people }` (stale responses
+     for a changed query are dropped);
+   - **result:** `SquadsApp::selected_people() -> &[Person]`.
+   B2a therefore opens the picker, lets the user pick, reads
+   `selected_people()` (one person → a 1:1, several → a group chat), then clears
+   with `ClearPeopleSelection`. `Esc` (through `CloseOverlays`) closes the picker
+   but **keeps** the selection, so the caller can still read it. Until B2a wires
+   it into the new-chat flow it is reachable from the **Search** page's "Find
+   people" button, which is what exercises it now.
+
+**Consequences.**
+
+- File search is available on the Files page (a non-empty query switches to
+  global results, reusing the `FileEntry` row + Download action; the download
+  resolves the row from the in-memory results, so a chat-less hit still works).
+- Both searches are fully testable offline: the drive and `/users` request
+  shapes (path, `$top`, the `ConsistencyLevel: eventual` header, the Graph
+  bearer) and the parsing are pinned by local TCP stubs.
+- **The live acceptance is unverified** (U-010): the real response shapes and
+  whether the Teams first-party Graph token carries the delegated
+  `Files.Read`/`User.ReadBasic.All` scopes for these routes are not proven here;
+  if a route 403s, the wrapper surfaces the vendored error unchanged.
+- No schema change and no encryption change: directory people are never
+  persisted; a search hit is in-process only (B-007 still covers the files cache).
+- B2a's dependency is a **one-accessor contract**, so the picker can be reused
+  (e.g. an "add member" flow) without touching `squads-core`.

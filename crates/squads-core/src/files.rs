@@ -155,6 +155,23 @@ impl Files {
         Ok(entries)
     }
 
+    /// Search the signed-in user's OneDrive by file name/content (Graph
+    /// `/me/drive/root/search`), cache the hits **chatlessly** (additively, so a
+    /// chat association already on a row survives) and return them in wire
+    /// order.
+    ///
+    /// **Single window**, like the people search: the vendored helpers expose no
+    /// paging cursor, so `limit` is clamped to Graph's `1..=25` window
+    /// ([`FIND_MAX_LIMIT`](crate::api::FIND_MAX_LIMIT)) and one call returns at
+    /// most that many driveItems. Hits are driveItems, so the rows reuse
+    /// [`FileEntry`] and are downloadable when the wire names a drive.
+    pub async fn search_files(&self, query: &str, limit: usize) -> Result<Vec<FileEntry>> {
+        let wire = self.client.search_files(query, limit).await?;
+        let entries: Vec<FileEntry> = wire.iter().map(FileEntry::from_shared).collect();
+        self.store.upsert_files(&self.profile, None, &entries)?;
+        Ok(entries)
+    }
+
     // ----- transfer -------------------------------------------------------
 
     /// Download `file`'s content to `dest_path`; returns bytes written.
@@ -568,6 +585,48 @@ mod tests {
             "{}",
             requests(&seen)[0]
         );
+    }
+
+    #[tokio::test]
+    async fn search_files_hits_drive_search_caches_and_clamps_the_limit() {
+        let body = serde_json::json!({"value": [
+            {"id": "f1", "name": "plan.md", "size": 48211,
+             "webUrl": "https://x/plan",
+             "file": {"mimeType": "text/markdown"},
+             "parentReference": {"driveId": "D1"}},
+            {"id": "dir1", "name": "Design", "folder": {},
+             "parentReference": {"driveId": "D1"}},
+            {"name": "no-id-skipped"}
+        ]})
+        .to_string();
+        let (base, seen, task) = http_stub(vec![StubResponse::ok(body)]).await;
+        let (store, files) = test_files(&base);
+
+        // A limit over the cap is clamped by the vendored path builder (single
+        // window, no paging).
+        let got = files
+            .search_files("quarterly plan", 100)
+            .await
+            .expect("search");
+        assert_eq!(got.len(), 2, "the id-less row is skipped");
+        assert_eq!(got[0].id, "f1");
+        assert_eq!(got[0].drive_id.as_deref(), Some("D1"));
+        assert_eq!(got[0].mime.as_deref(), Some("text/markdown"));
+        assert!(!got[0].is_folder);
+        assert!(got[1].is_folder);
+        // Cached chatlessly (a search hit has no owning chat).
+        assert_eq!(
+            store.file("default", "D1", "f1").unwrap().unwrap().name,
+            "plan.md"
+        );
+
+        task.await.expect("stub drains");
+        let req = requests(&seen)[0].clone();
+        assert!(
+            req.starts_with("GET /me/drive/root/search(q='quarterly%20plan')?$top=25 "),
+            "unexpected request line: {req}"
+        );
+        assert!(req.contains("authorization: Bearer graph-token"), "{req}");
     }
 
     // ----- download -------------------------------------------------------

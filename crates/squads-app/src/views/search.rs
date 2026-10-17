@@ -23,7 +23,16 @@ use squads_core::model::SearchHit;
 /// Render the global message-search page.
 pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
     egui::CentralPanel::default().show(ui, |ui| {
-        ui.heading("Message search");
+        ui.horizontal(|ui| {
+            ui.heading("Message search");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // The reusable people picker (B3) is reachable from here until
+                // B2a wires it into the new-chat flow.
+                if ui.button("Find people").clicked() {
+                    app.push_action(Action::TogglePeoplePicker);
+                }
+            });
+        });
         ui.label(
             RichText::new("Search your cached messages. Results open the conversation and highlight the match.")
                 .weak()

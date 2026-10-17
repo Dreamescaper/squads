@@ -39,6 +39,7 @@ use crate::messaging::Messaging;
 use crate::model::Identity;
 use crate::notifications::{LogNotifier, Notifications, Notifier};
 use crate::paths::AppDirs;
+use crate::people::People;
 use crate::presence::{Presence, presence_base_from_region};
 use crate::realtime::{RealtimeEvent, RealtimeService};
 use crate::search::Search;
@@ -364,6 +365,17 @@ impl Session {
             Arc::clone(&self.store),
             client,
         ))
+    }
+
+    /// The B3 people-search service for this session.
+    ///
+    /// Shares the session's protocol client (Graph `/users` `$search`). Requires
+    /// a token set ([`CoreError::NotSignedIn`] otherwise); building is offline
+    /// and makes no request. The returned [`People`] is stateless beyond the
+    /// shared client, so callers may build a fresh handle whenever they like.
+    pub fn people(&mut self) -> Result<People> {
+        let client = self.api_arc()?;
+        Ok(People::new(self.profile.clone(), client))
     }
 
     /// The B1 message-search service for this session.
@@ -1209,6 +1221,35 @@ mod tests {
         assert!(Arc::ptr_eq(calendar.store(), session.store()));
         assert_eq!(
             calendar.client().request_count(),
+            0,
+            "building the service is offline"
+        );
+        assert!(session.has_api());
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp2).ok();
+    }
+
+    // ----- B3: people search -------------------------------------------------
+
+    #[test]
+    fn people_requires_tokens_and_shares_the_client() {
+        let (tmp, dirs_a) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs_a, "default", store).expect("session");
+        // No tokens yet: building the service must fail cleanly, no network.
+        let err = session.people().unwrap_err();
+        assert!(matches!(err, CoreError::NotSignedIn), "got {err:?}");
+
+        let (tmp2, dirs2) = dirs();
+        let store2 = Arc::new(MemoryTokenStore::new());
+        store2.save("work", &sample_set()).unwrap();
+        let mut session = Session::with_store(dirs2, "work", store2).expect("session");
+        session.restore().expect("restore");
+
+        let people = session.people().expect("people");
+        assert_eq!(people.profile(), "work");
+        assert_eq!(
+            people.client().request_count(),
             0,
             "building the service is offline"
         );

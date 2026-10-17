@@ -27,7 +27,9 @@ use tokio::runtime::{Handle, Runtime};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use squads_core::api::JoinTarget;
-use squads_core::model::{CallLogEntry, Chat, FileEntry, Meeting, Message, SearchHit, Team};
+use squads_core::model::{
+    CallLogEntry, Chat, FileEntry, Meeting, Message, Person, SearchHit, Team,
+};
 use squads_core::{CallState, Channel, ContactPresence, Identity, RealtimeEvent, SignInProgress};
 
 /// Everything the backend can tell the UI about.
@@ -107,6 +109,22 @@ pub enum AppEvent {
         /// The mapped hits (possibly empty).
         hits: Vec<SearchHit>,
     },
+    /// Global drive file search returned (B3). `query` guards against a stale
+    /// response landing after the user changed the query.
+    FileSearchResults {
+        /// The query these files answer.
+        query: String,
+        /// The mapped driveItems (possibly empty).
+        files: Vec<FileEntry>,
+    },
+    /// Directory people search returned (B3) — the people picker's results.
+    /// `query` guards against a stale response.
+    PeopleResults {
+        /// The query these people answer.
+        query: String,
+        /// The mapped directory people (possibly empty).
+        people: Vec<Person>,
+    },
     /// Batch presence for a set of contacts. No producer is wired yet (the M11
     /// presence panel will emit it); the variant is part of the event vocabulary.
     #[allow(dead_code)]
@@ -142,6 +160,8 @@ impl AppEvent {
             AppEvent::MediaLoaded { .. } => "media_loaded",
             AppEvent::MediaFailed { .. } => "media_failed",
             AppEvent::SearchResults { .. } => "search_results",
+            AppEvent::FileSearchResults { .. } => "file_search_results",
+            AppEvent::PeopleResults { .. } => "people_results",
             AppEvent::PresenceUpdated(_) => "presence_updated",
             AppEvent::Realtime(_) => "realtime",
             AppEvent::CallState(_) => "call_state",

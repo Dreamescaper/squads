@@ -1,22 +1,22 @@
 # Project status — one screen
 
 > Snapshot for the **M13 (Self identity + inline media)** milestone plus backlog
-> item **B1 (Message search)**. The detailed
+> items **B1 (Message search)** and **B3 (File & people search)**. The detailed
 > per-milestone history is in [`PROGRESS.md`](PROGRESS.md); constraints are in
 > [`BLOCKERS.md`](BLOCKERS.md).
 
 ## Where the project is
 
-All fourteen planned milestones (**M0–M13**) are implemented, plus backlog item
-**B1 (message search)**. The workspace
+All fourteen planned milestones (**M0–M13**) are implemented, plus backlog items
+**B1 (message search)** and **B3 (file & people search)**. The workspace
 builds device- and network-free with default features, and the test suite passes
 offline:
 
 | Crate | Role | Tests |
 |---|---|---|
 | `squads-protocol` (vendored `ost`, lib `ost`) | protocol core (auth, api, trouter, calling) | 377 (unchanged) |
-| `squads-core` | session, store, settings, realtime, services | 344 |
-| `squads-app` (`squads` binary) | egui UI | 25 |
+| `squads-core` | session, store, settings, realtime, services | 353 |
+| `squads-app` (`squads` binary) | egui UI | 27 |
 
 `cargo build --workspace` and `cargo build --workspace --release` both succeed.
 
@@ -36,7 +36,9 @@ calendar agenda/week view, scheduling/cancelling and the join hand-off; the
 signed-in identity (whoami → `mark_own` on server history and realtime) and the
 inline-media cache with timeline image rendering; **local-first message search**
 (schema-v9 index, `Search` service, the **Search** page and jump-to-message —
-B1); the egui shell and every
+B1); **Graph file & people search** (single-window drive search on the Files
+page, a `People` service, and a reusable multi-select **people picker** whose
+`selected_people()` B2a will consume — B3); the egui shell and every
 screen; M11 keyboard shortcuts, expanded settings, light theme + accents, and
 headless UI tests.
 
@@ -92,6 +94,7 @@ Newest last; full text in [`DECISIONS.md`](DECISIONS.md).
 - **ADR-034** — Self identity: whoami → cached identity, schema-v8 `accounts`, and where `mark_own` is applied.
 - **ADR-035** — Inline media: `text::image_urls` + a deterministic `MediaCache` + `egui_extras` image loading.
 - **ADR-036** — Message search is local-first (schema-v9 index), with the Graph server path as an optional, expected-to-403 fallback.
+- **ADR-037** — File/people search wrappers, a schema-free `People` service, and the people-picker contract B2a consumes.
 
 ## Open blockers (summary)
 
@@ -104,9 +107,10 @@ media cache unencrypted), **B-008** (call frames filtered from the hub; global
 hub; reconnect token staleness), **B-009** (unified presence token unverified),
 **B-010** (desktop notifications / quiet hours), **B-011** (live calls + real
 media), **B-012** (UI verified by wiring, not pixels; attachment picker stub),
-and unverified aspects **U-001…U-009** (U-007: live calendar acceptance and the
+and unverified aspects **U-001…U-010** (U-007: live calendar acceptance and the
 browser-only join-by-id fallback; U-008: live whoami and media-host acceptance;
-U-009: the optional Graph message-search fallback, expected to 403).
+U-009: the optional Graph message-search fallback, expected to 403; U-010: live
+Graph drive/people search acceptance and the delegated scopes).
 
 ## How to verify by hand
 
@@ -115,8 +119,8 @@ U-009: the optional Graph message-search fallback, expected to 403).
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --workspace                 # default features, no device/network
-cargo test -p squads-core               # 344
-cargo test -p squads-app                # 25 (headless egui_kittest)
+cargo test -p squads-core               # 353
+cargo test -p squads-app                # 27 (headless egui_kittest)
 cargo test -p squads-protocol           # 377
 cargo fmt -p squads-core -p squads-app -- --check
 cargo clippy -p squads-core -p squads-app --all-targets
@@ -136,7 +140,11 @@ cargo build --workspace --release
 4. In **Settings**, switch the theme to Light and pick an accent; toggle compact
    mode and the notification switches; set a download folder. Restart and confirm
    the choices persist (`~/.config/squads/settings.json`).
-5. Follow the per-milestone "How to verify manually" steps in
+5. On **Files**, type a filename into the search box and confirm the global
+   OneDrive results render and download; clear it to return to the chat's files.
+   On **Search**, press **Find people**, search a colleague's name and select one
+   or several (B3).
+6. Follow the per-milestone "How to verify manually" steps in
    [`PROGRESS.md`](PROGRESS.md) for the network features (needs a real tenant).
 
 ### Release/packaging

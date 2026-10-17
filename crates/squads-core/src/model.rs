@@ -358,6 +358,68 @@ impl From<&TeamMemberInfo> for TeamMember {
     }
 }
 
+// ----- people (B3) --------------------------------------------------------
+
+/// One directory person from the **B3** people search (Graph `/users`).
+///
+/// Built from the vendored `ost::api::TeamMemberInfo` the people search
+/// projects. The directory `$select` is `id,displayName,mail,userPrincipalName`,
+/// so `id` is the Graph user id, `display_name` falls back to the id, and
+/// `email` is `mail` when present else `userPrincipalName` (the vendored
+/// mapping folds the two). The `roles`/`is_owner` a roster entry carries are
+/// **not** meaningful for a directory hit and are dropped here.
+///
+/// One wire fact is documented rather than guessed: the `$select` does **not**
+/// request a job title, so [`job_title`](Person::job_title) is modeled for
+/// forward-compatibility and is always `None` from [`Person::from_member`] until
+/// the vendored projection carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Person {
+    /// Graph user id.
+    pub id: String,
+    /// Display name (`displayName`, falling back to the id).
+    pub display_name: String,
+    /// Email (`mail`, falling back to `userPrincipalName`), when either was set.
+    pub email: Option<String>,
+    /// Job title. **Not carried** by the people-search projection today (the
+    /// `$select` omits it); always `None` from the wire.
+    pub job_title: Option<String>,
+}
+
+impl Person {
+    /// Build a domain [`Person`] from a protocol `TeamMemberInfo`.
+    ///
+    /// `job_title` defaults to `None` (the projection does not carry one — see
+    /// the type docs).
+    pub fn from_member(info: &TeamMemberInfo) -> Self {
+        Person {
+            id: info.id.clone(),
+            display_name: info.display_name.clone(),
+            email: info.email.clone(),
+            job_title: None,
+        }
+    }
+
+    /// A short `"Name <email>"` label for the picker (the email is omitted when
+    /// unknown).
+    pub fn label(&self) -> String {
+        match self
+            .email
+            .as_deref()
+            .filter(|email| !email.trim().is_empty())
+        {
+            Some(email) => format!("{} <{}>", self.display_name, email),
+            None => self.display_name.clone(),
+        }
+    }
+}
+
+impl From<&TeamMemberInfo> for Person {
+    fn from(info: &TeamMemberInfo) -> Self {
+        Person::from_member(info)
+    }
+}
+
 // ----- files (M7) ---------------------------------------------------------
 
 /// One file shared in a chat/channel or listed from a drive (milestone **M7**).
@@ -1159,6 +1221,53 @@ mod tests {
         });
         assert!(!plain.is_owner());
         assert!(plain.email.is_none());
+    }
+
+    // ----- B3: people -------------------------------------------------------
+
+    #[test]
+    fn person_converts_from_a_directory_member() {
+        let person = Person::from_member(&TeamMemberInfo {
+            id: "u1".into(),
+            display_name: "Ava Lindqvist".into(),
+            user_id: Some("u1".into()),
+            email: Some("ava@contoso.com".into()),
+            roles: Vec::new(),
+            is_owner: false,
+        });
+        assert_eq!(person.id, "u1");
+        assert_eq!(person.display_name, "Ava Lindqvist");
+        assert_eq!(person.email.as_deref(), Some("ava@contoso.com"));
+        // The projection does not carry a job title: it is never guessed.
+        assert!(person.job_title.is_none());
+        assert_eq!(person.label(), "Ava Lindqvist <ava@contoso.com>");
+        // The `From` impl delegates to `from_member`.
+        assert_eq!(
+            Person::from(&TeamMemberInfo {
+                id: "u1".into(),
+                display_name: "Ava Lindqvist".into(),
+                user_id: Some("u1".into()),
+                email: Some("ava@contoso.com".into()),
+                roles: Vec::new(),
+                is_owner: false,
+            }),
+            person
+        );
+    }
+
+    #[test]
+    fn person_label_omits_a_missing_email_and_round_trips() {
+        let person = Person::from_member(&TeamMemberInfo {
+            id: "u2".into(),
+            display_name: "Tom Becker".into(),
+            user_id: None,
+            email: None,
+            roles: Vec::new(),
+            is_owner: false,
+        });
+        assert_eq!(person.label(), "Tom Becker");
+        let back: Person = serde_json::from_str(&serde_json::to_string(&person).unwrap()).unwrap();
+        assert_eq!(back, person);
     }
 
     #[test]
