@@ -12,6 +12,7 @@ pub mod composer;
 pub mod conversation;
 pub mod files;
 pub mod login;
+pub mod quick_switcher;
 pub mod settings;
 pub mod shell;
 pub mod teams;

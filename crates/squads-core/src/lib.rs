@@ -50,7 +50,7 @@ pub use presence::{
 };
 pub use realtime::{EventBus, RealtimeEvent, RealtimeService};
 pub use session::{Session, SessionState};
-pub use settings::{Settings, Theme, WindowSettings};
+pub use settings::{Accent, Settings, Theme, WindowSettings};
 pub use store::{Account, Counts, Store};
 pub use teams::Teams;
 pub use text::{Mention, html_escape, mentions, strip_html};

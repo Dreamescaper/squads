@@ -485,4 +485,36 @@ media are not.
 **Mitigation:** a developer on a machine with a display should run
 `cargo run -p squads-app` and walk the checklist in `docs/PROGRESS.md` ("M10 —
 egui UI → How to run the GUI locally"); wire the picker and real media as
-follow-ups (M11).
+follow-ups beyond the planned milestones (see B-013).
+
+### B-013 — M11 polish limits: shortcut placeholders, notification settings, and unbuilt bundles
+
+M11 landed keyboard shortcuts, expanded settings, theming and packaging *docs*,
+but three things are deliberately bounded:
+
+1. **Two shortcuts are placeholders.** `Ctrl/Cmd+Shift+M` (mute) has no media
+   device in the default build, so it toggles an app-level flag and shows a
+   toast; `Ctrl/Cmd+Enter` (send) is a no-op with no conversation open. The
+   mapping and dispatch exist and are tested; the underlying features are
+   B-011/B-012.
+2. **The notification settings gate *routing*, not *delivery*.** The
+   `notifications_enabled` / `notify_only_mentions` switches feed the pure
+   [`route`](../crates/squads-core/src/notifications.rs) and are honoured by the
+   app's realtime path, but the default notifier is still a `LogNotifier`: real
+   desktop toasts need the default-off `desktop-notifications` feature and a
+   session bus (B-010). Quiet hours remain unimplemented.
+3. **No bundle is produced or verified.** `docs/PACKAGING.md` gives concrete
+   Linux/macOS/Windows instructions and `packaging/` holds the `.desktop` file
+   and a placeholder icon, but no AppImage/Flatpak/`.app`/MSI is built in CI —
+   that needs platform runners, a display and signing credentials this
+   environment lacks. The `strip = "symbols"` release profile and the CI
+   `cargo build --release` are the only packaging-adjacent things verified here.
+
+**Impact:** the M11 *surface* (mapping, settings, persistence, theming, docs,
+CI) is verified offline; the *features behind the placeholders* and the
+*installers* are not.
+
+**Mitigation:** the shortcut mapping is pure and additive (add an arm in
+`resolve`/`apply_shortcut` once a feature exists); the notification settings are
+already threaded to the router; the packaging instructions are concrete enough
+for a contributor to run and correct on real hardware.

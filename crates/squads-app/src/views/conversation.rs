@@ -15,10 +15,6 @@ use squads_core::model::Message;
 use crate::app::{Action, SquadsApp, short_time};
 use crate::views::composer;
 
-/// Fixed row height for the virtualized list. Message bubbles are single-line
-/// in the default font at this size; longer bodies wrap within the row.
-const ROW_HEIGHT: f32 = 78.0;
-
 /// Render the conversation for the selected chat/channel.
 pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
     egui::CentralPanel::default().show(ui, |ui| {
@@ -49,6 +45,29 @@ pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
                 });
             });
         });
+        if app.timeline_search_open() {
+            egui::Panel::top("conversation_search").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let label = ui.label("Search messages");
+                    let mut query = app.timeline_filter().to_string();
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut query)
+                            .hint_text("Search in conversation")
+                            .desired_width(ui.available_width() - 96.0),
+                    );
+                    let response = response.labelled_by(label.id);
+                    if app.take_timeline_search_focus() {
+                        response.request_focus();
+                    }
+                    if response.changed() {
+                        app.set_timeline_filter(query);
+                    }
+                    if ui.button("Close search").clicked() {
+                        app.push_action(Action::CloseOverlays);
+                    }
+                });
+            });
+        }
         egui::Panel::bottom("composer_bar").show(ui, |ui| {
             ui.separator();
             composer::show(app, ui);
@@ -71,20 +90,29 @@ pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
                 });
         }
 
-        if app.has_older() {
-            if ui.button("Load older messages").clicked() {
-                app.push_action(Action::LoadOlder(chat_id.clone()));
-            }
+        if app.has_older() && ui.button("Load older messages").clicked() {
+            app.push_action(Action::LoadOlder(chat_id.clone()));
         }
 
-        let timeline = app.timeline().to_vec();
+        let filter = app.timeline_filter().to_lowercase();
+        let timeline: Vec<Message> = app
+            .timeline()
+            .iter()
+            .filter(|message| filter.is_empty() || message.content.to_lowercase().contains(&filter))
+            .cloned()
+            .collect();
         if timeline.is_empty() {
             ui.add_space(12.0);
-            ui.label(RichText::new("No messages cached yet.").weak());
+            let text = if filter.is_empty() {
+                "No messages cached yet."
+            } else {
+                "No messages match the search."
+            };
+            ui.label(RichText::new(text).weak());
         }
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
-            .show_rows(ui, ROW_HEIGHT, timeline.len(), |ui, range| {
+            .show_rows(ui, app.row_height(), timeline.len(), |ui, range| {
                 for index in range {
                     bubble(app, ui, &timeline[index], index);
                 }

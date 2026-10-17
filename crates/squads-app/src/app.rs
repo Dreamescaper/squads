@@ -28,12 +28,13 @@ use std::time::Duration;
 
 use squads_core::model::{Channel, Message, SendState};
 use squads_core::{
-    AppDirs, CallLogEntry, CallService, CallState, Chat, ContactPresence, FileEntry, Files,
-    IncomingCall, Messaging, RealtimeEvent, Session, Settings, SignInProgress, Store, Team, Teams,
-    Theme,
+    Accent, AppDirs, CallIdentity, CallLogEntry, CallService, CallState, Chat, ContactPresence,
+    FileEntry, Files, IncomingCall, Messaging, NotificationContext, RealtimeEvent, Session,
+    Settings, SignInProgress, Store, Team, Teams, Theme,
 };
 
 use crate::runtime::{AppEvent, AppRuntime};
+use crate::shortcuts::{self, Shortcut};
 use crate::theme::{self, Palette};
 use crate::views;
 
@@ -88,7 +89,7 @@ impl Page {
 /// user asked for; [`SquadsApp::apply_actions`] turns it into a backend call or
 /// a state change. Keeping them separate means a view never mutates shared
 /// state mid-layout and a test can inspect the queue.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// Start the device-code sign-in flow.
     BeginSignIn {
@@ -159,6 +160,34 @@ pub enum Action {
     ResetCall,
     /// Switch the colour theme.
     SetTheme(Theme),
+    /// Switch the accent colour.
+    SetAccent(Accent),
+    /// Set the UI font scale.
+    SetFontScale(f32),
+    /// Toggle compact density.
+    SetCompactMode(bool),
+    /// Toggle notification delivery.
+    SetNotificationsEnabled(bool),
+    /// Toggle "only mentions notify".
+    SetNotifyOnlyMentions(bool),
+    /// Set the download directory (empty string clears it to the default).
+    SetDownloadDir(String),
+    /// Open/close the quick chat switcher (`Ctrl/Cmd+K`).
+    ToggleQuickSwitcher,
+    /// Show the in-conversation message search (`Ctrl/Cmd+F`).
+    FocusTimelineSearch,
+    /// Close overlays and clear the active search (`Esc`).
+    CloseOverlays,
+    /// Jump to the settings page (`Ctrl/Cmd+,`).
+    OpenSettings,
+    /// Select the next chat (`j` / `Down`).
+    NextChat,
+    /// Select the previous chat (`k` / `Up`).
+    PrevChat,
+    /// Send the current draft of the selected conversation (`Ctrl/Cmd+Enter`).
+    SendDraft,
+    /// Mute/unmute — a placeholder with no media device (`Ctrl/Cmd+Shift+M`).
+    ToggleMute,
     /// Clear the transient toasts.
     DismissToasts,
 }
@@ -214,6 +243,18 @@ pub struct SquadsApp {
     drafts: HashMap<String, String>,
     search: String,
     show_info: bool,
+    /// Quick switcher overlay: whether it is open, the typed query, and a
+    /// one-shot focus request for its input.
+    quick_switcher_open: bool,
+    quick_switcher_query: String,
+    focus_quick_switcher: bool,
+    /// In-conversation search: whether the search bar is shown, the filter, and
+    /// a one-shot focus request for its input.
+    timeline_search_open: bool,
+    timeline_filter: String,
+    focus_timeline_search: bool,
+    /// App-level mute placeholder (there is no media device in this build).
+    muted: bool,
     /// Unread counts per chat, recomputed when the chat list reloads (never per
     /// frame — the store is synchronous and this keeps idle frames cheap).
     unread: HashMap<String, usize>,
@@ -300,7 +341,7 @@ impl SquadsApp {
         session: Session,
         settings: Settings,
     ) -> anyhow::Result<Self> {
-        let palette = theme::install(&ctx, settings.theme);
+        let palette = theme::install(&ctx, &settings);
         let store = Arc::clone(session.store());
         let profile = session.profile().to_string();
         let runtime = AppRuntime::new()?;
@@ -330,6 +371,13 @@ impl SquadsApp {
             drafts: HashMap::new(),
             search: String::new(),
             show_info: false,
+            quick_switcher_open: false,
+            quick_switcher_query: String::new(),
+            focus_quick_switcher: false,
+            timeline_search_open: false,
+            timeline_filter: String::new(),
+            focus_timeline_search: false,
+            muted: false,
             unread: HashMap::new(),
             pending: HashSet::new(),
             failed: HashSet::new(),
@@ -484,6 +532,124 @@ impl SquadsApp {
         self.search = text;
     }
 
+    // ----- M11: shortcuts, overlays and preferences --------------------------
+
+    /// Whether the quick switcher overlay is open.
+    pub fn quick_switcher_open(&self) -> bool {
+        self.quick_switcher_open
+    }
+
+    /// The quick switcher's typed query.
+    pub fn quick_switcher_query(&self) -> &str {
+        &self.quick_switcher_query
+    }
+
+    /// Set the quick switcher's query.
+    pub fn set_quick_switcher_query(&mut self, text: String) {
+        self.quick_switcher_query = text;
+    }
+
+    /// Take the one-shot quick-switcher focus request.
+    pub fn take_quick_switcher_focus(&mut self) -> bool {
+        std::mem::take(&mut self.focus_quick_switcher)
+    }
+
+    /// Whether the in-conversation search bar is shown.
+    pub fn timeline_search_open(&self) -> bool {
+        self.timeline_search_open
+    }
+
+    /// The in-conversation message filter.
+    pub fn timeline_filter(&self) -> &str {
+        &self.timeline_filter
+    }
+
+    /// Set the in-conversation message filter.
+    pub fn set_timeline_filter(&mut self, text: String) {
+        self.timeline_filter = text;
+    }
+
+    /// Take the one-shot timeline-search focus request.
+    pub fn take_timeline_search_focus(&mut self) -> bool {
+        std::mem::take(&mut self.focus_timeline_search)
+    }
+
+    /// Whether the app-level mute placeholder is engaged.
+    #[allow(dead_code)] // asserted by the headless tests
+    pub fn muted(&self) -> bool {
+        self.muted
+    }
+
+    /// Whether compact density is enabled (drives the timeline row height).
+    pub fn compact_mode(&self) -> bool {
+        self.settings.compact_mode
+    }
+
+    /// The timeline row height for the current density.
+    pub fn row_height(&self) -> f32 {
+        if self.settings.compact_mode {
+            56.0
+        } else {
+            78.0
+        }
+    }
+
+    /// The accent colour choice.
+    pub fn accent(&self) -> Accent {
+        self.settings.accent
+    }
+
+    /// The UI font scale.
+    pub fn font_scale(&self) -> f32 {
+        self.settings.effective_font_scale()
+    }
+
+    /// Whether notifications are enabled.
+    pub fn notifications_enabled(&self) -> bool {
+        self.settings.notifications_enabled
+    }
+
+    /// Whether only mentions notify.
+    pub fn notify_only_mentions(&self) -> bool {
+        self.settings.notify_only_mentions
+    }
+
+    /// The configured download directory (as a string; empty means the default).
+    pub fn download_dir(&self) -> String {
+        self.settings
+            .download_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Where a download should be written: the configured directory when set,
+    /// else the app's media directory.
+    pub fn download_target(&self) -> std::path::PathBuf {
+        self.settings
+            .download_dir
+            .clone()
+            .unwrap_or_else(|| self.dirs.media_dir())
+    }
+
+    /// The [`NotificationContext`] the app routes realtime messages with,
+    /// derived from the persisted notification settings, our own MRI (decoded
+    /// from the skype token when available) and the store's muted chats.
+    pub(crate) fn notification_context(&self) -> NotificationContext {
+        let mut ctx = NotificationContext::new()
+            .with_notifications_enabled(self.settings.notifications_enabled)
+            .with_notify_only_mentions(self.settings.notify_only_mentions);
+        if let Some(tokens) = self.session.tokens()
+            && let Some(identity) = CallIdentity::from_skype_token(tokens.skype_token())
+        {
+            ctx = ctx.with_self_mri(identity.mri);
+        }
+        if let Ok(muted) = self.store.muted_chats(&self.profile) {
+            ctx = ctx.mute_all(muted);
+        }
+        ctx
+    }
+
     /// The mutable draft for a conversation (creates an empty one on demand).
     pub fn draft_mut(&mut self, chat_id: &str) -> &mut String {
         self.drafts.entry(chat_id.to_string()).or_default()
@@ -492,6 +658,115 @@ impl SquadsApp {
     /// Queue an action (called by the views).
     pub fn push_action(&mut self, action: Action) {
         self.actions.push(action);
+    }
+
+    // ----- M11: shortcut input + dispatch -----------------------------------
+
+    /// Read egui's raw key events and dispatch every bound shortcut (M11).
+    ///
+    /// The mapping is the pure [`shortcuts::resolve`]; this method owns the
+    /// dispatch and the "is a text field focused?" guard so a plain `j`/`k`
+    /// never hijacks typing in the composer or a search box.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if !self.signed_in {
+            return;
+        }
+        let events: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => Some((*key, *modifiers)),
+                    _ => None,
+                })
+                .collect()
+        });
+        let text_focused = ctx.egui_wants_keyboard_input();
+        for (key, modifiers) in events {
+            let Some(shortcut) = shortcuts::resolve(key, modifiers) else {
+                continue;
+            };
+            if text_focused
+                && matches!(
+                    shortcut,
+                    Shortcut::NextChat | Shortcut::PrevChat | Shortcut::Send
+                )
+            {
+                continue;
+            }
+            self.apply_shortcut(shortcut);
+        }
+    }
+
+    /// Turn a resolved [`Shortcut`] into a queued [`Action`] — the dispatch half
+    /// of the M11 shortcut design (the mapping lives in [`crate::shortcuts`]).
+    pub(crate) fn apply_shortcut(&mut self, shortcut: Shortcut) {
+        tracing::trace!(
+            shortcut = shortcut.label(),
+            placeholder = shortcut.is_placeholder(),
+            "keyboard shortcut"
+        );
+        match shortcut {
+            Shortcut::QuickSwitcher => self.push_action(Action::ToggleQuickSwitcher),
+            Shortcut::SearchInChat => self.push_action(Action::FocusTimelineSearch),
+            Shortcut::CloseOverlay => self.push_action(Action::CloseOverlays),
+            Shortcut::OpenSettings => self.push_action(Action::OpenSettings),
+            Shortcut::ToggleMute => self.push_action(Action::ToggleMute),
+            Shortcut::NextChat => self.push_action(Action::NextChat),
+            Shortcut::PrevChat => self.push_action(Action::PrevChat),
+            Shortcut::Send => self.push_action(Action::SendDraft),
+        }
+    }
+
+    /// Select the chat `delta` rows from the current selection (clamped to the
+    /// list; an unselected list starts at the first/last row).
+    fn select_relative_chat(&mut self, delta: i32) {
+        if self.chats.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_chat
+            .as_ref()
+            .and_then(|id| self.chats.iter().position(|chat| &chat.id == id));
+        let len = self.chats.len() as i32;
+        let next = match current {
+            Some(index) => (index as i32 + delta).clamp(0, len - 1) as usize,
+            None if delta >= 0 => 0,
+            None => self.chats.len() - 1,
+        };
+        let id = self.chats[next].id.clone();
+        self.push_action(Action::SelectChat(id));
+    }
+
+    /// Re-install the theme from the current settings (after a preference
+    /// change) and persist them.
+    fn reinstall_theme(&mut self) {
+        self.palette = theme::install(&self.ctx, &self.settings);
+        self.persist_settings();
+    }
+
+    /// Persist the current settings, surfacing a write error as a toast.
+    fn persist_settings(&mut self) {
+        if let Err(e) = self.settings.save(&self.dirs) {
+            self.push_error(e);
+        }
+    }
+
+    /// Route a realtime event to a notification using the persisted settings
+    /// (M11 wiring). Delivery goes through the session's notifier — a
+    /// [`LogNotifier`](squads_core::LogNotifier) by default, a desktop notifier
+    /// under the default-off feature.
+    fn notify_realtime(&self, event: &RealtimeEvent) {
+        if !self.settings.notifications_enabled {
+            return;
+        }
+        let ctx = self.notification_context();
+        let _ = self.session.notifications().notify_event(event, &ctx);
     }
 
     /// A preview line for a chat (falls back to the last sender).
@@ -789,7 +1064,7 @@ impl SquadsApp {
         else {
             return;
         };
-        let dest = self.dirs.media_dir().join(&entry.name);
+        let dest = self.download_target().join(&entry.name);
         let dest_path = dest.to_string_lossy().into_owned();
         self.runtime.spawn(async move {
             match files.download(&entry, &dest_path, |_, _| {}).await {
@@ -947,6 +1222,7 @@ impl SquadsApp {
                     self.reload_timeline();
                 }
                 self.reload_chats_from_store();
+                self.notify_realtime(&event);
             }
             RealtimeEvent::MessageEdited {
                 chat_id,
@@ -1116,10 +1392,84 @@ impl SquadsApp {
             }
             Action::SetTheme(theme) => {
                 self.settings.theme = theme;
-                self.palette = theme::install(&self.ctx, theme);
-                if let Err(e) = self.settings.save(&self.dirs) {
-                    self.push_error(e);
+                self.reinstall_theme();
+            }
+            Action::SetAccent(accent) => {
+                self.settings.accent = accent;
+                self.reinstall_theme();
+            }
+            Action::SetFontScale(scale) => {
+                self.settings.font_scale = scale.clamp(
+                    squads_core::settings::FONT_SCALE_MIN,
+                    squads_core::settings::FONT_SCALE_MAX,
+                );
+                self.reinstall_theme();
+            }
+            Action::SetCompactMode(compact) => {
+                self.settings.compact_mode = compact;
+                self.reinstall_theme();
+            }
+            Action::SetNotificationsEnabled(enabled) => {
+                self.settings.notifications_enabled = enabled;
+                self.persist_settings();
+            }
+            Action::SetNotifyOnlyMentions(only) => {
+                self.settings.notify_only_mentions = only;
+                self.persist_settings();
+            }
+            Action::SetDownloadDir(path) => {
+                let trimmed = path.trim();
+                self.settings.download_dir = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(std::path::PathBuf::from(trimmed))
+                };
+                self.persist_settings();
+            }
+            Action::ToggleQuickSwitcher => {
+                self.quick_switcher_open = !self.quick_switcher_open;
+                if self.quick_switcher_open {
+                    self.focus_quick_switcher = true;
+                } else {
+                    self.quick_switcher_query.clear();
                 }
+            }
+            Action::FocusTimelineSearch => {
+                self.timeline_search_open = true;
+                self.focus_timeline_search = true;
+                self.page = Page::Chats;
+            }
+            Action::CloseOverlays => {
+                self.quick_switcher_open = false;
+                self.quick_switcher_query.clear();
+                self.timeline_search_open = false;
+                self.timeline_filter.clear();
+                self.search.clear();
+                self.show_info = false;
+            }
+            Action::OpenSettings => self.dispatch(Action::SetPage(Page::Settings)),
+            Action::NextChat => self.select_relative_chat(1),
+            Action::PrevChat => self.select_relative_chat(-1),
+            Action::SendDraft => {
+                if let Some(chat_id) = self.selected_chat.clone() {
+                    let text = self.draft(&chat_id).trim().to_string();
+                    if !text.is_empty() {
+                        self.drafts.insert(chat_id.clone(), String::new());
+                        // Reuse the normal send path (and its applied log).
+                        self.push_action(Action::SendMessage { chat_id, text });
+                    }
+                }
+            }
+            Action::ToggleMute => {
+                self.muted = !self.muted;
+                self.toasts.push(Toast {
+                    text: if self.muted {
+                        "Muted (placeholder — no media device in this build).".into()
+                    } else {
+                        "Unmuted (placeholder).".into()
+                    },
+                    error: false,
+                });
             }
             Action::DismissToasts => self.toasts.clear(),
         }
@@ -1181,6 +1531,9 @@ impl eframe::App for SquadsApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Shortcuts are read from the raw input first, so a shortcut queued this
+        // frame is applied at the end of it.
+        self.handle_shortcuts(ui.ctx());
         // Panels must be added before the central content, so the status bar
         // comes first.
         self.show_status_bar(ui);
@@ -1189,6 +1542,8 @@ impl eframe::App for SquadsApp {
         } else {
             views::login::show(self, ui);
         }
+        // The quick switcher is a floating overlay, drawn after the shell.
+        views::quick_switcher::show(self, ui.ctx());
         self.apply_actions();
     }
 }

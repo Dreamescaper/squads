@@ -19,6 +19,7 @@ use squads_core::model::{Channel, FileEntry, Message, SendState};
 use squads_core::{AppDirs, Chat, Session, SessionState, Settings, Store, Team};
 
 use crate::app::{Action, Page, SquadsApp};
+use crate::shortcuts::Shortcut;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -254,4 +255,171 @@ fn switching_sections_updates_the_page() {
             "expected the {page:?} page after clicking its nav button"
         );
     }
+}
+
+#[test]
+fn command_shortcuts_open_and_close_the_overlays() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+    });
+    harness.run();
+
+    // Ctrl/Cmd+K opens the quick switcher.
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    harness.run();
+    assert!(
+        harness.state().quick_switcher_open(),
+        "Ctrl+K should open the quick switcher"
+    );
+
+    // Esc closes it.
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(
+        !harness.state().quick_switcher_open(),
+        "Esc should close the quick switcher"
+    );
+
+    // Ctrl/Cmd+F shows the in-conversation search.
+    harness.get_by_label("Alice").click();
+    harness.run();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F);
+    harness.run();
+    assert!(
+        harness.state().timeline_search_open(),
+        "Ctrl+F should show the timeline search"
+    );
+
+    // Esc hides it again.
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(!harness.state().timeline_search_open());
+}
+
+#[test]
+fn apply_shortcut_dispatches_actions() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+    });
+    harness.run();
+
+    // The dispatch half of the shortcut design, driven directly.
+    harness.state_mut().apply_shortcut(Shortcut::QuickSwitcher);
+    harness.run();
+    assert!(harness.state().quick_switcher_open());
+
+    harness.state_mut().apply_shortcut(Shortcut::CloseOverlay);
+    harness.run();
+    assert!(!harness.state().quick_switcher_open());
+
+    harness.state_mut().apply_shortcut(Shortcut::ToggleMute);
+    harness.run();
+    assert!(harness.state().muted());
+
+    // Send dispatches the selected conversation's draft through the normal
+    // send action.
+    harness.get_by_label("Alice").click();
+    harness.run();
+    harness.state_mut().draft_mut("c1").push_str("hi there");
+    harness.state_mut().apply_shortcut(Shortcut::Send);
+    harness.run();
+    assert_eq!(harness.state().draft("c1"), "", "the draft is cleared");
+    let sent = harness
+        .state()
+        .applied_actions()
+        .iter()
+        .any(|action| matches!(action, Action::SendMessage { text, .. } if text == "hi there"));
+    assert!(
+        sent,
+        "expected a SendMessage action; got {:?}",
+        harness.state().applied_actions()
+    );
+}
+
+#[test]
+fn notification_context_follows_the_settings() {
+    let (mut harness, _store) = app_harness(|_| {});
+    harness.run();
+
+    // Defaults: enabled, all messages.
+    let ctx = harness.state().notification_context();
+    assert!(ctx.notifications_enabled());
+    assert!(!ctx.notify_only_mentions());
+
+    // The settings screen flips them and the context follows.
+    harness.get_by_label("Settings").click();
+    harness.run();
+    harness.get_by_label("Enable notifications").click();
+    harness.run();
+    assert!(
+        !harness
+            .state()
+            .notification_context()
+            .notifications_enabled()
+    );
+
+    harness.get_by_label("Enable notifications").click();
+    harness.run();
+    harness.get_by_label("Notify only for mentions").click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .notification_context()
+            .notify_only_mentions()
+    );
+}
+
+#[test]
+fn j_and_k_navigate_the_chat_list() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats(
+                "default",
+                &[chat("c1", "Alice"), chat("c2", "Bob"), chat("c3", "Carol")],
+            )
+            .expect("chats");
+    });
+    harness.run();
+
+    // `j` selects the first chat, then moves down.
+    harness.key_press(egui::Key::J);
+    harness.run();
+    let first = harness.state().chats()[0].id.clone();
+    assert_eq!(harness.state().selected_chat(), Some(first.as_str()));
+
+    harness.key_press(egui::Key::J);
+    harness.run();
+    let second = harness.state().chats()[1].id.clone();
+    assert_eq!(harness.state().selected_chat(), Some(second.as_str()));
+
+    // `k` moves back up.
+    harness.key_press(egui::Key::K);
+    harness.run();
+    assert_eq!(harness.state().selected_chat(), Some(first.as_str()));
+}
+
+#[test]
+fn settings_screen_edits_preferences() {
+    let (mut harness, _store) = app_harness(|_| {});
+    harness.run();
+    harness.get_by_label("Settings").click();
+    harness.run();
+
+    // The M11 controls are present.
+    harness.get_by_label("Compact mode");
+    harness.get_by_label("Enable notifications");
+    harness.get_by_label("Notify only for mentions");
+    harness.get_by_label("Download folder");
+
+    harness.get_by_label("Compact mode").click();
+    harness.run();
+    assert!(
+        harness.state().compact_mode(),
+        "clicking Compact mode should enable it"
+    );
 }

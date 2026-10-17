@@ -17,7 +17,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started · ⛔ blocked (see [BLO
 | M8 | Presence & notifications | ✅ | Two presence backends (Graph + unified `presence.teams.microsoft.com`) behind one `Presence`; `text::mentions`; pure notification routing + `Notifier` (desktop behind a default-off feature); schema **v5** (`chats.muted`) + unread/activity derivation; `Session::presence()`/`notifications()`. |
 | M9 | Audio/video calls | ✅ | `calls` layer: UI `CallState` machine + `CallDirection`; injectable epconv `CallSignaller` (create→join-SDP→invite, accept→media-answer, end); SDP/SRTP/RTP offline tests; `MediaSession` seam with `LoopbackMedia` (runs `macav::call_dry_run`), real audio behind default-off `audio`/`video-capture`; `on_notification` incoming calls (B-008 noted); recording wrappers; schema **v6** `call_log`; `Session::calls()`. |
 | M10 | egui UI | ✅ | App shell (nav rail + list + timeline + composer + info), login/teams/files/calls/settings screens, tokio runtime bridge + Action pattern, virtualized timeline, headless `egui_kittest` tests. |
-| M11 | Polish & packaging | ⬜ | |
+| M11 | Polish & packaging | ✅ | Pure `shortcuts` mapping + app dispatch; expanded forward-compatible `Settings` (accent, font scale, compact, notifications, download dir) + settings screen; light/dark + accents; `docs/PACKAGING.md` + `packaging/`; CI workflow; release `strip`; docs final pass (`STATUS.md`). |
 
 ---
 
@@ -901,3 +901,97 @@ squads-core` still passes **281**; `cargo test -p squads-protocol` still passes
 verification is compile + the `egui_kittest` tests). **B-012** (the attachment
 picker is a stub — the `Files::upload` action path exists but no file dialog
 opens; device media is absent so calls are signalling-only, B-011).
+
+---
+
+## M11 — Polish & packaging
+
+**Goal.** Make the app keyboard-driven, give it real persisted preferences and a
+second theme, and finish the repository for other people: build/packaging notes,
+CI, and a final documentation pass — all still building and testing **offline
+with default features**.
+
+**Landed.**
+
+- `crates/squads-app/src/shortcuts.rs` (new) — the **pure** shortcut mapping.
+  `resolve(key, modifiers) -> Option<Shortcut>` covers `Ctrl/Cmd+K` (quick
+  switcher), `Ctrl/Cmd+F` (in-conversation search), `Esc` (close overlays /
+  clear search), `Ctrl/Cmd+,` (settings), `Ctrl/Cmd+Shift+M` (mute placeholder),
+  `j`/`k` and `Down`/`Up` (chat navigation) and `Ctrl/Cmd+Enter` (send). It
+  looks only at the key and modifiers, so it is unit-tested with hand-built
+  `egui::Modifiers` and no display (ADR-029).
+- `app.rs` — the **dispatch** half: `handle_shortcuts` reads raw
+  `egui::Event::Key` presses in `ui()`, and `apply_shortcut` turns each
+  `Shortcut` into a queued `Action` (the M10 pipeline). New actions:
+  `ToggleQuickSwitcher`, `FocusTimelineSearch`, `CloseOverlays`, `OpenSettings`,
+  `NextChat`, `PrevChat`, `SendDraft`, `ToggleMute`, plus the settings actions
+  below. Plain `j`/`k`/arrows are suppressed while a text field is focused, and
+  `Ctrl/Cmd+Enter` is left to the focused composer so it cannot double-send.
+- `views/quick_switcher.rs` (new) — a floating overlay that filters the cached
+  chats and opens the picked one; `Esc`/Close closes it.
+- `views/conversation.rs` — an in-conversation **message filter** (shown by
+  `Ctrl/Cmd+F`) that filters the virtualized timeline, and a compact row height.
+- `views/settings.rs` — the real preferences screen: theme, **accent**, **font
+  scale** slider, **compact mode**, notification switches, a **download
+  directory** field, and the account/sign-out block.
+- `crates/squads-core/src/settings.rs` — `Settings` grows `accent`, `font_scale`,
+  `compact_mode`, `notifications_enabled`, `notify_only_mentions` and
+  `download_dir`, with a hand-written `Default` and **container-level**
+  `#[serde(default)]` so an old file missing the new keys still loads with the
+  meaningful defaults (ADR-030). `Settings::effective_font_scale` clamps a
+  hand-edited value. New `Accent` enum.
+- `crates/squads-core/src/notifications.rs` — `NotificationContext` gains
+  `notifications_enabled` and `notify_only_mentions` (both permissive by
+  default, so existing behaviour is unchanged); `route` honours them. The app
+  builds the context from the persisted settings and the store's muted chats and
+  routes each realtime `NewMessage` through the session's notifier.
+- `theme.rs` — light **and** dark visuals, a small accent palette, the font
+  scale via `Context::set_zoom_factor`, and compact spacing; re-applied and
+  persisted on every settings change, and applied on the next start.
+- `packaging/` — `dev.squads.squads.desktop`, a placeholder `dev.squads.squads.svg`
+  icon and a short `README.md`. `docs/PACKAGING.md` has the concrete Linux
+  (install + AppImage/Flatpak sketches + system libs), macOS (`.app` layout +
+  `Info.plist`) and Windows (zip/MSI) instructions, the runtime prerequisites,
+  and the config/data/cache locations.
+- `.github/workflows/ci.yml` — push/PR: `cargo fmt -p squads-core -p squads-app
+  -- --check`, `cargo clippy -p squads-core -p squads-app --all-targets` (no
+  `-D warnings`), `cargo test --workspace`, `cargo build --release` (ADR-031).
+- Root `Cargo.toml` — the release profile keeps `lto = "thin"` /
+  `codegen-units = 1` and adds `strip = "symbols"` (release-only, so tests are
+  unaffected).
+- Docs — new `STATUS.md` (one-screen state, ADR list, blockers, how to verify);
+  `README.md` feature matrix + run/config/troubleshooting; `docs/README.md`
+  index; this PROGRESS section; ADR-029/030/031; `PLAN.md` M11 ticked.
+
+**Decisions.** **ADR-029** (shortcuts: pure mapping + app dispatch),
+**ADR-030** (settings forward-compatibility via container-level serde defaults),
+**ADR-031** (CI scope — our crates only — and the release profile).
+
+**Tests.** `cargo test -p squads-app` — **18** (the 5 M10 headless tests + 6
+`shortcuts` unit tests + 2 `theme` tests + 5 new headless tests: the command
+shortcuts open/close the overlays, `apply_shortcut` dispatches (including the
+draft send), `j`/`k` navigate the chat list, the settings screen edits
+preferences, and the notification context follows the settings). `cargo test -p
+squads-core` — **285** (281 from M1–M9 + 2 `settings` and 2 `notifications`
+tests: the old-file-missing-new-keys forward-compatibility case, the font-scale
+clamp, disabled notifications, and notify-only-mentions). `cargo test -p
+squads-protocol` still passes **377**. `cargo build --workspace` and `cargo
+build --workspace --release` both succeed; `cargo fmt -p squads-core -p
+squads-app -- --check` is clean.
+
+**How to verify by hand** (needs a display; B-001):
+
+1. `cargo run -p squads-app`, sign in, and press each shortcut:
+   `Ctrl/Cmd+K` (quick switcher), `Ctrl/Cmd+F` (message search), `Esc` (close),
+   `Ctrl/Cmd+,` (settings), `Ctrl/Cmd+Shift+M` (mute placeholder),
+   `j`/`k` (chat navigation), `Ctrl/Cmd+Enter` (send).
+2. In **Settings** choose Light + an accent, drag the font scale, toggle compact
+   mode and the notification switches, set a download folder; restart and confirm
+   the choices are still in effect (`~/.config/squads/settings.json`).
+3. Follow `docs/PACKAGING.md` for a local install and `docs/STATUS.md` for the
+   full hand-verification checklist.
+
+**Blockers.** **B-001**/**B-012** (the UI is verified by compilation and the
+headless `egui_kittest` tests, not by pixels). **B-010** (notification *delivery*
+is still a log notifier; the settings switch gates routing, not a real toast).
+The mute shortcut and the attachment picker remain placeholders (B-011/B-012).

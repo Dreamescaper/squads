@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: fmt · clippy · test · release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The default (device-free) build needs OpenSSL for reqwest/native-tls
+      # and the X11/Wayland/GL development libraries for eframe/egui. The audio
+      # and video-capture features are default-off, so ALSA/SDL2 are not needed.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libssl-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libgl1-mesa-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Lint and format only our crates. The vendored `squads-protocol` crate
+      # has pre-existing warnings (and its own formatting); we neither fix nor
+      # fail on those here. Clippy runs without `-D warnings` on purpose: our
+      # crates also carry a few intentional `manual_async_fn` lints (ADR-007).
+      - name: Format (our crates)
+        run: cargo fmt -p squads-core -p squads-app -- --check
+
+      - name: Clippy (our crates)
+        run: cargo clippy -p squads-core -p squads-app --all-targets
+
+      - name: Test (workspace)
+        run: cargo test --workspace
+
+      - name: Release build (workspace)
+        run: cargo build --release

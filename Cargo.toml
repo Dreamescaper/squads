@@ -65,3 +65,7 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Strip symbols from the shipped binary: smaller downloads, no loss of
+# behaviour, and tests run on the dev profile so this cannot affect them.
+# (Set to `"debuginfo"` instead if you want symbolized release backtraces.)
+strip = "symbols"

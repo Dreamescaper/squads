@@ -222,16 +222,38 @@ impl Notifier for DesktopNotifier {
 /// Built by the caller (the UI/session knows our MRI and name; the store knows
 /// the muted chats and our own messages) and kept **pure** so [`route`] is
 /// trivially testable.
-#[derive(Debug, Clone, Default)]
+///
+/// The two switches mirror the M11 [`Settings`](crate::settings::Settings)
+/// notification options: `notifications_enabled` turns delivery off entirely,
+/// and `notify_only_mentions` suppresses ordinary messages so only mentions and
+/// replies-to-own get through. Both default to the permissive values
+/// (enabled, all messages) so a context built without them behaves exactly as
+/// before.
+#[derive(Debug, Clone)]
 pub struct NotificationContext {
     self_mri: Option<String>,
     self_name: Option<String>,
     muted_chats: HashSet<String>,
     own_message_ids: HashSet<String>,
+    notifications_enabled: bool,
+    notify_only_mentions: bool,
+}
+
+impl Default for NotificationContext {
+    fn default() -> Self {
+        Self {
+            self_mri: None,
+            self_name: None,
+            muted_chats: HashSet::new(),
+            own_message_ids: HashSet::new(),
+            notifications_enabled: true,
+            notify_only_mentions: false,
+        }
+    }
 }
 
 impl NotificationContext {
-    /// An empty context (nothing muted, nobody known as "us").
+    /// An empty context (nothing muted, nobody known as "us", notifications on).
     pub fn new() -> Self {
         Self::default()
     }
@@ -252,6 +274,18 @@ impl NotificationContext {
     /// Set our display name only.
     pub fn with_self_name(mut self, name: impl Into<String>) -> Self {
         self.self_name = Some(name.into());
+        self
+    }
+
+    /// Turn notification delivery on or off (default: on).
+    pub fn with_notifications_enabled(mut self, enabled: bool) -> Self {
+        self.notifications_enabled = enabled;
+        self
+    }
+
+    /// Suppress ordinary messages, keeping only mentions/replies (default: off).
+    pub fn with_notify_only_mentions(mut self, only_mentions: bool) -> Self {
+        self.notify_only_mentions = only_mentions;
         self
     }
 
@@ -289,6 +323,16 @@ impl NotificationContext {
         self.muted_chats.contains(chat_id)
     }
 
+    /// Whether notifications are enabled at all.
+    pub fn notifications_enabled(&self) -> bool {
+        self.notifications_enabled
+    }
+
+    /// Whether only mentions/replies should notify.
+    pub fn notify_only_mentions(&self) -> bool {
+        self.notify_only_mentions
+    }
+
     /// Our MRI, when known.
     pub fn self_mri(&self) -> Option<&str> {
         self.self_mri.as_deref()
@@ -303,8 +347,13 @@ impl NotificationContext {
 /// Route one realtime event to a notification (see the module docs).
 ///
 /// Returns `None` for anything but a new message from someone else in a
-/// non-muted chat.
+/// non-muted chat, when notifications are enabled. With
+/// [`NotificationContext::with_notify_only_mentions`] set, an ordinary message
+/// (not a mention and not a reply to one of ours) is also dropped.
 pub fn route(event: &RealtimeEvent, ctx: &NotificationContext) -> Option<Notification> {
+    if !ctx.notifications_enabled() {
+        return None;
+    }
     let RealtimeEvent::NewMessage { chat_id, message } = event else {
         return None;
     };
@@ -319,6 +368,9 @@ pub fn route(event: &RealtimeEvent, ctx: &NotificationContext) -> Option<Notific
     }
     let mention = message_mentions(message, ctx);
     let reply = !mention && is_reply_to_own(message, ctx);
+    if ctx.notify_only_mentions() && !mention && !reply {
+        return None;
+    }
     let kind = if mention {
         NotificationKind::Mention
     } else if reply {
@@ -711,6 +763,71 @@ mod tests {
         assert_eq!(n.kind, NotificationKind::NewMessage);
         assert!(!n.mention);
         assert_eq!(n.body, "standup at 5");
+    }
+
+    #[test]
+    fn disabled_notifications_never_route() {
+        let ctx = NotificationContext::new()
+            .with_self(SELF, "Me")
+            .with_notifications_enabled(false);
+        let msg = message("m1", "c1", "8:orgid:other", "Alice", "<p>hi</p>", None);
+        assert!(route(&new_message("c1", msg), &ctx).is_none());
+
+        // A mention is dropped too when notifications are off.
+        let mention = message(
+            "m2",
+            "c1",
+            "8:orgid:other",
+            "Alice",
+            r#"<p>hey <at mri="8:orgid:self">Me</at></p>"#,
+            None,
+        );
+        assert!(route(&new_message("c1", mention), &ctx).is_none());
+
+        // The switch is readable back.
+        assert!(!ctx.notifications_enabled());
+    }
+
+    #[test]
+    fn notify_only_mentions_drops_ordinary_messages() {
+        let ctx = NotificationContext::new()
+            .with_self(SELF, "Me")
+            .with_notify_only_mentions(true)
+            .own_message("parent-1");
+
+        // Ordinary message: dropped.
+        let ordinary = message("m1", "c1", "8:orgid:other", "Alice", "<p>hi</p>", None);
+        assert!(route(&new_message("c1", ordinary), &ctx).is_none());
+
+        // A mention still notifies.
+        let mention = message(
+            "m2",
+            "c1",
+            "8:orgid:other",
+            "Alice",
+            r#"<p>hey <at mri="8:orgid:self">Me</at></p>"#,
+            None,
+        );
+        assert_eq!(
+            route(&new_message("c1", mention), &ctx).unwrap().kind,
+            NotificationKind::Mention
+        );
+
+        // A reply to one of our messages still notifies.
+        let reply = message(
+            "m3",
+            "c1",
+            "8:orgid:other",
+            "Alice",
+            "<p>sure</p>",
+            Some("parent-1"),
+        );
+        assert_eq!(
+            route(&new_message("c1", reply), &ctx).unwrap().kind,
+            NotificationKind::Reply
+        );
+
+        assert!(ctx.notify_only_mentions());
     }
 
     #[test]

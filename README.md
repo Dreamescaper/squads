@@ -3,8 +3,11 @@
 An alternative, cross-platform **Microsoft Teams** client built with **Rust** and
 [**egui**](https://github.com/emilk/egui) (immediate-mode, event-driven, glow/OpenGL).
 
-> Status: early. The protocol core is in place; the UI and the session/store layers are
-> being built milestone by milestone. See [`docs/PLAN.md`](docs/PLAN.md).
+> Status: the planned milestones (**M0–M11**) are implemented. The workspace
+> builds and tests **offline, with default features**; the network paths need a
+> live tenant and the UI needs a display, neither of which exist in the build
+> environment. See [`docs/STATUS.md`](docs/STATUS.md) for the one-screen state and
+> [`docs/PLAN.md`](docs/PLAN.md) for the roadmap.
 
 ## Why
 
@@ -37,16 +40,82 @@ crates/
   squads-app/        the egui application
 ```
 
-## Building
+## Feature status
+
+| Area | Works (verified offline) | Unverified (needs a live tenant / device / display) | Deferred |
+|---|---|---|---|
+| Auth | Device-code flow, five-token model, 0600 token store, refresh | Real AAD/`authsvc` exchange | Browser PKCE loopback (B-004) |
+| Chat | Offline-first store + paging, optimistic send, edit/delete/reply/react/receipts | Server acceptance of the write shapes (U-002) | — |
+| Realtime | Trouter wrap, typed event bus, write-through | Live push; call frames are filtered upstream (B-008) | — |
+| Teams/channels | Metadata cache, channel history, thread replies, middle-tier writes | Write acceptance; channel reactions/receipts (U-003) | — |
+| Files | Graph list/upload/download/links/versions, coarse progress | Real SharePoint/OneDrive acceptance (U-004) | Streaming I/O |
+| Presence | Two backends, unified by default; pure mapping | Unified token audience/shapes (B-009/U-005) | Quiet hours (B-010) |
+| Notifications | Pure routing, unread/activity, settings switches | Desktop toasts (need DBus, B-010) | Quiet hours |
+| Calls | State machine, epconv signalling, SDP/SRTP/RTP, loopback, call log | Live calls + real media devices (B-011/U-006) | Hardware video (D-002) |
+| UI | egui shell + all screens, keyboard shortcuts, light/dark + accents, compact mode | Actual pixels/layout (B-012) | Attachment picker (B-012) |
+| Packaging | `cargo build --release`, `.desktop`+icon, docs | No installer is built/signed here (B-013) | AppImage/Flatpak/MSI |
+
+The full blocker list is in [`docs/BLOCKERS.md`](docs/BLOCKERS.md).
+
+## Building & running
 
 ```sh
-cargo build            # workspace
-cargo run -p squads-app  # GUI (requires a display server)
-cargo test --workspace
+export PATH="$HOME/.cargo/bin:$PATH"   # if cargo is not on PATH
+
+cargo build                 # workspace, default features (device/network-free)
+cargo run -p squads-app     # GUI (binary `squads`; requires a display server)
+cargo test --workspace      # offline test suite
+cargo build --release       # shipped configuration
 ```
 
-Linux build prerequisites: a C toolchain, `libssl-dev`, `libasound2-dev` (audio),
-`libxkbcommon-dev`, `libwayland-dev`/X11, and `libgl1-mesa-dev`.
+Linux build prerequisites: a C toolchain, `pkg-config`, `libssl-dev`,
+`libxkbcommon-dev` (+ `libxkbcommon-x11-dev`), `libwayland-dev`/X11,
+`libgl1-mesa-dev`. (`libasound2-dev` and SDL2 are only needed for the
+default-off `audio`/`video-capture` features.) See
+[`docs/PACKAGING.md`](docs/PACKAGING.md) for the full, per-platform instructions
+and for AppImage/Flatpak/macOS/Windows packaging notes.
+
+### Keyboard shortcuts
+
+`Ctrl/Cmd+K` quick chat switcher · `Ctrl/Cmd+F` search in conversation · `Esc`
+close overlays / clear search · `Ctrl/Cmd+,` settings · `Ctrl/Cmd+Shift+M`
+mute (placeholder) · `j`/`k` or `↓`/`↑` chat navigation · `Ctrl/Cmd+Enter` send.
+
+## Configuration & data
+
+Resolved by `squads_core::AppDirs` (`directories`, project id
+`dev.squads.squads`):
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Config | `~/.config/squads` | `~/Library/Application Support/dev.squads.squads` | `%APPDATA%\squads\squads\config` |
+| Data | `~/.local/share/squads` | `~/Library/Application Support/dev.squads.squads` | `%APPDATA%\squads\squads\data` |
+| Cache | `~/.cache/squads` | `~/Library/Caches/dev.squads.squads` | `%LOCALAPPDATA%\squads\squads\cache` |
+
+- `settings.json` — preferences (theme, accent, font scale, compact mode,
+  notifications, download directory).
+- `tokens.json` / `tokens-<profile>.json` — the token set, mode `0600` (secret).
+- `store.sqlite` (+ `-wal`/`-shm`) — the offline cache; **unencrypted at rest**
+  (B-007).
+- `media/` — downloads when no download directory is set.
+
+## Troubleshooting
+
+- **The window never opens / "no display".** Squads is a GUI app and needs an X11
+  or Wayland session. In a headless shell (CI, containers, SSH) `cargo run -p
+  squads-app` cannot show a window; use the tests and the
+  [`squads-cli`](crates/squads-protocol) binary for protocol work instead. This
+  is why the UI is verified by compilation and headless `egui_kittest` tests,
+  not screenshots (B-001/B-012).
+- **`libEGL`/`libGL`/`libwayland` errors at start.** Install the graphics and
+  windowing development libraries listed above; a software GL driver (Mesa
+  `llvmpipe`) is sufficient.
+- **No chat/call data.** Everything network-facing needs a signed-in Microsoft
+  work/school account and a live tenant; nothing is exercised against production
+  here (B-002).
+- **Settings look wrong after a hand edit.** A malformed `settings.json` is a
+  hard error by design (so a typo is noticed); delete the file to fall back to
+  defaults. New fields are forward-compatible — an old file keeps loading.
 
 ## License
 

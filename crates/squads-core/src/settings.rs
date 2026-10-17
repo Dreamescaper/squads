@@ -1,9 +1,12 @@
 //! User settings, persisted as JSON under [`AppDirs::settings_file`].
 //!
-//! This is a **placeholder** the UI will grow (M10/M11). M3 intentionally keeps
-//! it tiny: a theme choice and an initial window size. Every field is
-//! `#[serde(default)]`, so an old file missing new fields — or a hand-edited one
-//! with extra fields — still loads.
+//! This grew from the M3 placeholder into the real preferences the M11 settings
+//! screen edits: the colour [`Theme`] and [`Accent`], a UI font scale, a compact
+//! density toggle, notification switches and a download directory. Every field
+//! is `#[serde(default)]` **at the container level**, so an old file missing the
+//! new keys loads with the struct's [`Default`] for each missing field (the
+//! forward-compatibility property the M11 tests pin). A hand-edited file with
+//! extra fields also loads.
 //!
 //! Writes are atomic (unique temp file in the target directory, then `rename`),
 //! so a crash mid-save can never leave a truncated `settings.json`. Unlike the
@@ -17,6 +20,13 @@ use serde::{Deserialize, Serialize};
 use crate::error::{CoreError, Result};
 use crate::paths::AppDirs;
 
+/// Smallest accepted [`Settings::font_scale`].
+pub const FONT_SCALE_MIN: f32 = 0.8;
+/// Largest accepted [`Settings::font_scale`].
+pub const FONT_SCALE_MAX: f32 = 1.6;
+/// The default UI font scale.
+pub const FONT_SCALE_DEFAULT: f32 = 1.0;
+
 /// Colour theme selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +38,21 @@ pub enum Theme {
     Light,
     /// Always dark.
     Dark,
+}
+
+/// Accent colour used for selection, links and the send button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Accent {
+    /// Teams-like blue (the default).
+    #[default]
+    Blue,
+    /// Teal.
+    Teal,
+    /// Purple.
+    Purple,
+    /// Orange.
+    Orange,
 }
 
 /// Initial window size in logical pixels.
@@ -53,19 +78,63 @@ impl Default for WindowSettings {
 }
 
 /// Persisted user settings.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+///
+/// `#[serde(default)]` at the **container** level means a missing key is filled
+/// from [`Settings::default`] — so a file written before M11 (no `font_scale`,
+/// no `notifications_enabled`, …) still loads and gets today's defaults rather
+/// than a type-default `0.0`/`false`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Colour theme.
     pub theme: Theme,
+    /// Accent colour.
+    pub accent: Accent,
     /// Initial window size.
     pub window: WindowSettings,
+    /// UI font scale (`1.0` = 100%).
+    pub font_scale: f32,
+    /// Compact density (tighter spacing / shorter rows).
+    pub compact_mode: bool,
+    /// Whether notifications are delivered at all.
+    pub notifications_enabled: bool,
+    /// Whether only mentions (and not every message) notify.
+    pub notify_only_mentions: bool,
+    /// Where downloads are written; `None` means the app's media directory.
+    pub download_dir: Option<PathBuf>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: Theme::default(),
+            accent: Accent::default(),
+            window: WindowSettings::default(),
+            font_scale: FONT_SCALE_DEFAULT,
+            compact_mode: false,
+            notifications_enabled: true,
+            notify_only_mentions: false,
+            download_dir: None,
+        }
+    }
 }
 
 impl Settings {
     /// The file these settings live in, for `dirs`.
     pub fn path(dirs: &AppDirs) -> PathBuf {
         dirs.settings_file()
+    }
+
+    /// [`Settings::font_scale`] clamped to the accepted range.
+    ///
+    /// A hand-edited or future file can carry an out-of-range value; the app
+    /// applies this rather than trusting the file blindly.
+    pub fn effective_font_scale(&self) -> f32 {
+        if self.font_scale.is_finite() {
+            self.font_scale.clamp(FONT_SCALE_MIN, FONT_SCALE_MAX)
+        } else {
+            FONT_SCALE_DEFAULT
+        }
     }
 
     /// Load settings from `dirs`.
@@ -120,8 +189,14 @@ mod tests {
     fn defaults_are_sane() {
         let settings = Settings::default();
         assert_eq!(settings.theme, Theme::System);
+        assert_eq!(settings.accent, Accent::Blue);
         assert_eq!(settings.window.width, 1080.0);
         assert_eq!(settings.window.height, 720.0);
+        assert_eq!(settings.font_scale, FONT_SCALE_DEFAULT);
+        assert!(!settings.compact_mode);
+        assert!(settings.notifications_enabled);
+        assert!(!settings.notify_only_mentions);
+        assert_eq!(settings.download_dir, None);
     }
 
     #[test]
@@ -135,6 +210,12 @@ mod tests {
                 width: 800.0,
                 height: 600.0,
             },
+            font_scale: 1.25,
+            compact_mode: true,
+            notifications_enabled: false,
+            notify_only_mentions: true,
+            download_dir: Some(PathBuf::from("/tmp/squads-downloads")),
+            ..Settings::default()
         };
         settings.save(&dirs).unwrap();
         assert!(dirs.settings_file().is_file());
@@ -144,36 +225,78 @@ mod tests {
     }
 
     #[test]
-    fn json_round_trip_and_theme_encoding() {
+    fn json_round_trip_and_enum_encoding() {
         let settings = Settings {
             theme: Theme::Light,
+            accent: Accent::Teal,
             window: WindowSettings {
                 width: 1024.0,
                 height: 768.0,
             },
+            font_scale: 1.1,
+            compact_mode: true,
+            notifications_enabled: true,
+            notify_only_mentions: true,
+            download_dir: Some(PathBuf::from("/data/dl")),
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(
             json.contains("\"light\""),
             "theme should be snake_case: {json}"
         );
+        assert!(
+            json.contains("\"teal\""),
+            "accent should be snake_case: {json}"
+        );
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back, settings);
     }
 
     #[test]
-    fn partial_and_unknown_fields_use_defaults() {
-        // A file written by an older build (no `window`) plus a field this build
-        // does not know: both must load.
-        let parsed: Settings =
-            serde_json::from_str(r#"{"theme":"dark","future_field":42}"#).unwrap();
+    fn forward_compatible_load_of_an_old_file_missing_new_keys() {
+        // A file written before M11: only `theme` and `window` exist. Every new
+        // field must come from `Settings::default`, not the type default
+        // (`font_scale` must be 1.0, not 0.0; notifications must be on).
+        let parsed: Settings = serde_json::from_str(
+            r#"{"theme":"dark","window":{"width":640,"height":480},"future_field":42}"#,
+        )
+        .unwrap();
         assert_eq!(parsed.theme, Theme::Dark);
-        assert_eq!(parsed.window, WindowSettings::default());
+        assert_eq!(parsed.window.width, 640.0);
+        assert_eq!(parsed.window.height, 480.0);
+        assert_eq!(parsed.accent, Accent::Blue);
+        assert_eq!(parsed.font_scale, FONT_SCALE_DEFAULT);
+        assert!(!parsed.compact_mode);
+        assert!(parsed.notifications_enabled);
+        assert!(!parsed.notify_only_mentions);
+        assert_eq!(parsed.download_dir, None);
+    }
 
+    #[test]
+    fn partial_fields_keep_their_defaults() {
         // Only one window field present: the other keeps its default.
         let parsed: Settings = serde_json::from_str(r#"{"window":{"width":640}}"#).unwrap();
         assert_eq!(parsed.window.width, 640.0);
         assert_eq!(parsed.window.height, 720.0);
+    }
+
+    #[test]
+    fn font_scale_is_clamped() {
+        let too_big = Settings {
+            font_scale: 12.0,
+            ..Settings::default()
+        };
+        assert_eq!(too_big.effective_font_scale(), FONT_SCALE_MAX);
+        let too_small = Settings {
+            font_scale: 0.1,
+            ..Settings::default()
+        };
+        assert_eq!(too_small.effective_font_scale(), FONT_SCALE_MIN);
+        let nan = Settings {
+            font_scale: f32::NAN,
+            ..Settings::default()
+        };
+        assert_eq!(nan.effective_font_scale(), FONT_SCALE_DEFAULT);
     }
 
     #[test]

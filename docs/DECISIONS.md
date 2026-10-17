@@ -1130,3 +1130,119 @@ and deterministic (B-002: no tenant).
   useful forcing function for accessible UI.
 - The action log is a first-class test seam: a widget can be verified to have
   queued the right `Action` even when the backend call itself cannot run.
+
+---
+
+## ADR-029 — Keyboard shortcuts: a pure mapping in `shortcuts`, dispatch owned by the app
+
+**Status:** accepted (M11)
+
+**Context.** M11 asks for keyboard-driven operation (`Ctrl/Cmd+K` quick switcher,
+`Ctrl/Cmd+F` in-conversation search, `Esc`, `Ctrl/Cmd+,` settings,
+`Ctrl/Cmd+Shift+M` mute, `j`/`k` navigation, `Ctrl/Cmd+Enter` send). The brief
+also demands the mapping be a **pure function unit-tested without a display**,
+while the existing app pattern (ADR-026) is "views queue `Action`s; the app
+applies them after the frame". Shortcuts therefore have two halves — *what key
+means what* and *what the app does about it* — and mixing them (e.g. reading
+`egui::InputState` inside a view) would make the mapping untestable headlessly.
+
+**Decision.**
+
+1. `crates/squads-app/src/shortcuts.rs` owns the mapping:
+   `resolve(key: egui::Key, modifiers: egui::Modifiers) -> Option<Shortcut>`.
+   It is **pure and total** — it looks only at the key and modifiers, never at
+   app state — and is unit-tested directly with hand-built `Modifiers`.
+2. Cross-platform `Ctrl`/`Cmd` is expressed with `Modifiers::command` alone
+   (egui sets it to `ctrl` off macOS and to ⌘ on it).
+3. `SquadsApp` owns the **dispatch**: `handle_shortcuts` reads the raw
+   `egui::Event::Key { pressed: true, .. }` events from the input state and
+   calls `apply_shortcut`, which turns each `Shortcut` into a queued `Action`
+   (reusing the M10 action pipeline). Plain `j`/`k`/arrows are ignored while a
+   text field has focus (`Context::egui_wants_keyboard_input`), so typing is not
+   hijacked; `Ctrl/Cmd+Enter` is owned by the focused composer (to avoid a
+   double send) and only dispatched by the global handler when no field is
+   focused.
+4. Shortcuts whose feature is incomplete are **documented placeholders**, not
+   missing bindings: `ToggleMute` has no media device in this build and toggles
+   an app-level flag plus a toast; `Send` is a no-op with no conversation open.
+   The mapping and dispatch exist and are tested regardless.
+
+**Consequences.**
+
+- The whole mapping is covered by ordinary unit tests (no harness, no display);
+  the dispatch is covered by `apply_shortcut` + the `egui_kittest` harness.
+- Adding a shortcut is a two-line change (a `resolve` arm and an `apply_shortcut`
+  arm) with an obvious test site.
+- The mapping intentionally knows nothing about focus; that policy lives in the
+  app so it can be changed without touching the pure function.
+
+---
+
+## ADR-030 — Settings forward-compatibility: container-level serde defaults
+
+**Status:** accepted (M11)
+
+**Context.** M11 grows `Settings` from the M3 placeholder
+(`theme`, `window`) into the real preferences screen: `accent`, `font_scale`,
+`compact_mode`, `notifications_enabled`, `notify_only_mentions` and
+`download_dir`. Existing users already have a `settings.json` with only the old
+keys, and it must keep loading. The M3 field types also mean a **type-default**
+fallback is wrong: a missing `font_scale` must default to `1.0` (not `0.0`) and a
+missing `notifications_enabled` to `true` (not `false`).
+
+**Decision.** Keep `#[serde(default)]` at the **container** level (not per
+field), so every missing key is filled from `Settings`'s hand-written `Default`
+implementation — which supplies the *meaningful* defaults above — and implement
+`Default` manually rather than deriving it. `Accent` and the existing `Theme`
+are snake_case enums with a `#[default]` variant, so an unknown/absent value
+degrades to the default. Out-of-range values (a hand-edited `font_scale`) are
+clamped by `Settings::effective_font_scale` rather than trusted.
+
+**Consequences.**
+
+- An old or partial file loads; the M11 tests pin the "old file missing every
+  new key" case and the exact default values.
+- Adding a field later is a one-line change plus a `Default` entry; unknown
+  *extra* fields were already tolerated by serde.
+- The app applies the persisted choices on start (theme/accent/font
+  scale/compact via `theme::install`, notification switches via the
+  `NotificationContext`, download directory via `download_target`), so a choice
+  made in the settings screen is in effect on the next launch.
+
+---
+
+## ADR-031 — CI scope (our crates only) and the release profile
+
+**Status:** accepted (M11)
+
+**Context.** M11 adds CI. The workspace contains the vendored
+`squads-protocol` crate, which carries **pre-existing warnings and its own
+formatting** that we must not fail on (and must not "fix", per ADR-001 — the
+vendored source is kept close to upstream). Our own crates also carry a few
+**intentional** lints (the `manual_async_fn` warnings on the ADR-007
+`AuthTransport` impls and their test fakes), so a blanket `-D warnings` would be
+wrong.
+
+**Decision.** `.github/workflows/ci.yml` runs on push/PR:
+
+1. `cargo fmt -p squads-core -p squads-app -- --check` — formatting for **our
+   crates only**.
+2. `cargo clippy -p squads-core -p squads-app --all-targets` — lint our crates,
+   **without** `-D warnings` (pre-existing/intentional lints are reported, not
+   fatal).
+3. `cargo test --workspace` — the whole suite (including the vendored 377).
+4. `cargo build --release` — the shipped configuration.
+
+The release profile keeps `lto = "thin"` and `codegen-units = 1`, and adds
+`strip = "symbols"` for a smaller binary. Stripping is release-only, so the dev
+profile the tests use is untouched.
+
+**Consequences.**
+
+- CI is green on the vendored crate's warnings by construction, and stays
+  meaningful for our code.
+- The release artifact is smaller; symbolized release backtraces require
+  changing one line (`strip = "debuginfo"`).
+- Cross-platform bundles are *documented* (ADR/PACKAGING) but not built in CI;
+  producing and signing installers needs platform runners and credentials this
+  environment does not have.

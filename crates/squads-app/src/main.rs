@@ -27,6 +27,7 @@
 
 mod app;
 mod runtime;
+mod shortcuts;
 mod theme;
 mod views;
 

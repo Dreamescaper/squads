@@ -107,6 +107,11 @@ Each milestone is an independent work item for the implementation loop: **implem
 ### M11 — Polish & packaging
 - Settings, keyboard shortcuts, themes, cross-platform build/packaging, docs, README.
 - **Exit:** release build config + packaging notes.
+- **Landed:** pure `shortcuts` mapping + dispatch; expanded, forward-compatible
+  `Settings` (accent, font scale, compact, notifications, download dir) with a
+  settings screen; light/dark + accent theming; `docs/PACKAGING.md` + the
+  `packaging/` assets; `.github/workflows/ci.yml`; release `strip`; and the
+  docs final pass (`STATUS.md`, README matrix, index). See `PROGRESS.md` (M11).
 
 ## 4. Working agreement (the loop)
 
@@ -146,4 +151,4 @@ Documentation is updated continuously:
 - [x] M8 — Presence & notifications
 - [x] M9 — Audio/video calls
 - [x] M10 — egui UI
-- [ ] M11 — Polish & packaging
+- [x] M11 — Polish & packaging

@@ -1,7 +1,8 @@
-//! The message composer (milestone **M10**).
+//! The message composer (milestone **M10**, Ctrl/Cmd+Enter in **M11**).
 //!
-//! A multiline input where **Enter sends** and **Shift+Enter inserts a
-//! newline**, a **Send** button (disabled while the draft is empty) and an
+//! A multiline input where **Enter sends** (and **Shift+Enter inserts a
+//! newline**; **Ctrl/Cmd+Enter** also sends, matching the M11 shortcut), a
+//! **Send** button (disabled while the draft is empty) and an
 //! **Attach** button. Sending queues [`Action::SendMessage`], which the app
 //! turns into an optimistic [`Messaging::send_text`](squads_core::Messaging::send_text)
 //! (ADR-014): the pending bubble appears immediately and is re-keyed to the
@@ -35,7 +36,9 @@ pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
         );
         let response = response.labelled_by(label.id);
 
-        // Enter sends, Shift+Enter inserts a newline. egui's multiline editor
+        // Enter sends; Shift+Enter inserts a newline (Ctrl/Cmd+Enter also
+        // sends — the M11 shortcut; the composer owns it while focused so the
+        // global handler does not double-send). egui's multiline editor
         // consumes Enter to insert `\n`; we detect the key press afterwards and
         // strip the trailing newline before sending.
         let enter = response.has_focus()
