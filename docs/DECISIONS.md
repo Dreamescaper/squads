@@ -1263,7 +1263,9 @@ is fragile and would still not validate the platform's own linker/signing story.
 
 - `ubuntu-latest` → `x86_64-unknown-linux-gnu` → `.tar.gz`
 - `macos-14` → `aarch64-apple-darwin` → `.zip` (`Squads.app`)
-- `macos-13` → `x86_64-apple-darwin` → `.zip` (`Squads.app`)
+- `macos-14` → `x86_64-apple-darwin` → `.zip` (`Squads.app`); the Intel slice
+  is cross-built on the arm64 runner because GitHub retired the `macos-13`
+  (x86_64) image
 - `windows-latest` → `x86_64-pc-windows-msvc` → `.zip`
 
 It builds with `cargo build --locked --release --target <triple>` using **default

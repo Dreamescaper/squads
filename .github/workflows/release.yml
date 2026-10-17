@@ -33,7 +33,10 @@ jobs:
             target: aarch64-apple-darwin
             label: macos-arm64
             artifact: squads-macos-arm64
-          - os: macos-13
+          # The Intel slice is cross-built on an Apple-Silicon runner: the
+          # `macos-13` (x86_64) image is retired, and the macOS SDK/toolchain on
+          # arm64 links x86_64 fine, so no Intel runner is needed.
+          - os: macos-14
             target: x86_64-apple-darwin
             label: macos-x86_64
             artifact: squads-macos-x86_64

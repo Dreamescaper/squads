@@ -199,7 +199,7 @@ downloadable archive per platform on **native runners** (no cross-compilation):
 |---|---|---|---|
 | `ubuntu-latest` | `x86_64-unknown-linux-gnu` | `squads-linux-x86_64` | `squads-<version>-linux-x86_64.tar.gz` — `squads`, `squads-cli`, `LICENSE`, `NOTICE`, `README.md`, `packaging/` (`.desktop` + icon) |
 | `macos-14` | `aarch64-apple-darwin` | `squads-macos-arm64` | `squads-macos-arm64.zip` (`Squads.app`, ad-hoc signed) + `squads-macos-arm64-cli.zip` (`squads-cli` + docs) |
-| `macos-13` | `x86_64-apple-darwin` | `squads-macos-x86_64` | same layout as `arm64` |
+| `macos-14` | `x86_64-apple-darwin` | `squads-macos-x86_64` | same layout as `arm64` (the Intel slice is cross-built on the arm64 runner, since the `macos-13` image is retired) |
 | `windows-latest` | `x86_64-pc-windows-msvc` | `squads-windows-x86_64` | `squads-windows-x86_64.zip` — `squads.exe`, `squads-cli.exe`, `LICENSE`, `NOTICE`, `README.md` |
 
 **Triggers**
