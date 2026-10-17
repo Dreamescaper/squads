@@ -29,6 +29,7 @@ use crate::auth::flow::{AuthDriver, AuthTransport, HttpTransport, SignInProgress
 use crate::auth::store::{DEFAULT_PROFILE, FileTokenStore, TokenStore};
 use crate::auth::tokens::TokenSet;
 use crate::error::{CoreError, Result};
+use crate::messaging::Messaging;
 use crate::paths::AppDirs;
 use crate::realtime::{RealtimeEvent, RealtimeService};
 use crate::store::Store;
@@ -92,9 +93,10 @@ pub struct Session {
     store: Arc<Store>,
     tokens: Option<TokenSet>,
     sign_in: Option<SignInTask>,
-    /// Lazily-built protocol client (M2). Dropped whenever the token set
+    /// Lazily-built protocol client (M2), shared behind an `Arc` so the M5
+    /// [`Messaging`] service can hold it too. Dropped whenever the token set
     /// changes so the next [`Session::api`] rebuilds it with fresh credentials.
-    api: Option<ApiClient>,
+    api: Option<Arc<ApiClient>>,
     /// The running realtime (Trouter) feed (M4), if [`Session::start_realtime`]
     /// has been called.
     realtime: Option<RealtimeService>,
@@ -200,16 +202,39 @@ impl Session {
     /// so calling this never hits the network; the first `list_chats` /
     /// `read_messages` call does.
     pub fn api(&mut self) -> Result<&ApiClient> {
-        if self.api.is_none() {
-            let tokens = self.tokens.as_ref().ok_or(CoreError::NotSignedIn)?;
-            self.api = Some(ApiClient::from_tokens(tokens));
+        self.api_arc()?;
+        Ok(self.api.as_ref().expect("api built above").as_ref())
+    }
+
+    /// Build (or reuse) the shared protocol client, returning the `Arc`.
+    fn api_arc(&mut self) -> Result<Arc<ApiClient>> {
+        if let Some(api) = &self.api {
+            return Ok(Arc::clone(api));
         }
-        Ok(self.api.as_ref().expect("api built above"))
+        let tokens = self.tokens.as_ref().ok_or(CoreError::NotSignedIn)?;
+        let api = Arc::new(ApiClient::from_tokens(tokens));
+        self.api = Some(Arc::clone(&api));
+        Ok(api)
     }
 
     /// Whether a protocol client has already been built for this session.
     pub fn has_api(&self) -> bool {
         self.api.is_some()
+    }
+
+    /// The M5 messaging service for this session.
+    ///
+    /// Shares the session's [`Store`] and protocol client. Requires a token set
+    /// ([`CoreError::NotSignedIn`] otherwise); building is offline. The returned
+    /// [`Messaging`] owns its own in-memory paging cursors (ADR-016), so callers
+    /// that page should keep the handle they get back.
+    pub fn messaging(&mut self) -> Result<Messaging> {
+        let client = self.api_arc()?;
+        Ok(Messaging::new(
+            self.profile.clone(),
+            Arc::clone(&self.store),
+            client,
+        ))
     }
 
     /// Start the realtime (Trouter) feed for the current token set (M4).
@@ -527,7 +552,10 @@ mod tests {
         let db = Arc::new(crate::store::Store::open_in_memory().unwrap());
         let session = Session::with_token_store_and_db(dirs, "default", tokens, Arc::clone(&db))
             .expect("session");
-        assert_eq!(session.store().schema_version().unwrap(), 1);
+        assert_eq!(
+            session.store().schema_version().unwrap(),
+            crate::store::SCHEMA_VERSION
+        );
         assert!(Arc::ptr_eq(session.store(), &db));
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -801,6 +829,37 @@ mod tests {
             "t-graph"
         );
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ----- M5: messaging service ---------------------------------------------
+
+    #[test]
+    fn messaging_requires_tokens_and_shares_the_store_and_client() {
+        let (tmp, dirs_a) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs_a, "default", store).expect("session");
+        // No tokens yet: building the service must fail cleanly, no network.
+        let err = session.messaging().unwrap_err();
+        assert!(matches!(err, CoreError::NotSignedIn), "got {err:?}");
+
+        let (tmp2, dirs2) = dirs();
+        let store2 = Arc::new(MemoryTokenStore::new());
+        store2.save("work", &sample_set()).unwrap();
+        let mut session = Session::with_store(dirs2, "work", store2).expect("session");
+        session.restore().expect("restore");
+
+        let messaging = session.messaging().expect("messaging");
+        assert_eq!(messaging.profile(), "work");
+        assert!(Arc::ptr_eq(messaging.store(), session.store()));
+        assert_eq!(
+            messaging.client().request_count(),
+            0,
+            "building the service is offline"
+        );
+        // The session's cached client is the same one the service holds.
+        assert!(session.has_api());
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp2).ok();
     }
 
     // ----- M4: realtime wiring ------------------------------------------------

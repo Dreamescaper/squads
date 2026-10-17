@@ -140,7 +140,7 @@ Documentation is updated continuously:
 - [x] M2 — Protocol clients & session core
 - [x] M3 — Local persistence & offline cache
 - [x] M4 — Realtime (Trouter)
-- [ ] M5 — Messaging
+- [x] M5 — Messaging
 - [ ] M6 — Teams & channels
 - [ ] M7 — Files
 - [ ] M8 — Presence & notifications

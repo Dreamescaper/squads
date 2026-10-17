@@ -35,7 +35,8 @@ use std::fmt;
 
 use serde_json::{Map, Value};
 
-use crate::model::{Message, Reaction};
+use crate::model::{Message, Reaction, SendState};
+use crate::text::strip_html;
 
 /// The maximum number of fields we scan for a case-insensitive key is bounded by
 /// the object size; these helpers never recurse without a bound.
@@ -353,6 +354,7 @@ fn parse_message(chat_id: &str, o: &MapOf) -> Message {
         client_message_id,
         edited: false,
         is_own: false,
+        send_state: SendState::Sent,
     }
 }
 
@@ -443,80 +445,6 @@ fn str_field(o: &MapOf, key: &str) -> Option<String> {
         Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
-}
-
-/// Strip HTML for display, with the vendored block-boundary spacing rule
-/// (`</p><p>` becomes a space, inline tags vanish) and common-entity decoding.
-///
-/// This mirrors the parsing in `ost::api` (whose helpers are private) closely
-/// enough for M4's decode; M5 owns the full HTML/RichText model.
-fn strip_html(html: &str) -> String {
-    const BLOCK_TAGS: &[&str] = &[
-        "p",
-        "div",
-        "br",
-        "section",
-        "article",
-        "header",
-        "footer",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "ul",
-        "ol",
-        "li",
-        "dl",
-        "dt",
-        "dd",
-        "table",
-        "tr",
-        "td",
-        "th",
-        "blockquote",
-        "pre",
-        "hr",
-    ];
-    let mut out = String::with_capacity(html.len());
-    let mut tag = String::new();
-    let mut in_tag = false;
-    let mut pending_space = false;
-    for ch in html.chars() {
-        if in_tag {
-            if ch == '>' {
-                in_tag = false;
-                let name = tag
-                    .trim_start_matches('/')
-                    .split(|c: char| c.is_whitespace() || c == '/')
-                    .next()
-                    .unwrap_or("");
-                if BLOCK_TAGS.iter().any(|t| t.eq_ignore_ascii_case(name)) {
-                    pending_space = true;
-                }
-                tag.clear();
-            } else {
-                tag.push(ch);
-            }
-        } else if ch == '<' {
-            in_tag = true;
-        } else {
-            if pending_space {
-                pending_space = false;
-                if !out.is_empty() && !out.ends_with(char::is_whitespace) && !ch.is_whitespace() {
-                    out.push(' ');
-                }
-            }
-            out.push(ch);
-        }
-    }
-    out.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
 }
 
 /// Minimal `%XX` percent-decode (MRIs are colon-separated GUIDs; only `%3A` and

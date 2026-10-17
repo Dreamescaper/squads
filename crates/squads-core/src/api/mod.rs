@@ -24,6 +24,10 @@ use ost::api::MessageInfo;
 use ost::api::client::TeamsClient;
 use ost::config::Config;
 
+/// Protocol types surfaced by the M5 chat calls, re-exported so the UI and
+/// `messaging` do not need to reach into the vendored crate.
+pub use ost::api::{MessagesPage, ReadReceipt, SentMessage};
+
 use crate::auth::tokens::{StoredToken, TokenSet};
 use crate::error::Result;
 
@@ -147,6 +151,207 @@ impl ApiClient {
         tracing::debug!(count = messages.len(), call, "read messages");
         Ok(messages)
     }
+
+    /// Read **one page** of history and its backward cursor (M5).
+    ///
+    /// `page_url` is the previous page's `backward_link` for older history, or
+    /// `None` for the newest page. Unlike [`ApiClient::read_messages`], this
+    /// keeps the `_metadata.backwardLink` cursor, which is what backward paging
+    /// walks.
+    pub async fn read_messages_page(
+        &self,
+        chat_id: &str,
+        limit: usize,
+        page_url: Option<&str>,
+    ) -> Result<MessagesPage> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.read_messages_page",
+            limit,
+            paged = page_url.is_some(),
+            call
+        );
+        let page = ost::api::read_messages_page(&self.client, chat_id, limit, page_url)
+            .instrument(span)
+            .await?;
+        tracing::debug!(
+            count = page.messages.len(),
+            has_more = page.backward_link.is_some(),
+            call,
+            "read message page"
+        );
+        Ok(page)
+    }
+
+    /// Send a message body with a caller-owned `client_message_id` (M5).
+    ///
+    /// The `client_message_id` is the idempotency key: a retry reuses the same
+    /// value so one logical send never becomes two server messages. The server's
+    /// assigned id (if the receipt named one) comes back on [`SentMessage`].
+    pub async fn send_message(
+        &self,
+        chat_id: &str,
+        text: &str,
+        client_message_id: &str,
+    ) -> Result<SentMessage> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.send_message",
+            len = text.len(),
+            call
+        );
+        let sent =
+            ost::api::send_message_with_client_id(&self.client, chat_id, text, client_message_id)
+                .instrument(span)
+                .await?;
+        tracing::debug!(has_id = sent.id.is_some(), call, "sent message");
+        Ok(sent)
+    }
+
+    /// Post a quote reply with a caller-owned `client_message_id` (M5).
+    ///
+    /// The parent's sender and text are embedded in the wire `<quote>` block;
+    /// the parent id is recovered on read by the vendored `split_reply_quote`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reply_message(
+        &self,
+        chat_id: &str,
+        parent_id: &str,
+        parent_sender: &str,
+        parent_text: &str,
+        text: &str,
+        client_message_id: &str,
+    ) -> Result<SentMessage> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.reply_message",
+            len = text.len(),
+            call
+        );
+        let sent = ost::api::reply_message_with_client_id(
+            &self.client,
+            chat_id,
+            parent_id,
+            parent_sender,
+            parent_text,
+            text,
+            client_message_id,
+        )
+        .instrument(span)
+        .await?;
+        tracing::debug!(has_id = sent.id.is_some(), call, "sent reply");
+        Ok(sent)
+    }
+
+    /// Verify whether a message carrying `client_message_id` exists on the
+    /// server, by reading the newest page. Used by retry before re-posting
+    /// (M5): a timed-out POST that actually landed must not be sent twice.
+    pub async fn find_message_by_client_id(
+        &self,
+        chat_id: &str,
+        client_message_id: &str,
+    ) -> Result<Option<MessageInfo>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.find_message_by_client_id",
+            call
+        );
+        let found = ost::api::find_message_by_client_id(&self.client, chat_id, client_message_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(found = found.is_some(), call, "verified send by client id");
+        Ok(found)
+    }
+
+    /// Edit one of our own messages (PUT with `skypeeditedid`).
+    pub async fn edit_message(&self, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.edit_message", call);
+        ost::api::edit_message_with_client(&self.client, chat_id, message_id, text)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "edited message");
+        Ok(())
+    }
+
+    /// Delete one of our own messages (`?behavior=softDelete`).
+    pub async fn delete_message(&self, chat_id: &str, message_id: &str) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.delete_message", call);
+        ost::api::delete_message_with_client(&self.client, chat_id, message_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "deleted message");
+        Ok(())
+    }
+
+    /// Add an emoji reaction to a message. Unsupported emoji is rejected before
+    /// any request (see [`ost::api::REACTION_EMOJI`]).
+    pub async fn send_reaction(&self, chat_id: &str, message_id: &str, emoji: &str) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.send_reaction", call);
+        ost::api::send_reaction_with_client(&self.client, chat_id, message_id, emoji)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "added reaction");
+        Ok(())
+    }
+
+    /// Remove an emoji reaction from a message.
+    pub async fn remove_reaction(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.remove_reaction", call);
+        ost::api::remove_reaction_with_client(&self.client, chat_id, message_id, emoji)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "removed reaction");
+        Ok(())
+    }
+
+    /// Mark a conversation read up to `message_id` (consumption horizon PUT).
+    pub async fn mark_read(&self, chat_id: &str, message_id: &str) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.mark_read", call);
+        ost::api::mark_read_with_client(&self.client, chat_id, message_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "marked read");
+        Ok(())
+    }
+
+    /// Peer read positions for a thread (read-only).
+    pub async fn read_receipts(&self, thread_id: &str) -> Result<Vec<ReadReceipt>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.read_receipts",
+            call
+        );
+        let receipts = ost::api::read_receipts_data(&self.client, thread_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = receipts.len(), call, "read receipts");
+        Ok(receipts)
+    }
 }
 
 impl fmt::Debug for ApiClient {
@@ -206,6 +411,191 @@ pub(crate) async fn one_shot_json_stub(
         sock.shutdown().await.ok();
     });
     (base, seen, task)
+}
+
+/// One scripted HTTP response for [`http_stub`] (test-only).
+///
+/// `arrive`/`release` optionally turn the stub into a gate: it signals `arrive`
+/// when the request has been read, then waits for `release` before replying.
+/// That lets a test observe the client's state *while* a request is in flight
+/// (the optimistic-send boundary) without any timing or sleeps.
+#[cfg(test)]
+pub(crate) struct StubResponse {
+    /// HTTP status code to reply with.
+    pub status: u16,
+    /// Optional `Location` header (the server id receipt for sends).
+    pub location: Option<String>,
+    /// Response body (JSON).
+    pub body: String,
+    /// Signalled after the request is read, before the reply.
+    pub arrive: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Awaited before the reply is written.
+    pub release: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+#[cfg(test)]
+impl StubResponse {
+    /// A `200 OK` JSON response with the given body and no `Location`.
+    pub fn ok(body: impl Into<String>) -> Self {
+        Self {
+            status: 200,
+            location: None,
+            body: body.into(),
+            arrive: None,
+            release: None,
+        }
+    }
+
+    /// A `200 OK` response carrying the given `Location` header.
+    pub fn ok_location(location: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            status: 200,
+            location: Some(location.into()),
+            body: body.into(),
+            arrive: None,
+            release: None,
+        }
+    }
+
+    /// A response with an arbitrary status (e.g. `500`).
+    pub fn status(status: u16) -> Self {
+        Self {
+            status,
+            location: None,
+            body: String::new(),
+            arrive: None,
+            release: None,
+        }
+    }
+}
+
+/// Serve a scripted list of HTTP responses, one connection/request each.
+///
+/// Returns `(base_url, seen_requests, task)`. Every request (request line,
+/// headers **and body**) is recorded verbatim in order, so a test can assert
+/// the exact method/path/body the client produced. The task ends after the last
+/// response; a client that makes more requests than were scripted gets a
+/// connection error.
+#[cfg(test)]
+pub(crate) async fn http_stub(
+    responses: Vec<StubResponse>,
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    http_stub_with(move |_base| responses).await
+}
+
+/// Like [`http_stub`], but the responses are built from the bound base URL.
+///
+/// Lets a scripted response embed the stub's own origin (e.g. a
+/// `_metadata.backwardLink` that must point back at the same stub).
+#[cfg(test)]
+pub(crate) async fn http_stub_with<F>(
+    build: F,
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+)
+where
+    F: FnOnce(&str) -> Vec<StubResponse>,
+{
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stub binds");
+    let base = format!("http://{}", listener.local_addr().expect("stub addr"));
+    let responses = build(&base);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = std::sync::Arc::clone(&seen);
+    let task = tokio::spawn(async move {
+        for response in responses {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let request = read_http_request(&mut sock).await;
+            log.lock().unwrap_or_else(|e| e.into_inner()).push(request);
+            if let Some(arrive) = response.arrive {
+                let _ = arrive.send(());
+            }
+            if let Some(release) = response.release {
+                let _ = release.await;
+            }
+            let mut head = format!(
+                "HTTP/1.1 {} {}\r\n",
+                response.status,
+                status_text(response.status)
+            );
+            if let Some(location) = &response.location {
+                head.push_str(&format!("Location: {location}\r\n"));
+            }
+            head.push_str(&format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.body.len()
+            ));
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(response.body.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    (base, seen, task)
+}
+
+/// Read one HTTP request (headers plus a `Content-Length`-sized body) as text.
+#[cfg(test)]
+async fn read_http_request(sock: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    fn find_headers_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n")
+    }
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = sock.read(&mut tmp).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find_headers_end(&buf) {
+            let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+            let content_length = head
+                .lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    if k.eq_ignore_ascii_case("content-length") {
+                        v.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let body_start = pos + 4;
+            while buf.len() < body_start + content_length {
+                let n = sock.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+#[cfg(test)]
+fn status_text(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        400 => "Bad Request",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Status",
+    }
 }
 
 #[cfg(test)]

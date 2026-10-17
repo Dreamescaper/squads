@@ -167,6 +167,43 @@ explicit about:
 - **Concurrency:** `Store` is asserted `Send + Sync` and exercised single-threaded;
   real multi-threaded lock contention (UI + M4 realtime) is not benchmarked here.
 
+### U-002 — M5 messaging aspects not exercised offline
+
+M5's chat calls are thin wrappers over the vendored crate and are tested against
+local TCP stubs (request shape + store effects). The following cannot be
+exercised here (B-002 — no live tenant):
+
+- **Live send/edit/delete/reply/react/mark-read.** The exact server acceptance of
+  the POST/PUT/DELETE bodies — in particular that the real chat service returns a
+  `Location` (or `OriginalArrivalTime`) we can parse as the new message id, and
+  that a re-used `clientmessageid` is genuinely de-duplicated server-side — is
+  only verifiable against a real tenant. The vendored crate's own docs already
+  flag the reactions lane as *best-effort, not yet verified live*, and the
+  `?behavior=softDelete` delete shape as "exactly what the Teams web client
+  sends".
+- **Channel-vs-chat differences.** The vendored reactions/receipts lane targets
+  the native chat service with `skypetoken`; channel conversations
+  (`is_channel_conversation_id`, `@thread.tacv2`/`@thread.skype`) route through
+  different endpoints (thread replies, middle tier for some writes) that M5 does
+  **not** special-case — `Messaging` treats every id uniformly. M6 (teams &
+  channels) must add channel-aware send/reply/reaction/receipt routing. The
+  read-receipt `consumptionhorizons` endpoint in particular is a thread
+  (`/v1/threads/{id}/…`) call whose behaviour on channels is unverified here.
+- **Pending→sent re-key races.** `send_text` replaces the placeholder row with
+  the server-id row; if the realtime `NewMessage` for the same message lands in
+  between, a duplicate row can be created until a resync. Offline tests cover the
+  sequential paths only.
+- **Reaction reconciliation.** The local `react` adjustment is a coarse ±1 with no
+  reactor identity (we do not know our own MRI in `Messaging`); canonical counts
+  arrive with the next realtime update/history refresh. Not verified live.
+
+**Impact:** the wire-level correctness of the write calls is assumed from the
+vendored crate + stubs, not proven; channel messaging needs M6 routing.
+
+**Mitigation:** keep the write calls behind `ApiClient`/`Messaging` so M6 can
+slot in channel routing; M8 consumes `read_state`; the deterministic stub tests
+pin the exact request shapes so a regression in formatting is caught.
+
 ## Deferred work
 
 ### D-001 — Third-party Teams app hosting (TeamsJS/web frames)

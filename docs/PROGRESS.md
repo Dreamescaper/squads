@@ -11,7 +11,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started · ⛔ blocked (see [BLO
 | M2 | Protocol clients & session core | ✅ | `ApiClient` over the vendored `TeamsClient`; `tokens_to_config`; lazy `Session::api()`; token refresh; offline `list_chats`/`read_messages` tests. |
 | M3 | Local persistence & offline cache | ✅ | UI-free `model`; bundled-SQLite `Store` (`user_version` migrations, idempotent upserts, per-chat paging); JSON `Settings` with atomic saves; `Session` owns the store. |
 | M4 | Realtime (Trouter) | ✅ | Wrap the vendored Trouter loop; `RealtimeEvent` decode; `EventBus` broadcast fan-out; collector write-through; `Session::start_realtime`/`subscribe`. |
-| M5 | Messaging | ⬜ | |
+| M5 | Messaging | ✅ | `api` chat wrappers (page/send/reply/edit/delete/react/receipts); offline-first `Messaging` (open/load_older, optimistic `SendState` send + idempotent retry); shared `text` module; schema **v2** (`send_state`, `read_state`); `Session::messaging()`. |
 | M6 | Teams & channels | ⬜ | |
 | M7 | Files | ⬜ | |
 | M8 | Presence & notifications | ⬜ | |
@@ -301,3 +301,89 @@ has the row.
 **Blockers.** B-008 (call frames are filtered out of the hub → call
 notifications deferred to M9; `event_hub` is process-global; reconnect token
 staleness).
+
+---
+
+## M5 — Messaging
+
+**Goal.** Turn the M2 client + M3 store into the conversation service the
+timeline/composer drive: offline-first history with backward paging, optimistic
+sends with idempotent retry, edit/delete/reply/reactions/read receipts — all
+testable offline against local TCP stubs, with a shared HTML/text story.
+
+**Landed.**
+
+- `api` (M2 module, extended) — typed, instrumented wrappers over the vendored
+  chat calls, in the existing `ApiClient` style (redacting `Debug`, request
+  counter, `tracing` spans): `read_messages_page` (keeps the `backwardLink`),
+  `send_message` (caller-owned `clientmessageid` → `SentMessage`),
+  `reply_message`, `find_message_by_client_id`, `edit_message`, `delete_message`,
+  `send_reaction` / `remove_reaction`, `mark_read`, `read_receipts`. The
+  protocol types are re-exported (`MessagesPage`, `SentMessage`, `ReadReceipt`).
+  A richer **multi-request stub** (`api::http_stub`, scripted status/headers/
+  bodies, full request capture incl. bodies, and an optional arrive/release gate
+  for observing in-flight state) backs the offline tests; `one_shot_json_stub`
+  remains.
+- `model` — `SendState { Pending, Sent, Failed }` (`as_str`/`from_db`, serde,
+  `Default = Sent`) added to `Message.send_state`; `with_send_state`/
+  `set_send_state`; `Debug` prints it. Missing JSON/schema values default `Sent`.
+- `text` — **one** shared, documented HTML⇄text module (`strip_html`,
+  `html_escape`), reusing the M4 spacing-aware rules; `realtime::event` now calls
+  it (its private `strip_html` is gone). Outgoing HTML stays the vendored
+  fenced-code-aware `build_message_html`/`build_reply_html`. Tested for entities,
+  nested tags, `<pre>`, `<at>` mentions, unicode and malformed input.
+- `store` — **schema v2**. `messages.send_state` (guarded `ALTER TABLE`, existing
+  rows default `'sent'`) and a `read_state(chat_id, profile, message_id, read_at)`
+  table, plus methods `message`, `message_by_client_id`,
+  `update_message_send_state`, `set_read_state`, `read_state`. `upsert_messages`
+  persists `send_state`; `SCHEMA_VERSION = 2`.
+- `messaging` — the offline-first conversation service `Messaging { profile,
+  Arc<Store>, Arc<ApiClient>, in-memory cursors }`:
+  - `cached` (local-only instant read) and `open` (fetch newest page, map +
+    upsert, return the merged newest page + `backward_link`).
+  - `load_older` (walk the stored `backwardLink`, upsert, return the older
+    batch).
+  - `send_text` — **optimistic**: `Pending` row (fresh `client_message_id`,
+    `is_own`, id temporarily = the client id) is upserted before the POST; on
+    success re-keyed to the server id and marked `Sent`; on failure marked
+    `Failed` and retained.
+  - `retry` — reuses the same `client_message_id`, first probing
+    `find_message_by_client_id` so a landed POST is never double-sent.
+  - `reply` (quote block with the parent snippet resolved from the store),
+    `edit`, `delete`, `react` (add/remove, local count adjustment),
+    `mark_read` (API + `read_state`), `read_receipts`.
+  - `HistoryPage { messages (oldest-first), backward_link }`.
+- `session` — the cached `ApiClient` is now `Arc`-shared so `Session::messaging()`
+  can hand out a `Messaging` over the session's store + client (offline to
+  build; `NotSignedIn` without tokens). `Session::api()` is unchanged for callers.
+
+**Decisions.** **ADR-014** (optimistic sends + `SendState` + schema-v2
+`send_state`), **ADR-015** (one shared `text` module; outgoing HTML stays
+vendored), **ADR-016** (the paging cursor lives in memory, per `Messaging`
+handle).
+
+**Tests.** `cargo test -p squads-core` — **146** offline unit tests (120 from
+M1–M4 + 26 new: 12 `messaging`, 9 `text`, 5 `store`). `cargo test -p
+squads-protocol` still passes **377**. New coverage includes: the exact send
+request shape (`<p>…</p>`, `"messagetype":"RichText/Html"`, our
+`clientmessageid`) and server-id capture from the `Location` header; the
+optimistic boundary (a `Pending` row exists *before* the gated stub replies,
+`Sent` with the server id after); a 500 leaving `Failed` and a retry reusing the
+**same** `client_message_id` (POST → probe GET → POST); edit/delete/reply/react/
+mark_read request line + body against the stub with the store reflecting each
+change; backward paging (page 1 `backwardLink` → `load_older` fetches page 2,
+merged oldest-first, no duplicates); the **v1→v2 upgrade** (open a real v1
+database → reopen → `send_state` exists and the old row defaults to `sent`); and
+the `text` module cases.
+
+**How to verify manually** (real tenant; not runnable here): sign in, build
+`session.messaging()`, `open(chat)` and `load_older(chat)`; send a message and
+watch the bubble go pending → sent (its id becomes the server id); send with the
+network down, confirm the failed row survives, restore, and `retry` — the server
+must receive exactly one message carrying the original `clientmessageid`. Edit,
+delete, react and mark-read a message and confirm the store and the tenant
+agree.
+
+**Blockers.** **U-002** (untested live: real send/edit/react/mark-read, and the
+channel-vs-chat reaction/receipt differences). B-007 (chat/message content is
+still stored unencrypted at rest — the v2 columns add no new exposure).

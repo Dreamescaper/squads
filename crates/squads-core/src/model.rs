@@ -31,6 +31,52 @@ use serde::{Deserialize, Serialize};
 
 use ost::api::{ChatInfo, MessageInfo, ReactionCount, Reactor as WireReactor};
 
+/// Delivery state of a message we authored (milestone **M5**).
+///
+/// Optimistic sending writes a locally-authored message to the store *before*
+/// the network call; this enum is what the UI renders a pending/failed bubble
+/// from. Messages that arrive from the wire (history or realtime) are always
+/// [`SendState::Sent`]. The value is persisted in the `send_state` column
+/// (schema v2) as its lowercase name; an unknown/foreign value degrades to
+/// [`SendState::Sent`] rather than failing a read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendState {
+    /// Posted locally, awaiting the server's confirmation.
+    Pending,
+    /// Confirmed by the server (the default, and every wired-in message).
+    #[default]
+    Sent,
+    /// The POST failed; the row is retained so the UI can retry.
+    Failed,
+}
+
+impl SendState {
+    /// The lowercase name stored in the database / carried in JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SendState::Pending => "pending",
+            SendState::Sent => "sent",
+            SendState::Failed => "failed",
+        }
+    }
+
+    /// Parse a stored value; anything unrecognized (including `NULL` mapped to
+    /// `""`) degrades to [`SendState::Sent`].
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "pending" => SendState::Pending,
+            "failed" => SendState::Failed,
+            _ => SendState::Sent,
+        }
+    }
+
+    /// Whether the message is still awaiting a server id.
+    pub fn is_pending(self) -> bool {
+        matches!(self, SendState::Pending)
+    }
+}
+
 /// A chat / thread shown in the chat list.
 ///
 /// The first six fields mirror `ost::api::ChatInfo`. `unread` and `pinned` are
@@ -160,6 +206,10 @@ pub struct Message {
     pub edited: bool,
     /// Local: the message was sent by the signed-in user.
     pub is_own: bool,
+    /// Local: optimistic-send delivery state (M5). Defaults to
+    /// [`SendState::Sent`], which is correct for every wired-in message.
+    #[serde(default)]
+    pub send_state: SendState,
 }
 
 impl Message {
@@ -182,6 +232,8 @@ impl Message {
             client_message_id: info.client_message_id.clone(),
             edited: false,
             is_own: false,
+            // A message read off the wire has, by definition, reached the server.
+            send_state: SendState::Sent,
         }
     }
 
@@ -236,6 +288,17 @@ impl Message {
         self.edited = true;
         self
     }
+
+    /// Set [`Message::send_state`].
+    pub fn with_send_state(mut self, state: SendState) -> Self {
+        self.send_state = state;
+        self
+    }
+
+    /// Set [`Message::send_state`] in place.
+    pub fn set_send_state(&mut self, state: SendState) {
+        self.send_state = state;
+    }
 }
 
 impl From<&MessageInfo> for Message {
@@ -266,6 +329,7 @@ impl std::fmt::Debug for Message {
             .field("client_message_id", &self.client_message_id)
             .field("edited", &self.edited)
             .field("is_own", &self.is_own)
+            .field("send_state", &self.send_state)
             .finish()
     }
 }
@@ -398,6 +462,33 @@ mod tests {
                 .with_edited(true)
                 .edited
         );
+    }
+
+    #[test]
+    fn send_state_defaults_to_sent_and_round_trips() {
+        // Wired-in messages are always `Sent`.
+        let msg = Message::from_info("c", &message_info());
+        assert_eq!(msg.send_state, SendState::Sent);
+
+        // Explicit states and their database names.
+        assert_eq!(
+            Message::from_info("c", &message_info())
+                .with_send_state(SendState::Pending)
+                .send_state,
+            SendState::Pending
+        );
+        assert_eq!(SendState::Pending.as_str(), "pending");
+        assert_eq!(SendState::from_db("failed"), SendState::Failed);
+        assert!(SendState::Pending.is_pending());
+        // Unknown / blank values degrade to `Sent`.
+        assert_eq!(SendState::from_db("bogus"), SendState::Sent);
+        assert_eq!(SendState::from_db(""), SendState::Sent);
+
+        // Serializable, and a missing field in old JSON defaults to `Sent`.
+        let mut value = serde_json::to_value(msg).unwrap();
+        value.as_object_mut().unwrap().remove("send_state");
+        let back: Message = serde_json::from_value(value).unwrap();
+        assert_eq!(back.send_state, SendState::Sent);
     }
 
     #[test]

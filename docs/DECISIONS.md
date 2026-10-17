@@ -440,4 +440,109 @@ the raw JSON.
   feed whenever its own token set changes (restore/sign-in/refresh/sign-out) and
   the caller restarts it — the residual gap is recorded as B-008.
 
+---
+
+## ADR-014 — Optimistic sends with `SendState` and a schema-v2 `send_state` column
+
+**Status:** accepted (M5)
+
+**Context.** Sending has to feel instant and must never double-post. The
+vendored chat service is idempotent *if* every POST for one logical send carries
+the same `clientmessageid` (`ost::api::send_message_with_client_id` +
+`find_message_by_client_id`, OstMac §106). The UI, meanwhile, needs a bubble it
+can render before the server answers and a retry affordance when a POST fails.
+
+**Decision.**
+
+1. Add local-only delivery state to [`model::Message`]: a
+   `SendState { Pending, Sent, Failed }` field, defaulting to `Sent` (every
+   message read off the wire has, by definition, reached the server).
+2. `Messaging::send_text` is **optimistic**: it mints a `client_message_id`,
+   upserts a `Pending` row (`is_own = true`, id temporarily = the client id)
+   *before* the network call, then POSTs. On success the row is re-keyed to the
+   server id from `sent_id_from_response` and marked `Sent`; on failure it is
+   marked `Failed` and **retained**. The same shape serves `retry`.
+3. Persist the state in a new **schema v2** `messages.send_state` column
+   (`TEXT NOT NULL DEFAULT 'sent'`), so existing databases upgrade forward and
+   every pre-existing row defaults to `sent`. The `ALTER TABLE` is guarded by a
+   `PRAGMA table_info` probe so re-running the migration (e.g. a reset
+   `user_version`) stays safe — SQLite has no `ADD COLUMN IF NOT EXISTS`.
+4. `retry` reuses the same `client_message_id`; before re-posting it calls
+   `find_message_by_client_id` to discover whether the timed-out attempt landed,
+   reconciling to `Sent` instead of posting twice. One logical send is never two
+   server messages.
+
+**Consequences.**
+
+- The UI can render pending/failed bubbles and a retry button from the store
+  alone; a failure keeps the typed text (the failed row survives) so nothing is
+  lost.
+- The re-key (delete placeholder + insert server-id row) means a message's id
+  changes once, on confirmation. Consumers must look rows up by
+  `client_message_id` (the stable key, via `Store::message_by_client_id`) rather
+  than assume a stable id across the pending→sent transition.
+- A message whose receipt names **no** server id is marked `Sent` in place and
+  keeps the client id as its row id; if the realtime `NewMessage` later arrives
+  with a different server id, that is a second row until a resync. Recorded as
+  U-002.
+- `send_state` is local-only state; it is never sent on the wire.
+
+---
+
+## ADR-015 — One shared text/HTML module; outgoing HTML stays vendored
+
+**Status:** accepted (M5)
+
+**Context.** M4 carried a *local* `strip_html` in `realtime/event.rs` because
+the vendored helpers are private. M5 needs the same HTML→text behaviour for
+history reads and optimistic sends, and a single escaping rule for tests. The
+risk is drift: two slightly different strip implementations, or a hand-rolled
+outgoing-HTML builder that disagrees with the wire.
+
+**Decision.** Move the HTML⇄text helpers into one documented module,
+`crates/squads-core/src/text.rs` (`strip_html`, `html_escape`), and reuse it
+from `realtime::event` and `messaging`. `strip_html` keeps the vendored
+spacing-aware rules (block-tag boundaries become one space, inline tags vanish,
+common entities decoded) and is unit-tested for entities, nested tags, `<pre>`,
+`<at>` mentions, unicode and malformed input. **Outgoing** HTML is *not*
+reimplemented: it is always the vendored, fenced-code-aware
+`ost::api::build_message_html` (and `build_reply_html` for quotes).
+
+**Consequences.**
+
+- One behaviour, one place to fix; the M4 tests keep passing unchanged.
+- We inherit the vendored markdown-ish fenced-code dialect exactly, so our
+  outgoing messages render identically to the reference clients.
+- `strip_html` decodes only a small named-entity set; uncommon numeric
+  references are not decoded (documented in the module).
+
+---
+
+## ADR-016 — The backward-paging cursor lives in memory, per `Messaging` handle
+
+**Status:** accepted (M5)
+
+**Context.** Backward paging walks the server's `_metadata.backwardLink`
+(`ost::api::read_messages_page`). The cursor could be persisted (a new column or
+table) or held in memory. Persisting it would add write-path complexity and a
+fresh migration for little benefit: after a restart, re-reading the newest page
+is cheap and is already the offline-first path.
+
+**Decision.** Keep the cursor **in memory**, keyed by `chat_id`, inside the
+`Messaging` service (`Mutex<HashMap<String, Option<String>>>`):
+`Some(link)` = an older page is available, `None` = history exhausted, absent =
+`open` has not been called. `open` sets it from the newest page's
+`backward_link`; `load_older` consumes it and stores the next one.
+
+**Consequences.**
+
+- No extra schema/migration and no cursor write on the hot read path.
+- The cursor is **per `Messaging` handle**: `Session::messaging()` returns a
+  fresh handle, so a caller that pages must keep the handle it got back.
+  `load_older` on a fresh handle returns nothing until `open` runs — which is
+  also the correct offline-first sequence (render cache, then refresh, then
+  page). Covered by a paging test.
+- If a future requirement needs server-exact paging across restarts, the cursor
+  can be persisted behind the existing `Messaging` API without changing callers.
+
 

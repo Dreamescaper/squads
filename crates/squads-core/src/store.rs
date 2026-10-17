@@ -18,19 +18,24 @@
 //!
 //! ## Schema & migrations
 //!
-//! The schema version lives in `PRAGMA user_version` and starts at **1**.
-//! Migrations are forward-only and re-entrant: every statement is
-//! `IF NOT EXISTS`, so re-running the current version is a no-op. A database
-//! whose `user_version` is **newer** than this build understands is rejected
-//! with [`CoreError::StoreSchemaVersion`] rather than silently mangled.
+//! The schema version lives in `PRAGMA user_version`; this build knows **v2**.
+//! Migrations are forward-only and re-entrant: statements are `IF NOT EXISTS`
+//! (or guarded by a schema probe, for `ALTER TABLE`), so re-running is a no-op.
+//! A database whose `user_version` is **newer** than this build understands is
+//! rejected with [`CoreError::StoreSchemaVersion`] rather than silently mangled.
+//!
+//! * **v1** (M3) — `accounts`, `chats`, `messages`.
+//! * **v2** (M5) — `messages.send_state` (optimistic sends; existing rows
+//!   default to `sent`) and the `read_state` table (our own consumption
+//!   horizon). See ADR-014/ADR-015.
 //!
 //! ## Who writes what
 //!
-//! M3 provides only the store API. **Realtime write-through lands in M4** and
-//! optimistic sends in M5; both will call the same idempotent
-//! [`Store::upsert_messages`] / [`Store::upsert_chats`] (keyed by server id) and
-//! read history through [`Store::messages`] / [`Store::messages_before`].
-//! Nothing in this module talks to the network.
+//! M3 provides the store API; **realtime write-through landed in M4** and M5's
+//! optimistic sends call the same idempotent [`Store::upsert_messages`] /
+//! [`Store::upsert_chats`] (keyed by server id) and read history through
+//! [`Store::messages`] / [`Store::messages_before`]. Nothing in this module
+//! talks to the network.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -41,10 +46,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::tokens::now_unix;
 use crate::error::{CoreError, Result};
-use crate::model::{Chat, Message, Reaction};
+use crate::model::{Chat, Message, Reaction, SendState};
 
 /// Newest schema version this build knows how to create/migrate to.
-pub const SCHEMA_VERSION: i32 = 1;
+///
+/// * **v1** (M3) — accounts, chats, messages.
+/// * **v2** (M5) — `messages.send_state` for optimistic sends, and the
+///   `read_state` table for our own read horizon.
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Timeout for a busy database before `SQLITE_BUSY` is surfaced.
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -93,6 +102,21 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_time
     ON messages (chat_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_chats_profile_time
     ON chats (profile, last_message_time);
+"#;
+
+/// v2 schema additions that are plain `CREATE TABLE IF NOT EXISTS` (re-entrant).
+///
+/// The `messages.send_state` column is added separately in [`migrate_v2`],
+/// because SQLite's `ALTER TABLE … ADD COLUMN` has no `IF NOT EXISTS` and a
+/// re-entrant migration must probe the schema first.
+const MIGRATION_V2_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS read_state (
+    chat_id    TEXT NOT NULL,
+    profile    TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    read_at    INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, profile)
+);
 "#;
 
 /// One local account record.
@@ -345,8 +369,8 @@ impl Store {
                 "INSERT INTO messages
                     (id, chat_id, profile, sender_mri, sender_name, timestamp,
                      content, raw, reactions_json, reply_to, client_message_id,
-                     edited, is_own, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                     edited, is_own, send_state, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(id, chat_id) DO UPDATE SET
                     profile = excluded.profile,
                     sender_mri = excluded.sender_mri,
@@ -359,6 +383,7 @@ impl Store {
                     client_message_id = excluded.client_message_id,
                     edited = excluded.edited,
                     is_own = excluded.is_own,
+                    send_state = excluded.send_state,
                     updated_at = MAX(messages.updated_at, excluded.updated_at)",
             )?;
             for msg in messages {
@@ -377,6 +402,7 @@ impl Store {
                     msg.client_message_id,
                     msg.edited as i64,
                     msg.is_own as i64,
+                    msg.send_state.as_str(),
                     now
                 ])?;
                 written += 1;
@@ -391,7 +417,8 @@ impl Store {
     pub fn messages(&self, chat_id: &str, limit: usize) -> Result<Vec<Message>> {
         self.messages_query(
             "SELECT id, chat_id, sender_mri, sender_name, timestamp, content,
-                    raw, reactions_json, reply_to, client_message_id, edited, is_own
+                    raw, reactions_json, reply_to, client_message_id, edited, is_own,
+                    send_state
              FROM messages
              WHERE chat_id = ?1
              ORDER BY timestamp DESC, id DESC
@@ -414,7 +441,8 @@ impl Store {
     ) -> Result<Vec<Message>> {
         self.messages_query(
             "SELECT id, chat_id, sender_mri, sender_name, timestamp, content,
-                    raw, reactions_json, reply_to, client_message_id, edited, is_own
+                    raw, reactions_json, reply_to, client_message_id, edited, is_own,
+                    send_state
              FROM messages
              WHERE chat_id = ?1 AND timestamp < ?2
              ORDER BY timestamp DESC, id DESC
@@ -457,6 +485,109 @@ impl Store {
             params![message_id, chat_id, profile],
         )?;
         Ok(removed > 0)
+    }
+
+    /// Fetch one message by its server id within a chat, or `None`.
+    ///
+    /// Like [`Store::messages`], this is **not** profile-scoped (matching the
+    /// M3 read API); chat ids are account-unique in practice (see U-001).
+    pub fn message(&self, chat_id: &str, message_id: &str) -> Result<Option<Message>> {
+        let conn = self.lock();
+        let message = conn
+            .query_row(
+                "SELECT id, chat_id, sender_mri, sender_name, timestamp, content,
+                        raw, reactions_json, reply_to, client_message_id, edited, is_own,
+                        send_state
+                 FROM messages WHERE chat_id = ?1 AND id = ?2",
+                params![chat_id, message_id],
+                row_to_message,
+            )
+            .optional()?;
+        Ok(message)
+    }
+
+    /// Find the message carrying `client_message_id` in a chat.
+    ///
+    /// This is how an optimistic send reconciles its local row with the server's
+    /// id (M5): the `clientmessageid` is the idempotency key, so it survives the
+    /// row being re-keyed. The newest match wins when (unusually) several rows
+    /// share the key.
+    pub fn message_by_client_id(
+        &self,
+        chat_id: &str,
+        client_message_id: &str,
+    ) -> Result<Option<Message>> {
+        let conn = self.lock();
+        let message = conn
+            .query_row(
+                "SELECT id, chat_id, sender_mri, sender_name, timestamp, content,
+                        raw, reactions_json, reply_to, client_message_id, edited, is_own,
+                        send_state
+                 FROM messages
+                 WHERE chat_id = ?1 AND client_message_id = ?2
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 1",
+                params![chat_id, client_message_id],
+                row_to_message,
+            )
+            .optional()?;
+        Ok(message)
+    }
+
+    /// Update only the [`SendState`] of one stored message (M5 optimistic send).
+    ///
+    /// Returns whether a matching `(id, chat_id, profile)` row existed. Content
+    /// and every other column are left untouched.
+    pub fn update_message_send_state(
+        &self,
+        profile: &str,
+        chat_id: &str,
+        message_id: &str,
+        state: SendState,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let now = now_unix() as i64;
+        let changed = conn.execute(
+            "UPDATE messages
+                SET send_state = ?1, updated_at = MAX(updated_at, ?2)
+              WHERE id = ?3 AND chat_id = ?4 AND profile = ?5",
+            params![state.as_str(), now, message_id, chat_id, profile],
+        )?;
+        Ok(changed > 0)
+    }
+
+    // ----- read state (M5) ------------------------------------------------
+
+    /// Record that `chat_id` has been read up to `message_id`.
+    ///
+    /// A local-only marker: the server's consumption horizon is authoritative on
+    /// the wire, and this row is what lets the UI render "read up to here"
+    /// without re-deriving it. One row per `(chat_id, profile)`.
+    pub fn set_read_state(&self, profile: &str, chat_id: &str, message_id: &str) -> Result<()> {
+        let conn = self.lock();
+        let now = now_unix() as i64;
+        conn.execute(
+            "INSERT INTO read_state (chat_id, profile, message_id, read_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat_id, profile) DO UPDATE SET
+                message_id = excluded.message_id,
+                read_at = excluded.read_at",
+            params![chat_id, profile, message_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// The last message id `chat_id` was marked read up to, if any.
+    pub fn read_state(&self, profile: &str, chat_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        let message_id = conn
+            .query_row(
+                "SELECT message_id FROM read_state WHERE chat_id = ?1 AND profile = ?2",
+                params![chat_id, profile],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(message_id)
     }
 
     /// Shared message query: rows come back newest-first; reverse for display.
@@ -518,11 +649,43 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if current < 1 {
         tx.execute_batch(MIGRATION_V1)?;
     }
+    if current < 2 {
+        migrate_v2(&tx)?;
+    }
     // Record the version *after* the DDL inside the same transaction, so a
     // crash can never leave a version marker ahead of the schema.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
+}
+
+/// Apply the v2 additions: the `messages.send_state` column and `read_state`.
+///
+/// Idempotent by construction. A database whose `user_version` was reset (or a
+/// foreign file carrying our tables) may already have the column, so the
+/// `ALTER TABLE` is guarded by a `PRAGMA table_info` probe rather than relying
+/// on the version marker alone.
+fn migrate_v2(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    if !column_exists(tx, "messages", "send_state")? {
+        tx.execute_batch(
+            "ALTER TABLE messages ADD COLUMN send_state TEXT NOT NULL DEFAULT 'sent';",
+        )?;
+    }
+    tx.execute_batch(MIGRATION_V2_TABLES)?;
+    Ok(())
+}
+
+/// Whether `table` already has a column named `column` (case-insensitive).
+fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn row_to_chat(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chat> {
@@ -554,6 +717,7 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         client_message_id: row.get(9)?,
         edited: row.get::<_, i64>(10)? != 0,
         is_own: row.get::<_, i64>(11)? != 0,
+        send_state: SendState::from_db(&row.get::<_, String>(12)?),
     })
 }
 
@@ -607,6 +771,7 @@ mod tests {
             client_message_id: None,
             edited: false,
             is_own: false,
+            send_state: SendState::Sent,
         }
     }
 
@@ -1020,5 +1185,138 @@ mod tests {
             .unwrap()
         };
         assert!(second >= first, "updated_at must not move backwards");
+    }
+
+    // ----- M5: optimistic send state, lookups, read state -----------------
+
+    #[test]
+    fn v1_database_upgrades_to_v2_defaulting_existing_rows_to_sent() {
+        let path = temp_path("v1-to-v2");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            // Build a genuine v1 database: the historical DDL plus a row, with
+            // the version marker set to 1 (no `send_state` column yet).
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute(
+                "INSERT INTO messages
+                    (id, chat_id, profile, sender_mri, sender_name, timestamp,
+                     content, raw, reactions_json, reply_to, client_message_id,
+                     edited, is_own, updated_at)
+                 VALUES ('m1','c1','default','8:orgid:aaaa','Alice',
+                     '2026-01-01T00:00:00Z','hi','<p>hi</p>','[]',NULL,NULL,0,0,1)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+
+        let store = Store::open(&path).expect("open the v1 database");
+        // Forward-only migration reached v2.
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        // The column now exists ...
+        {
+            let conn = store.lock();
+            assert!(column_exists(&conn, "messages", "send_state").unwrap());
+        }
+        // ... the v2 table exists ...
+        assert!(store.read_state("default", "c1").unwrap().is_none());
+        // ... and the pre-existing row defaults to `sent`.
+        let got = store.messages("c1", 10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].send_state, SendState::Sent);
+        assert_eq!(got[0].content, "hi");
+
+        // Reopening again is a clean no-op.
+        drop(store);
+        let store = Store::open(&path).expect("reopen v2 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.messages("c1", 10).unwrap().len(), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn message_and_client_id_lookups() {
+        let store = Store::open_in_memory().unwrap();
+        let mut a = message("a", "c1", "2026-01-01T00:00:00Z");
+        a.client_message_id = Some("42".into());
+        store
+            .upsert_messages("default", &[a, message("b", "c1", "2026-01-02T00:00:00Z")])
+            .unwrap();
+
+        assert_eq!(
+            store
+                .message("c1", "a")
+                .unwrap()
+                .unwrap()
+                .client_message_id
+                .as_deref(),
+            Some("42")
+        );
+        assert!(store.message("c1", "missing").unwrap().is_none());
+        assert!(store.message("other", "a").unwrap().is_none());
+        assert_eq!(
+            store.message_by_client_id("c1", "42").unwrap().unwrap().id,
+            "a"
+        );
+        assert!(store.message_by_client_id("c1", "nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn send_state_round_trips_and_updates_in_place() {
+        let store = Store::open_in_memory().unwrap();
+        let mut pending = message("p", "c1", "2026-01-01T00:00:00Z");
+        pending.send_state = SendState::Pending;
+        pending.is_own = true;
+        pending.client_message_id = Some("p".into());
+        store.upsert_messages("default", &[pending]).unwrap();
+
+        assert_eq!(
+            store.messages("c1", 10).unwrap()[0].send_state,
+            SendState::Pending
+        );
+        assert!(
+            store
+                .update_message_send_state("default", "c1", "p", SendState::Failed)
+                .unwrap()
+        );
+        let row = &store.messages("c1", 10).unwrap()[0];
+        assert_eq!(row.send_state, SendState::Failed);
+        assert_eq!(row.content, "body p", "only the state changed");
+
+        // A miss is `false`, not an error; another profile must not match.
+        assert!(
+            !store
+                .update_message_send_state("default", "c1", "missing", SendState::Sent)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_message_send_state("work", "c1", "p", SendState::Sent)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn read_state_round_trips_and_is_profile_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.read_state("default", "c1").unwrap(), None);
+        store.set_read_state("default", "c1", "m5").unwrap();
+        assert_eq!(
+            store.read_state("default", "c1").unwrap().as_deref(),
+            Some("m5")
+        );
+        // A newer horizon replaces the old one (one row per chat/profile).
+        store.set_read_state("default", "c1", "m9").unwrap();
+        assert_eq!(
+            store.read_state("default", "c1").unwrap().as_deref(),
+            Some("m9")
+        );
+        assert_eq!(store.read_state("work", "c1").unwrap(), None);
+        assert_eq!(
+            store.read_state("default", "c2").unwrap(),
+            None,
+            "other chats are unaffected"
+        );
     }
 }

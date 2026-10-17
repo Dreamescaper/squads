@@ -294,6 +294,7 @@ mod tests {
                     client_message_id: None,
                     edited: false,
                     is_own: false,
+                    send_state: crate::model::SendState::Sent,
                 }],
             )
             .unwrap();
@@ -349,6 +350,7 @@ mod tests {
                     client_message_id: None,
                     edited: false,
                     is_own: false,
+                    send_state: crate::model::SendState::Sent,
                 }],
             )
             .unwrap();
