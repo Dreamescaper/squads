@@ -2,13 +2,15 @@
 //!
 //! This crate owns everything the GPUI application needs that is not rendering:
 //! configuration paths, secure token storage, the Teams session/client lifecycle,
-//! the realtime event bus, and the local (offline-first) store.
+//! the realtime event bus, the local (offline-first) store, and the call layer
+//! (signalling, media seam, call history).
 //!
 //! The heavy protocol lifting lives in the vendored [`ost`] crate
 //! (`squads-protocol`); this crate wraps it into a stable, testable API for the UI.
 
 pub mod api;
 pub mod auth;
+pub mod calls;
 pub mod error;
 pub mod files;
 pub mod messaging;
@@ -25,12 +27,17 @@ pub mod text;
 
 pub use api::{ApiClient, tokens_to_config};
 pub use auth::{AuthDriver, AuthTransport, SignInProgress, TokenKind, TokenSet};
+pub use calls::{
+    AcceptedCall, CallCredentials, CallEndpoints, CallIdentity, CallMachine, CallRecorder,
+    CallRecording, CallService, CallSignaller, CallState, EndReason, IncomingCall, LoopbackMedia,
+    MediaKind, MediaSession, PlaceCallRequest, PlacedCall, RecordingRequest, parse_incoming,
+};
 pub use error::{CoreError, Result};
 pub use files::Files;
 pub use messaging::{HistoryPage, Messaging};
 pub use model::{
-    Channel, Chat, FileEntry, FileVersion, Message, Reaction, Reactor, SendState, SharedLink, Team,
-    TeamMember, is_channel_conversation_id,
+    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, FileEntry, FileVersion, Message,
+    Reaction, Reactor, SendState, SharedLink, Team, TeamMember, is_channel_conversation_id,
 };
 pub use notifications::{
     ActivityItem, LogNotifier, Notification, NotificationContext, NotificationKind, Notifications,
@@ -50,3 +57,8 @@ pub use text::{Mention, html_escape, mentions, strip_html};
 
 #[cfg(feature = "desktop-notifications")]
 pub use notifications::DesktopNotifier;
+
+#[cfg(feature = "audio")]
+pub use calls::AudioMedia;
+#[cfg(feature = "video-capture")]
+pub use calls::VideoMedia;

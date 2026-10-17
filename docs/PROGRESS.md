@@ -15,7 +15,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started · ⛔ blocked (see [BLO
 | M6 | Teams & channels | ✅ | `api` teams wrappers (list teams/members, thread reply, channel/team writes); `model::{Team,Channel,TeamMember}`; schema **v3** (`teams`,`channels`,`team_members`); offline-first `Teams` (metadata cache, channel history via `Messaging`, optimistic channel post + thread reply); `Session::teams()`. |
 | M7 | Files | ✅ | Graph files wrappers + `FileEntry`/`FileVersion`/`SharedLink` model; schema **v4** (`files`); offline-first `Files` (chat/folder/recents list, coarse download progress, upload simple-PUT vs resumable, links, versions, manage); `Session::files()`. |
 | M8 | Presence & notifications | ✅ | Two presence backends (Graph + unified `presence.teams.microsoft.com`) behind one `Presence`; `text::mentions`; pure notification routing + `Notifier` (desktop behind a default-off feature); schema **v5** (`chats.muted`) + unread/activity derivation; `Session::presence()`/`notifications()`. |
-| M9 | Audio/video calls | ⬜ | |
+| M9 | Audio/video calls | ✅ | `calls` layer: UI `CallState` machine + `CallDirection`; injectable epconv `CallSignaller` (create→join-SDP→invite, accept→media-answer, end); SDP/SRTP/RTP offline tests; `MediaSession` seam with `LoopbackMedia` (runs `macav::call_dry_run`), real audio behind default-off `audio`/`video-capture`; `on_notification` incoming calls (B-008 noted); recording wrappers; schema **v6** `call_log`; `Session::calls()`. |
 | M10 | egui UI | ⬜ | |
 | M11 | Polish & packaging | ⬜ | |
 
@@ -700,3 +700,119 @@ request/response shapes, and the mute/reaction/call-event derivations are
 unverified).
 
 
+
+---
+
+## M9 — Audio/video calls
+
+**Goal.** Turn the vendored `ost::calling` protocol code into the call layer the
+M10 call screen drives: a UI-facing call state machine, injectable epconv
+signalling (place/accept/end), an offline-testable media seam, incoming-call
+handling and local call history — all testable **offline and deterministically**,
+with no device, camera, microphone, tenant or network in the default build.
+
+**Landed.** New module `crates/squads-core/src/calls/`:
+
+- `state` — the UI lifecycle [`CallState`] (`Idle`, `Placing`, `Ringing`,
+  `Connecting`, `Connected`, `Ended { reason }`), [`EndReason`] and the
+  [`CallMachine`] holding a [`CallDirection`]. Deliberately **independent of the
+  vendored `CallState`**. Every transition is explicit and checked (`place`,
+  `ring`, `connecting`, `connected`, `end`, `reset`); an illegal move returns a
+  [`TransitionError`] rather than corrupting the state.
+- `signaling` — [`CallSignaller`], an injectable-`reqwest::Client` +
+  injectable-endpoint wrapper over the vendored two-phase epconv flow:
+  [`CallSignaller::place_call`] (`create_conversation` → `join_conversation_with_sdp_video`
+  → `invite_user`), [`CallSignaller::accept_incoming`] (`accept_call_with_video`
+  → `send_media_answer`) and [`CallSignaller::end_call`]. [`CallEndpoints`]
+  derives `epconv_url` from `region_gtms` (`epconvUrl` → vendored
+  `calling_conversationServiceUrl` → derivation from
+  `calling_potentialCallRequestUrl` → documented fallback) and takes the
+  `trouter_surl` from `region_gtms.trouterSurl`. [`CallIdentity`] decodes the
+  skype JWT (pure) to recover our MRI/OID/name/tenant. Offers come from
+  `sdp::generate_sdp_offer` / `generate_av_sdp_offer`; answers from
+  `sdp::generate_sdp_answer_full`.
+- `media` — the [`MediaSession`] trait (start/stop/send-audio/receive) with
+  [`LoopbackMedia`] (runs `macav::call_dry_run` — the whole tone→PCMU→RTP→SRTP→
+  echo + video NAL pipeline — and loop-backs PCMU frames), `AudioMedia` behind
+  the default-off `audio` feature and a documented `VideoMedia` **placeholder**
+  behind `video-capture`.
+- `incoming` — [`IncomingCall`] + pure [`parse_incoming`] over the vendored
+  `parse_call_notification` (caller, participants, modalities, SDP offer,
+  acceptance/media-answer/end links). The module documents **B-008** (call frames
+  are filtered out of `event_hub`, so no producer exists yet) and the
+  recommended fix.
+- `recording` — [`CallRecorder`] wrapping the vendored recording module:
+  socket-free [`CallRecorder::add_bot`] / [`CallRecorder::stop`] (request-shape
+  tested offline) and the live-only [`CallRecorder::start`] (needs a connected
+  `TrouterSocket` and a live recorder service). Pure
+  [`derive_add_participant_url`] / [`extract_conversation_id`] mirror the
+  vendored private helpers.
+- `CallService` (in `calls`) — ties the above together: `on_notification`
+  (parse → `Ringing` → record), `place` (`Placing` → `Connecting`), `accept`
+  (`Ringing` → `Connecting`), `mark_connected` (`→ Connected`), `decline`/`end`
+  (→ `Ended`, recording the outcome), `missed` (records `Missed` and delivers the
+  M8 [`NotificationKind::MissedCall`] placeholder, finally produced). Every call
+  start/end is written through to the store.
+
+**Model & store.**
+
+- `model` — [`CallDirection`], [`CallOutcome`] and [`CallLogEntry`]
+  (`started`/`with_participants`/`finished`, deriving `duration_secs`).
+- `store` — **schema v6**: a `call_log` table keyed `(id, profile)` with
+  `thread_id`, `direction`, `started_at`, `ended_at`, `duration_secs`,
+  `participants_json` and `outcome`, plus an index on
+  `(profile, thread_id, started_at)`. Methods `upsert_call_log` (idempotent:
+  start then finish update one row), `call_log`, `call_log_for_thread` and
+  `call_log_entry`. The v5→v6 migration is `CREATE TABLE/INDEX IF NOT EXISTS`
+  (re-entrant); a corrupt participants blob degrades to empty.
+
+**Session.** `Session::calls()` mirrors the other services: shares the session's
+store and notifier, derives endpoints from `region_gtms`, carries the
+IC3/skype/recorder tokens, and decodes the identity from the skype JWT when it
+names one. Offline to build; `NotSignedIn` without tokens.
+
+**Decisions.** **ADR-023** (signalling via the vendored epconv with an injectable
+HTTP client and endpoints), **ADR-024** (media behind default-off
+`audio`/`video-capture` features; the loopback backs the offline tests),
+**ADR-025** (schema v6 `call_log`).
+
+**Tests.** `cargo test -p squads-core` — **281** offline unit tests (230 from
+M1–M8 + **51** new: 8 `calls::state`, 13 `calls::signaling`, 7 `calls::media`,
+4 `calls::incoming`, 5 `calls::recording`, 8 `calls::tests` (service), 2 `model`,
+3 `store`, 1 `session`). `cargo test -p squads-protocol` still passes **377**.
+New coverage includes: every legal state transition and the rejected ones (with
+the reported `from`/`to`); endpoint derivation (our key → vendored key →
+potential-URL derivation → fallback) and skype-JWT identity decoding (skypeid,
+oid, non-JWT); **a realistic audio+video SDP offer parsed and answered**,
+asserting the media lines, codecs, fresh ICE credentials, per-section
+candidates and distinct SRTP keys; **RTP encode/decode** and **SRTP parse →
+derive keys → create_context → protect → unprotect** round-trips (plus a
+tampered-packet auth failure); the **media loopback** (`macav::call_dry_run`
+success + echo detected + 5 video NALs, PCMU send/receive through a
+`Box<dyn MediaSession>`); the **signalling request shapes** against a local stub
+(`create_conversation` → `join-with-SDP`, the callee invite, the acceptance +
+media-answer bodies, the end POST, and a no-offer failure with no request); the
+**recording request shapes** (recorder-bot `addParticipant` body and the
+stop-recording/stop-transcription POSTs); **`on_notification`** on a realistic
+video invitation (and the non-call / malformed / stringified-body cases); the
+`CallService` flows (place → connecting → connected, failed placement ending and
+logging `Failed`, incoming ring → accept → connected, decline, end, missed with a
+`MissedCall` notification); and the **v5→v6 upgrade** (a hand-built v5 database
+gains `call_log`, rows round-trip and upsert updates in place) plus call-log
+ordering and profile isolation.
+
+**How to verify manually** (real tenant + devices; not runnable here): sign in,
+build `session.calls()`, `on_notification` a captured call frame (or, once B-008
+is fixed, feed the realtime feed), `accept`, start a `MediaSession`, and confirm
+the state machine walks `Ringing → Connecting → Connected`; place a 1:1 and a
+group call and confirm the tenant rings; check `session.store().call_log(profile,
+20)` records both; record a call (needs a live recorder service) and confirm the
+recording appears in OneDrive.
+
+**Blockers.** **B-008** (call frames are filtered out of `event_hub`, so
+incoming calls have no realtime producer; M9 provides the parser/seam and
+documents the fix). **B-011** (the real `trouter_surl` comes from the negotiated
+Trouter session, not `region_gtms`; live call acceptance/recording and real
+device media cannot be exercised here). **U-006** (live acceptance of the
+signalling/recording shapes, the remote-answer transition and the actual media
+path are unverified).

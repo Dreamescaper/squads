@@ -44,6 +44,15 @@ keyring = []
 # Desktop notifications via `notify-rust`. Off by default: the headless build
 # has no DBus/notification daemon (ADR-022).
 desktop-notifications = ["dep:notify-rust"]
+# Real audio capture/playback (cpal/ALSA) via the vendored `squads-protocol/audio`
+# feature. Off by default so the default build/tests need no audio device
+# (ADR-024).
+audio = ["ost/audio"]
+# Real audio + video capture/display via the vendored
+# `squads-protocol/video-capture` feature (v4l + openh264 + SDL2). Off by default;
+# SDL2 dev libraries are unavailable here, so this must not be enabled in CI
+# (ADR-024).
+video-capture = ["ost/video-capture"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

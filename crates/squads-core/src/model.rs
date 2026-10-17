@@ -433,6 +433,157 @@ pub struct SharedLink {
     pub scope: Option<String>,
 }
 
+// ----- calls (M9) ---------------------------------------------------------
+
+/// Which side of a call we are on (milestone **M9**).
+///
+/// Persisted in the schema-v6 `call_log` table as the lowercase name; an
+/// unknown/foreign value degrades to [`CallDirection::Outgoing`] rather than
+/// failing a read (call history is a convenience, not a critical record).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallDirection {
+    /// We placed the call.
+    #[default]
+    Outgoing,
+    /// Someone called us.
+    Incoming,
+}
+
+impl CallDirection {
+    /// The lowercase name stored in the database / carried in JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CallDirection::Outgoing => "outgoing",
+            CallDirection::Incoming => "incoming",
+        }
+    }
+
+    /// Parse a stored value; anything unrecognized degrades to `Outgoing`.
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "incoming" => CallDirection::Incoming,
+            _ => CallDirection::Outgoing,
+        }
+    }
+}
+
+/// How a logged call ended (milestone **M9**).
+///
+/// Persisted in `call_log.outcome` as the lowercase name; an unknown/foreign
+/// value (or a call still in progress) degrades to [`CallOutcome::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallOutcome {
+    /// The call connected and was hung up normally.
+    Completed,
+    /// An incoming call was declined before it connected.
+    Declined,
+    /// An incoming call rang out (or was declined) and was never answered.
+    Missed,
+    /// Placing/accepting the call failed.
+    Failed,
+    /// We cancelled a call while it was still ringing/connecting.
+    Cancelled,
+    /// In progress, or an outcome we do not model.
+    #[default]
+    Unknown,
+}
+
+impl CallOutcome {
+    /// The lowercase name stored in the database / carried in JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CallOutcome::Completed => "completed",
+            CallOutcome::Declined => "declined",
+            CallOutcome::Missed => "missed",
+            CallOutcome::Failed => "failed",
+            CallOutcome::Cancelled => "cancelled",
+            CallOutcome::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a stored value; anything unrecognized degrades to `Unknown`.
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "completed" => CallOutcome::Completed,
+            "declined" => CallOutcome::Declined,
+            "missed" => CallOutcome::Missed,
+            "failed" => CallOutcome::Failed,
+            "cancelled" => CallOutcome::Cancelled,
+            _ => CallOutcome::Unknown,
+        }
+    }
+
+    /// Whether the call is still in progress (no terminal outcome yet).
+    pub fn is_open(self) -> bool {
+        matches!(self, CallOutcome::Unknown)
+    }
+}
+
+/// One row of local call history (milestone **M9**, schema v6).
+///
+/// A purely local record: Teams does not expose a call-history API through the
+/// reverse-engineered surfaces, so this is what the UI's recents list reads.
+/// `participants` are the display names / MRIs the invitation or the placement
+/// named, stored as a JSON array. `id` is the call id when the wire named one
+/// (an incoming invitation's `debugContent.callId`), else a generated uuid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallLogEntry {
+    /// Stable call id (wire `callId` when known, else a generated uuid).
+    pub id: String,
+    /// The thread/chat the call belongs to (may be empty when unknown).
+    pub thread_id: String,
+    /// Whether we placed or received the call.
+    pub direction: CallDirection,
+    /// Unix seconds when the call started (placing/ringing).
+    pub started_at: i64,
+    /// Unix seconds when the call ended, when known.
+    pub ended_at: Option<i64>,
+    /// Talk time in seconds, when known.
+    pub duration_secs: Option<u64>,
+    /// Display names / MRIs of the participants, when known.
+    pub participants: Vec<String>,
+    /// How the call ended (or [`CallOutcome::Unknown`] while in progress).
+    pub outcome: CallOutcome,
+}
+
+impl CallLogEntry {
+    /// Begin a call-history row.
+    pub fn started(
+        id: impl Into<String>,
+        thread_id: impl Into<String>,
+        direction: CallDirection,
+        started_at: i64,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            thread_id: thread_id.into(),
+            direction,
+            started_at,
+            ended_at: None,
+            duration_secs: None,
+            participants: Vec::new(),
+            outcome: CallOutcome::Unknown,
+        }
+    }
+
+    /// Attach the participant names/MRIs.
+    pub fn with_participants(mut self, participants: Vec<String>) -> Self {
+        self.participants = participants;
+        self
+    }
+
+    /// Mark the call finished: set `ended_at`, derive `duration_secs` from
+    /// `started_at` (never negative) and record the outcome.
+    pub fn finished(mut self, ended_at: i64, outcome: CallOutcome) -> Self {
+        self.ended_at = Some(ended_at);
+        self.duration_secs = Some(ended_at.saturating_sub(self.started_at).max(0) as u64);
+        self.outcome = outcome;
+        self
+    }
+}
+
 /// One chat message in the timeline.
 ///
 /// `chat_id` is the owning thread: [`MessageInfo`] does not carry it, so it is
@@ -943,5 +1094,53 @@ mod tests {
         let back: SharedLink =
             serde_json::from_str(&serde_json::to_string(&link).unwrap()).unwrap();
         assert_eq!(back, link);
+    }
+
+    // ----- M9: call log -----------------------------------------------------
+
+    #[test]
+    fn call_direction_and_outcome_round_trip_through_db_names() {
+        assert_eq!(CallDirection::Outgoing.as_str(), "outgoing");
+        assert_eq!(CallDirection::from_db("incoming"), CallDirection::Incoming);
+        assert_eq!(CallDirection::from_db("bogus"), CallDirection::Outgoing);
+
+        assert_eq!(CallOutcome::Completed.as_str(), "completed");
+        assert_eq!(CallOutcome::from_db("missed"), CallOutcome::Missed);
+        assert_eq!(CallOutcome::from_db("failed"), CallOutcome::Failed);
+        assert_eq!(CallOutcome::from_db("declined"), CallOutcome::Declined);
+        assert_eq!(CallOutcome::from_db("cancelled"), CallOutcome::Cancelled);
+        // Unknown / in-progress both degrade to `Unknown`.
+        assert_eq!(CallOutcome::from_db("unknown"), CallOutcome::Unknown);
+        assert_eq!(CallOutcome::from_db("nonsense"), CallOutcome::Unknown);
+        assert!(CallOutcome::Unknown.is_open());
+        assert!(!CallOutcome::Completed.is_open());
+    }
+
+    #[test]
+    fn call_log_entry_finish_derives_duration_and_outcome() {
+        let entry = CallLogEntry::started("call-1", "thread-1", CallDirection::Incoming, 1_000)
+            .with_participants(vec!["Alice".into(), "8:orgid:self".into()]);
+        assert_eq!(entry.id, "call-1");
+        assert_eq!(entry.thread_id, "thread-1");
+        assert_eq!(entry.direction, CallDirection::Incoming);
+        assert_eq!(entry.started_at, 1_000);
+        assert!(entry.ended_at.is_none());
+        assert!(entry.duration_secs.is_none());
+        assert_eq!(entry.participants.len(), 2);
+        assert_eq!(entry.outcome, CallOutcome::Unknown);
+
+        let done = entry.clone().finished(1_042, CallOutcome::Completed);
+        assert_eq!(done.ended_at, Some(1_042));
+        assert_eq!(done.duration_secs, Some(42));
+        assert_eq!(done.outcome, CallOutcome::Completed);
+
+        // A clock that went backwards never yields a negative duration.
+        let backwards = entry.finished(900, CallOutcome::Failed);
+        assert_eq!(backwards.duration_secs, Some(0));
+
+        // Serializable (persisted as JSON columns for participants).
+        let back: CallLogEntry =
+            serde_json::from_str(&serde_json::to_string(&done).unwrap()).unwrap();
+        assert_eq!(back, done);
     }
 }

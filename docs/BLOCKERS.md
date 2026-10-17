@@ -117,11 +117,17 @@ explicit about:
 
    **Impact:** incoming/ongoing call UI is impossible through the M4 bus.
 
-   **Mitigation/deferred:** real call signalling and notifications land in **M9**
-   (`ost::calling`); M9 should either add a call event to the bus (a future patch
-   to the vendored filter) or drive calls directly from the vendored path. A
-   `TEAMS_MANUAL_CALLS`-style opt-out will be needed so the M4 feed and M9
-   handling do not fight over the same frames.
+   **Mitigation/deferred (M9 status):** real call signalling landed in **M9**
+   (`squads-core::calls`): the incoming-call parser (`calls::incoming::parse_incoming`)
+   and the `CallService::on_notification` seam exist and are tested, and calls
+   can be placed/accepted/ended via the vendored epconv path. **The producer is
+   still missing**: no `RealtimeEvent` variant can carry a call frame, so
+   `on_notification` has nothing feeding it. The recommended fix is a small
+   `squads-protocol` change — stop filtering call frames in
+   `trouter::data_frame_event`, add a call event (or a dedicated call hub), and
+   have the M4 collector hand the raw JSON to `on_notification` — plus a
+   `TEAMS_MANUAL_CALLS`-style opt-out so the M4 feed and M9 handling do not fight
+   over the same frames. Tracked as a follow-up for M10/UI wiring.
 
 2. **`ost::event_hub` is process-global and bounded (1024, oldest dropped).**
    Every squads-core account (and any other embedder in-process) shares one FIFO.
@@ -383,3 +389,73 @@ openh264 software codecs; hardware acceleration is deferred (M9).
 ### D-003 — Mobile
 
 Out of scope.
+
+### B-011 — Calls: live signalling, the Trouter surl, and real media (M9)
+
+M9's call layer is fully offline-testable, but three things cannot be exercised in
+this environment (no tenant, no devices, no live recorder service):
+
+1. **The real `trouter_surl` is not in `region_gtms`.** It is the callback path
+   prefix the negotiated Trouter session returns (`SessionResponse::surl`), which
+   `squads-core` does not own. `CallEndpoints::from_region_gtms` therefore reads
+   `region_gtms.trouterSurl` (our convention) and falls back to the empty string;
+   a caller that needs the real value must `CallSignaller::set_endpoints` after
+   negotiating the session. The signalling request shapes are pinned by stub
+   tests regardless.
+2. **Live call acceptance.** Whether the epconv/acceptance/media-answer/end
+   shapes are accepted by the live service, and how the remote answer surfaces,
+   is unproven (see U-006). The remote answer is **not observable** over the M4
+   bus (B-008), so `CallService::place`/`accept` stop at `Connecting` and the
+   caller drives `mark_connected` once media is up.
+3. **Real media devices.** Audio capture/playback (`cpal`/ALSA) and video
+   capture/display (V4L2 + `openh264` + SDL2) cannot be opened here; SDL2 dev
+   libraries are not installed, so the `video-capture` feature must not be
+   enabled in CI. Real recording additionally needs a **live recorder service**
+   (the recorder endpoint/session id are assigned per call and arrive over
+   Trouter), so only the socket-free recording steps (`add_bot`, `stop`) are
+   tested — the orchestrator `CallRecorder::start` is live-only.
+
+**Impact:** the media path and live signalling are verified only through the
+offline loopback (`macav::call_dry_run`), the SDP/SRTP/RTP primitive tests and the
+stub request-shape tests; real calls and recording are not.
+
+**Mitigation:** keep the `MediaSession` seam and the `CallSignaller`/`CallRecorder`
+wrappers transport-injectable so a live fix is contained; the stub tests pin the
+exact paths/headers/bodies so a regression is caught; wire real devices and a live
+recording flow as a follow-up.
+
+### U-006 — M9 call aspects not exercised offline
+
+M9's signalling and recording calls are thin wrappers over the vendored crate,
+tested offline against local TCP stubs (method/path/headers/body), and its media
+primitives (SDP/SRTP/RTP) and loopback are pure/deterministic. The following
+cannot be exercised here (B-002/B-011):
+
+- **Live acceptance of the signalling shapes.** That the live epconv service
+  returns a usable `conversationController` and accepts our join body, that the
+  acceptance/media-answer bodies are accepted (and that the SDP answer is
+  well-formed enough for the media controller), and that the `end` link tears the
+  call down, are assumed from the vendored crate + stubs.
+- **The remote-answer transition.** With call frames filtered out of the M4 bus
+  (B-008) there is no event to move `Connecting` → `Connected`; M9 exposes
+  `mark_connected` for the caller. A real implementation needs the B-008 fix (or
+  the vendored signalling callbacks) to drive it from the wire.
+- **The actual media path.** SRTP/RTP are tested as primitives and looped back,
+  but sending/receiving against a real media controller (ICE connectivity,
+  renegotiation, RTCP feedback, video) is unverified; the generated SDP uses
+  placeholder ports/candidates.
+- **Recording.** Only `add_bot` and `stop` request shapes are pinned; the full
+  flow (Trouter `addParticipantSuccess` → recorder discovery → transcription →
+  recording) needs a live recorder service and is unverified. The recorder-base
+  region fallback is the vendored code's.
+- **Call history fidelity.** `call_log.thread_id` is empty for an incoming call
+  whose invitation does not carry the thread id, and `started_at` is our local
+  clock (not the wire's); missed-vs-declined classification is a local heuristic.
+
+**Impact:** live call correctness is assumed from the vendored crate + stubs, not
+proven; the media path is exercised only offline.
+
+**Mitigation:** keep signalling/recording behind `CallSignaller`/`CallRecorder`
+and media behind `MediaSession`; the deterministic stub tests pin the request
+shapes so a regression is caught; fix B-008 to drive the state machine from the
+wire and add a live-device media implementation.

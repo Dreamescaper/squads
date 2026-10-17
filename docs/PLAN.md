@@ -144,6 +144,6 @@ Documentation is updated continuously:
 - [x] M6 — Teams & channels
 - [x] M7 — Files
 - [x] M8 — Presence & notifications
-- [ ] M9 — Audio/video calls
+- [x] M9 — Audio/video calls
 - [ ] M10 — egui UI
 - [ ] M11 — Polish & packaging

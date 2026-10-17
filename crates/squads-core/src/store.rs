@@ -35,6 +35,8 @@
 //! * **v5** (M8) — `chats.muted`, the local per-chat notification mute (fed from
 //!   the server's `alerts` property); unread/activity are **derived** from
 //!   `messages` + `read_state`, so no new table is needed. See ADR-021.
+//! * **v6** (M9) — `call_log`, the local call-history table (Teams exposes no
+//!   call-history API through the reverse-engineered surfaces). See ADR-025.
 //!
 //! ## Who writes what
 //!
@@ -46,8 +48,9 @@
 //! [`Store::upsert_channels`] and [`Store::upsert_team_members`]. M7's files
 //! service caches driveItems through [`Store::upsert_files`]. M8 derives unread
 //! counts from [`Store::unread_count`] / [`Store::unread_messages`] and persists
-//! the mute flag with [`Store::set_chat_muted`]. Nothing in this module talks to
-//! the network.
+//! the mute flag with [`Store::set_chat_muted`]. M9 records local call history
+//! through [`Store::upsert_call_log`] / [`Store::call_log`]. Nothing in this
+//! module talks to the network.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -58,7 +61,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::tokens::now_unix;
 use crate::error::{CoreError, Result};
-use crate::model::{Channel, Chat, FileEntry, Message, Reaction, SendState, Team, TeamMember};
+use crate::model::{
+    CallDirection, CallLogEntry, CallOutcome, Channel, Chat, FileEntry, Message, Reaction,
+    SendState, Team, TeamMember,
+};
 
 /// Newest schema version this build knows how to create/migrate to.
 ///
@@ -68,7 +74,8 @@ use crate::model::{Channel, Chat, FileEntry, Message, Reaction, SendState, Team,
 /// * **v3** (M6) — `teams`, `channels`, `team_members` for the teams service.
 /// * **v4** (M7) — `files`, the driveItem cache for the files service.
 /// * **v5** (M8) — `chats.muted`, the local per-chat notification mute.
-pub const SCHEMA_VERSION: i32 = 5;
+/// * **v6** (M9) — `call_log`, the local call-history table.
+pub const SCHEMA_VERSION: i32 = 6;
 
 /// Timeout for a busy database before `SQLITE_BUSY` is surfaced.
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -208,6 +215,33 @@ CREATE INDEX IF NOT EXISTS idx_files_chat
     ON files (profile, chat_id);
 CREATE INDEX IF NOT EXISTS idx_files_drive_item
     ON files (drive_id, id);
+"#;
+
+/// v6 schema: the local call-history table (M9). Plain
+/// `CREATE TABLE/INDEX IF NOT EXISTS`, so the migration is re-entrant.
+///
+/// `id` is the wire `callId` when known, else a generated uuid; `thread_id` is
+/// the conversation the call belongs to (may be empty). `ended_at`/
+/// `duration_secs` are `NULL` while a call is in progress; `outcome` degrades
+/// from an unknown value to `unknown`. `participants_json` mirrors the
+/// `reactions_json`/`roles_json` convention (a corrupt blob reads as empty).
+const MIGRATION_V6_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS call_log (
+    id                TEXT NOT NULL,
+    profile           TEXT NOT NULL,
+    thread_id         TEXT NOT NULL DEFAULT '',
+    direction         TEXT NOT NULL DEFAULT 'outgoing',
+    started_at        INTEGER NOT NULL,
+    ended_at          INTEGER,
+    duration_secs     INTEGER,
+    participants_json TEXT NOT NULL DEFAULT '[]',
+    outcome           TEXT NOT NULL DEFAULT 'unknown',
+    updated_at        INTEGER NOT NULL,
+    PRIMARY KEY (id, profile)
+);
+
+CREATE INDEX IF NOT EXISTS idx_call_log_thread
+    ON call_log (profile, thread_id, started_at);
 "#;
 
 /// One local account record.
@@ -1100,6 +1134,121 @@ impl Store {
         Ok(removed > 0)
     }
 
+    // ----- call log (M9) --------------------------------------------------
+
+    /// Insert or update local call-history rows for `profile`, keyed
+    /// `(id, profile)`.
+    ///
+    /// Idempotent: a call is first written when it starts (`ended_at`/
+    /// `duration_secs` `NULL`, outcome `unknown`) and updated in place when it
+    /// ends, so one call is one row. `updated_at` only advances. Returns the
+    /// number of rows written.
+    pub fn upsert_call_log(&self, profile: &str, entries: &[CallLogEntry]) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now_unix() as i64;
+        let mut written = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO call_log
+                    (id, profile, thread_id, direction, started_at, ended_at,
+                     duration_secs, participants_json, outcome, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id, profile) DO UPDATE SET
+                    thread_id = excluded.thread_id,
+                    direction = excluded.direction,
+                    started_at = excluded.started_at,
+                    ended_at = excluded.ended_at,
+                    duration_secs = excluded.duration_secs,
+                    participants_json = excluded.participants_json,
+                    outcome = excluded.outcome,
+                    updated_at = MAX(call_log.updated_at, excluded.updated_at)",
+            )?;
+            for entry in entries {
+                let participants =
+                    serde_json::to_string(&entry.participants).map_err(CoreError::from)?;
+                stmt.execute(params![
+                    entry.id,
+                    profile,
+                    entry.thread_id,
+                    entry.direction.as_str(),
+                    entry.started_at,
+                    entry.ended_at,
+                    entry.duration_secs.map(|d| d as i64),
+                    participants,
+                    entry.outcome.as_str(),
+                    now
+                ])?;
+                written += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// The newest `limit` call-history rows for `profile`, newest first.
+    ///
+    /// Ties (same `started_at`) fall back to the id so the order is stable.
+    pub fn call_log(&self, profile: &str, limit: usize) -> Result<Vec<CallLogEntry>> {
+        self.call_log_query(
+            "SELECT id, thread_id, direction, started_at, ended_at, duration_secs,
+                    participants_json, outcome
+             FROM call_log
+             WHERE profile = ?1
+             ORDER BY started_at DESC, id DESC
+             LIMIT ?2",
+            params![profile, limit as i64],
+        )
+    }
+
+    /// The newest `limit` call-history rows for one thread, newest first.
+    pub fn call_log_for_thread(
+        &self,
+        profile: &str,
+        thread_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CallLogEntry>> {
+        self.call_log_query(
+            "SELECT id, thread_id, direction, started_at, ended_at, duration_secs,
+                    participants_json, outcome
+             FROM call_log
+             WHERE profile = ?1 AND thread_id = ?2
+             ORDER BY started_at DESC, id DESC
+             LIMIT ?3",
+            params![profile, thread_id, limit as i64],
+        )
+    }
+
+    /// Fetch one call-history row by id within `profile`, or `None`.
+    pub fn call_log_entry(&self, profile: &str, id: &str) -> Result<Option<CallLogEntry>> {
+        let conn = self.lock();
+        let entry = conn
+            .query_row(
+                "SELECT id, thread_id, direction, started_at, ended_at, duration_secs,
+                        participants_json, outcome
+                 FROM call_log WHERE id = ?1 AND profile = ?2",
+                params![id, profile],
+                row_to_call_log,
+            )
+            .optional()?;
+        Ok(entry)
+    }
+
+    fn call_log_query(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<CallLogEntry>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params, row_to_call_log)?;
+        let mut entries = Vec::new();
+        for entry in rows {
+            entries.push(entry?);
+        }
+        Ok(entries)
+    }
+
     /// Shared message query: rows come back newest-first; reverse for display.
     fn messages_query(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Message>> {
         let conn = self.lock();
@@ -1171,6 +1320,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if current < 5 {
         migrate_v5(&tx)?;
     }
+    if current < 6 {
+        migrate_v6(&tx)?;
+    }
     // Record the version *after* the DDL inside the same transaction, so a
     // crash can never leave a version marker ahead of the schema.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1220,6 +1372,15 @@ fn migrate_v5(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     if !column_exists(tx, "chats", "muted")? {
         tx.execute_batch("ALTER TABLE chats ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;")?;
     }
+    Ok(())
+}
+
+/// Apply the v6 additions: the `call_log` call-history table (M9).
+///
+/// Every statement is `CREATE TABLE/INDEX IF NOT EXISTS`, so the migration is
+/// re-entrant even if the version marker was reset.
+fn migrate_v6(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(MIGRATION_V6_TABLES)?;
     Ok(())
 }
 
@@ -1316,6 +1477,20 @@ fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
     })
 }
 
+fn row_to_call_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallLogEntry> {
+    let participants_json: String = row.get(6)?;
+    Ok(CallLogEntry {
+        id: row.get(0)?,
+        thread_id: row.get(1)?,
+        direction: CallDirection::from_db(&row.get::<_, String>(2)?),
+        started_at: row.get(3)?,
+        ended_at: row.get(4)?,
+        duration_secs: row.get::<_, Option<i64>>(5)?.map(|d| d.max(0) as u64),
+        participants: participants_from_json(&participants_json),
+        outcome: CallOutcome::from_db(&row.get::<_, String>(7)?),
+    })
+}
+
 /// Serialize reactions for storage; the only fallible part of a message write.
 fn reactions_to_json(reactions: &[Reaction]) -> Result<String> {
     serde_json::to_string(reactions).map_err(CoreError::from)
@@ -1331,6 +1506,12 @@ fn reactions_from_json(text: &str) -> Vec<Reaction> {
 /// Parse a stored roles blob. Like reactions, a corrupt blob degrades to "no
 /// roles" rather than failing the roster read.
 fn roles_from_json(text: &str) -> Vec<String> {
+    serde_json::from_str(text).unwrap_or_default()
+}
+
+/// Parse a stored call participants blob. Like reactions/roles, a corrupt blob
+/// degrades to "no participants" rather than failing the call-history read.
+fn participants_from_json(text: &str) -> Vec<String> {
     serde_json::from_str(text).unwrap_or_default()
 }
 
@@ -2355,5 +2536,142 @@ mod tests {
         // A different chat is unaffected; another profile sees no horizon.
         assert_eq!(store.unread_count("default", "c2").unwrap(), 0);
         assert_eq!(store.unread_count("work", "c1").unwrap(), 3);
+    }
+
+    // ----- M9: call log -----------------------------------------------------
+
+    fn call_entry(id: &str, thread: &str, started: i64) -> CallLogEntry {
+        CallLogEntry::started(id, thread, CallDirection::Incoming, started)
+            .with_participants(vec!["Alice".into()])
+    }
+
+    #[test]
+    fn v5_database_upgrades_to_v6_adding_the_call_log_table() {
+        let path = temp_path("v5-to-v6");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            // Build a genuine v5 database: v1 DDL, v2 column + read_state, v3
+            // tables, v4 files table, v5 mute column, version marker 5.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN send_state TEXT NOT NULL DEFAULT 'sent';",
+            )
+            .unwrap();
+            conn.execute_batch(MIGRATION_V2_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V3_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V4_TABLES).unwrap();
+            conn.execute_batch("ALTER TABLE chats ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;")
+                .unwrap();
+            conn.pragma_update(None, "user_version", 5).unwrap();
+        }
+
+        let store = Store::open(&path).expect("open the v5 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        // The table exists and round-trips a row written after the upgrade.
+        assert!(store.call_log("default", 10).unwrap().is_empty());
+        store
+            .upsert_call_log("default", &[call_entry("call-1", "t1", 100)])
+            .unwrap();
+        assert_eq!(store.call_log("default", 10).unwrap().len(), 1);
+
+        // Reopening again is a clean no-op and the row survives.
+        drop(store);
+        let store = Store::open(&path).expect("reopen v6 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.call_log("default", 10).unwrap().len(), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn call_log_round_trips_and_upsert_updates_in_place() {
+        let store = Store::open_in_memory().unwrap();
+        let mut entry = call_entry("call-1", "t1", 1_000);
+        store.upsert_call_log("default", &[entry.clone()]).unwrap();
+
+        // In progress: no end, outcome unknown.
+        let got = store.call_log_entry("default", "call-1").unwrap().unwrap();
+        assert_eq!(got, entry);
+        assert_eq!(got.direction, CallDirection::Incoming);
+        assert!(got.ended_at.is_none());
+        assert!(got.duration_secs.is_none());
+        assert_eq!(got.outcome, CallOutcome::Unknown);
+        assert_eq!(got.participants, vec!["Alice".to_string()]);
+
+        // Finishing the same call updates the row, never adds one.
+        entry = entry.finished(1_042, CallOutcome::Completed);
+        store.upsert_call_log("default", &[entry.clone()]).unwrap();
+        assert_eq!(store.call_log("default", 10).unwrap().len(), 1);
+        assert_eq!(
+            store.call_log_entry("default", "call-1").unwrap().unwrap(),
+            entry
+        );
+        assert_eq!(
+            store
+                .call_log_entry("default", "call-1")
+                .unwrap()
+                .unwrap()
+                .duration_secs,
+            Some(42)
+        );
+
+        // A corrupt participants blob degrades to empty, never an error.
+        {
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE call_log SET participants_json = 'not json' WHERE id = 'call-1'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            store
+                .call_log_entry("default", "call-1")
+                .unwrap()
+                .unwrap()
+                .participants
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn call_log_is_ordered_newest_first_and_profile_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_call_log(
+                "default",
+                &[
+                    call_entry("old", "t1", 100),
+                    call_entry("new", "t2", 300),
+                    call_entry("mid", "t1", 200),
+                ],
+            )
+            .unwrap();
+        store
+            .upsert_call_log("work", &[call_entry("other", "t9", 400)])
+            .unwrap();
+
+        let all = store.call_log("default", 10).unwrap();
+        assert_eq!(
+            all.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["new", "mid", "old"],
+            "newest first"
+        );
+        assert_eq!(store.call_log("default", 2).unwrap().len(), 2);
+
+        // Per-thread filter, profile isolated.
+        let thread = store.call_log_for_thread("default", "t1", 10).unwrap();
+        assert_eq!(
+            thread.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["mid", "old"]
+        );
+        assert!(
+            store
+                .call_log_for_thread("work", "t1", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.call_log_entry("work", "old").unwrap().is_none());
+        assert!(store.call_log_entry("work", "other").unwrap().is_some());
     }
 }

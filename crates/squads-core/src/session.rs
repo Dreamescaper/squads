@@ -6,10 +6,11 @@
 //! ([`Session::api`], built lazily from the token set) and token refresh
 //! ([`Session::ensure_fresh_tokens`]). **M3** attaches the local SQLite store
 //! ([`Session::store`] / [`Session::attach_store`]), opened from
-//! [`AppDirs::store_file`] by [`Session::new`]. **M5/M6/M7** expose the
-//! conversation, teams/channels and files services ([`Session::messaging`],
-//! [`Session::teams`], [`Session::files`]). The realtime feed attaches in
-//! M4.
+//! [`AppDirs::store_file`] by [`Session::new`]. **M5/M6/M7/M8/M9** expose the
+//! conversation, teams/channels, files, presence/notifications and call services
+//! ([`Session::messaging`], [`Session::teams`], [`Session::files`],
+//! [`Session::presence`], [`Session::notifications`], [`Session::calls`]). The
+//! realtime feed attaches in M4.
 //!
 //! Network access only ever happens through the sign-in driver, a
 //! [`Session::ensure_fresh_tokens`] refresh, or a call on the [`ApiClient`]
@@ -30,6 +31,7 @@ use crate::api::ApiClient;
 use crate::auth::flow::{AuthDriver, AuthTransport, HttpTransport, SignInProgress};
 use crate::auth::store::{DEFAULT_PROFILE, FileTokenStore, TokenStore};
 use crate::auth::tokens::TokenSet;
+use crate::calls::{CallCredentials, CallEndpoints, CallIdentity, CallService, CallSignaller};
 use crate::error::{CoreError, Result};
 use crate::files::Files;
 use crate::messaging::Messaging;
@@ -278,6 +280,40 @@ impl Session {
             Arc::clone(&self.store),
             client,
         ))
+    }
+
+    /// The M9 call service for this session.
+    ///
+    /// Shares the session's [`Store`] and notifier. The signalling endpoints are
+    /// derived from `region_gtms` (see [`CallEndpoints::from_region_gtms`]); the
+    /// credentials are the session's IC3/skype/recorder tokens, and the identity
+    /// is decoded from the skype JWT when it names one (so placing a call works
+    /// out of the box). Requires a token set ([`CoreError::NotSignedIn`]
+    /// otherwise); building is offline and makes no request.
+    ///
+    /// The real `trouter_surl` is not in `region_gtms` (it comes from the
+    /// negotiated Trouter session), so a caller that needs it should
+    /// [`CallSignaller::set_endpoints`] before placing a call (B-011).
+    pub fn calls(&mut self) -> Result<CallService> {
+        let client = self.api_arc()?;
+        let tokens = self.tokens.as_ref().ok_or(CoreError::NotSignedIn)?;
+        let endpoints = CallEndpoints::from_region_gtms(client.region_gtms());
+        let credentials = CallCredentials {
+            ic3_token: tokens.ic3.token.clone(),
+            skype_token: tokens.skype.token.clone(),
+            recorder_token: tokens.recorder.token.clone(),
+        };
+        let mut service = CallService::new(
+            self.profile.clone(),
+            Arc::clone(&self.store),
+            CallSignaller::new(endpoints),
+        )
+        .with_credentials(credentials)
+        .with_notifier(Arc::clone(&self.notifier));
+        if let Some(identity) = CallIdentity::from_skype_token(&tokens.skype.token) {
+            service = service.with_identity(identity);
+        }
+        Ok(service)
     }
 
     /// The M8 presence service for this session.
@@ -1127,5 +1163,58 @@ mod tests {
         );
         assert_eq!(recorder.len(), 1);
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ----- M9: calls ---------------------------------------------------------
+
+    fn skype_jwt() -> String {
+        use base64::Engine as _;
+        let enc = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let header = enc(br#"{"alg":"none"}"#);
+        let payload = enc(serde_json::json!({
+            "skypeid": "orgid:self-guid",
+            "name": "Alice",
+            "tid": "tenant-1",
+        })
+        .to_string()
+        .as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
+    #[test]
+    fn calls_requires_tokens_and_builds_from_the_region_and_skype_token() {
+        let (tmp, dirs_a) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs_a, "default", store).expect("session");
+        let err = session.calls().unwrap_err();
+        assert!(matches!(err, CoreError::NotSignedIn), "got {err:?}");
+
+        let (tmp2, dirs_b) = dirs();
+        let mut set = sample_set();
+        set.skype = StoredToken::with_expiry(skype_jwt(), 4_000_000_000);
+        set.region_gtms = serde_json::json!({
+            "epconvUrl": "http://127.0.0.1:9/epconv",
+            "trouterSurl": "/surl/",
+        });
+        let store2 = Arc::new(MemoryTokenStore::new());
+        store2.save("work", &set).unwrap();
+        let mut session = Session::with_store(dirs_b, "work", store2).expect("session");
+        session.restore().expect("restore");
+
+        let service = session.calls().expect("calls");
+        assert_eq!(service.profile(), "work");
+        assert!(Arc::ptr_eq(service.store(), session.store()));
+        assert_eq!(service.state(), crate::calls::CallState::Idle);
+        assert_eq!(
+            service.signaller().endpoints().epconv_url,
+            "http://127.0.0.1:9/epconv"
+        );
+        assert_eq!(service.signaller().endpoints().trouter_surl, "/surl/");
+        // Building the service is offline.
+        assert!(session.has_api());
+        assert_eq!(session.api().unwrap().request_count(), 0);
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp2).ok();
     }
 }
