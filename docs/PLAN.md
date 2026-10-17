@@ -142,7 +142,7 @@ Documentation is updated continuously:
 - [x] M4 — Realtime (Trouter)
 - [x] M5 — Messaging
 - [x] M6 — Teams & channels
-- [ ] M7 — Files
+- [x] M7 — Files
 - [ ] M8 — Presence & notifications
 - [ ] M9 — Audio/video calls
 - [ ] M10 — egui UI

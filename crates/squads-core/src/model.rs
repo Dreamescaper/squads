@@ -12,6 +12,9 @@
 //! Conversions are explicit and cheap:
 //! [`Chat::from_info`] / `From<&ost::api::ChatInfo>` and
 //! [`Message::from_info`] / `From<&ost::api::MessageInfo>`.
+//! M6 adds [`Team::from_info`] / [`Channel::from_info`] /
+//! [`TeamMember::from_info`]; M7 adds [`FileEntry::from_shared`] /
+//! [`FileVersion::from_wire`].
 //!
 //! ## Two facts you must orient on
 //!
@@ -30,8 +33,8 @@
 use serde::{Deserialize, Serialize};
 
 use ost::api::{
-    ChannelInfo, ChatInfo, MessageInfo, ReactionCount, Reactor as WireReactor, TeamInfo,
-    TeamMemberInfo,
+    ChannelInfo, ChatInfo, FileVersion as WireFileVersion, MessageInfo, ReactionCount,
+    Reactor as WireReactor, SharedFile as WireSharedFile, TeamInfo, TeamMemberInfo,
 };
 
 /// Delivery state of a message we authored (milestone **M5**).
@@ -303,6 +306,131 @@ impl From<&TeamMemberInfo> for TeamMember {
     fn from(info: &TeamMemberInfo) -> Self {
         TeamMember::from_info(info)
     }
+}
+
+// ----- files (M7) ---------------------------------------------------------
+
+/// One file shared in a chat/channel or listed from a drive (milestone **M7**).
+///
+/// Mirrors the vendored `ost::api::SharedFile` but is owned and
+/// protocol-independent, so the store and the UI never touch the wire
+/// projection. [`FileEntry::drive_id`] is optional: an unresolved chat
+/// attachment (a file that could not be resolved to a driveItem — deleted, or
+/// no access) lists from message metadata alone, so it can be opened in a
+/// browser but not downloaded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    /// DriveItem id (or, for an unresolved attachment, its attachment id/URL).
+    pub id: String,
+    /// Owning drive id, when known.
+    pub drive_id: Option<String>,
+    /// Display name (never empty; the wire falls back to `[unnamed]`).
+    pub name: String,
+    /// Size in bytes (`0` when unknown: a folder or an unresolved attachment).
+    pub size: u64,
+    /// MIME type, when Graph named one.
+    pub mime: Option<String>,
+    /// Open-in-browser URL.
+    pub web_url: Option<String>,
+    /// Direct download URL (Graph `@microsoft.graph.downloadUrl`), when present.
+    pub download_url: Option<String>,
+    /// True when this driveItem is a folder (no size/mime; drill in with
+    /// [`Files::list_folder`](crate::Files::list_folder)).
+    pub is_folder: bool,
+    /// ISO-8601 creation time, when known.
+    pub created: Option<String>,
+    /// ISO-8601 last-modified time, when known.
+    pub modified: Option<String>,
+    /// Display name of the chat sender (chat listings only; `None` elsewhere).
+    pub sender: Option<String>,
+    /// Cached sharing link (set by
+    /// [`Files::create_link`](crate::Files::create_link); the list paths never
+    /// fill it).
+    pub share_url: Option<String>,
+    /// File-attachment GUID mined from the driveItem eTag; matches the
+    /// `<attachment id>` in the message that shared the file.
+    pub attachment_id: Option<String>,
+}
+
+impl FileEntry {
+    /// Build a domain [`FileEntry`] from a protocol `SharedFile`.
+    pub fn from_shared(file: &WireSharedFile) -> Self {
+        FileEntry {
+            id: file.id.clone(),
+            drive_id: file.drive_id.clone(),
+            name: file.name.clone(),
+            size: file.size,
+            mime: file.mime.clone(),
+            web_url: file.web_url.clone(),
+            download_url: file.download_url.clone(),
+            is_folder: file.is_folder,
+            created: file.created.clone(),
+            modified: file.modified.clone(),
+            sender: file.sender.clone(),
+            share_url: file.share_url.clone(),
+            attachment_id: file.attachment_id.clone(),
+        }
+    }
+}
+
+impl From<&WireSharedFile> for FileEntry {
+    fn from(file: &WireSharedFile) -> Self {
+        FileEntry::from_shared(file)
+    }
+}
+
+impl From<WireSharedFile> for FileEntry {
+    fn from(file: WireSharedFile) -> Self {
+        FileEntry::from_shared(&file)
+    }
+}
+
+/// One version in a drive item's version history (milestone **M7**).
+///
+/// Mirrors the vendored `ost::api::FileVersion`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileVersion {
+    /// Version id (Graph `versions/{id}`).
+    pub id: String,
+    /// Size in bytes (`0` when Graph omitted it).
+    pub size: u64,
+    /// ISO-8601 last-modified time, when known.
+    pub modified: Option<String>,
+    /// Display name of the last editor, when known.
+    pub modified_by: Option<String>,
+}
+
+impl FileVersion {
+    /// Build a domain [`FileVersion`] from a protocol `FileVersion`.
+    pub fn from_wire(version: &WireFileVersion) -> Self {
+        FileVersion {
+            id: version.id.clone(),
+            size: version.size,
+            modified: version.modified.clone(),
+            modified_by: version.modified_by.clone(),
+        }
+    }
+}
+
+impl From<&WireFileVersion> for FileVersion {
+    fn from(version: &WireFileVersion) -> Self {
+        FileVersion::from_wire(version)
+    }
+}
+
+/// A sharing link for one drive item (Graph `createLink`), milestone **M7**.
+///
+/// Defined here (not reused from the vendored crate) because the vendored
+/// `SharedLink` is not re-exported by `ost::api`; the [`ApiClient`] wrapper maps
+/// it into this owned type.
+///
+/// [`ApiClient`]: crate::ApiClient
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedLink {
+    /// The shareable URL.
+    pub url: String,
+    /// The link scope Graph reported (`anonymous` / `organization`).
+    pub scope: Option<String>,
 }
 
 /// One chat message in the timeline.
@@ -729,5 +857,91 @@ mod tests {
         assert!(!is_channel_conversation_id("19:team@thread.v2"));
         assert!(!is_channel_conversation_id(""));
         assert!(!is_channel_conversation_id("not-a-thread"));
+    }
+
+    // ----- M7: files --------------------------------------------------------
+
+    fn shared_file() -> WireSharedFile {
+        WireSharedFile {
+            id: "item-1".into(),
+            name: "Plan.docx".into(),
+            size: 2048,
+            mime: Some(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document".into(),
+            ),
+            web_url: Some("https://contoso.sharepoint.com/:w:/x/ABC".into()),
+            download_url: Some("https://contoso.sharepoint.com/download".into()),
+            drive_id: Some("drive-1".into()),
+            created: Some("2026-01-01T00:00:00Z".into()),
+            modified: Some("2026-01-02T00:00:00Z".into()),
+            sender: Some("Alice".into()),
+            is_folder: false,
+            share_url: None,
+            attachment_id: Some("550e8400-e29b-41d4-a716-446655440000".into()),
+        }
+    }
+
+    #[test]
+    fn file_entry_converts_from_shared_file() {
+        let entry = FileEntry::from_shared(&shared_file());
+        assert_eq!(entry.id, "item-1");
+        assert_eq!(entry.drive_id.as_deref(), Some("drive-1"));
+        assert_eq!(entry.name, "Plan.docx");
+        assert_eq!(entry.size, 2048);
+        assert!(entry.mime.as_deref().unwrap().contains("wordprocessingml"));
+        assert_eq!(entry.sender.as_deref(), Some("Alice"));
+        assert!(!entry.is_folder);
+        assert!(entry.share_url.is_none());
+        assert_eq!(
+            entry.attachment_id.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        // The `From` impls delegate to `from_shared`.
+        assert_eq!(FileEntry::from(&shared_file()), entry);
+        assert_eq!(FileEntry::from(shared_file()), entry);
+    }
+
+    #[test]
+    fn file_entry_keeps_unknown_drive_for_unresolved_refs() {
+        let mut wire = shared_file();
+        wire.drive_id = None;
+        wire.size = 0;
+        wire.mime = None;
+        wire.download_url = None;
+        let entry = FileEntry::from(wire);
+        assert!(entry.drive_id.is_none());
+        assert_eq!(entry.size, 0);
+        assert!(entry.download_url.is_none());
+    }
+
+    #[test]
+    fn file_version_and_shared_link_are_owned() {
+        let version = FileVersion::from_wire(&WireFileVersion {
+            id: "3.0".into(),
+            size: 48211,
+            modified: Some("2026-09-20T10:00:00Z".into()),
+            modified_by: Some("Megan Harper".into()),
+        });
+        assert_eq!(version.id, "3.0");
+        assert_eq!(version.size, 48211);
+        assert_eq!(version.modified_by.as_deref(), Some("Megan Harper"));
+        assert_eq!(
+            FileVersion::from(&WireFileVersion {
+                id: "1.0".into(),
+                size: 0,
+                modified: None,
+                modified_by: None,
+            })
+            .size,
+            0
+        );
+
+        let link = SharedLink {
+            url: "https://contoso.sharepoint.com/:w:/x/ABC".into(),
+            scope: Some("organization".into()),
+        };
+        let back: SharedLink =
+            serde_json::from_str(&serde_json::to_string(&link).unwrap()).unwrap();
+        assert_eq!(back, link);
     }
 }

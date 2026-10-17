@@ -30,6 +30,8 @@
 //!   horizon). See ADR-014/ADR-015.
 //! * **v3** (M6) — `teams`, `channels`, `team_members` (the teams/channel
 //!   metadata cache). See ADR-017.
+//! * **v4** (M7) — `files`, the driveItem cache for the files browser (keyed
+//!   `(id, profile)`, with an optional owning `chat_id`). See ADR-019.
 //!
 //! ## Who writes what
 //!
@@ -38,8 +40,9 @@
 //! [`Store::upsert_chats`] (keyed by server id) and read history through
 //! [`Store::messages`] / [`Store::messages_before`]. M6's teams service caches
 //! team/channel/member metadata through [`Store::upsert_teams`],
-//! [`Store::upsert_channels`] and [`Store::upsert_team_members`]. Nothing in
-//! this module talks to the network.
+//! [`Store::upsert_channels`] and [`Store::upsert_team_members`]. M7's files
+//! service caches driveItems through [`Store::upsert_files`]. Nothing in this
+//! module talks to the network.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -50,7 +53,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::tokens::now_unix;
 use crate::error::{CoreError, Result};
-use crate::model::{Channel, Chat, Message, Reaction, SendState, Team, TeamMember};
+use crate::model::{Channel, Chat, FileEntry, Message, Reaction, SendState, Team, TeamMember};
 
 /// Newest schema version this build knows how to create/migrate to.
 ///
@@ -58,7 +61,8 @@ use crate::model::{Channel, Chat, Message, Reaction, SendState, Team, TeamMember
 /// * **v2** (M5) — `messages.send_state` for optimistic sends, and the
 ///   `read_state` table for our own read horizon.
 /// * **v3** (M6) — `teams`, `channels`, `team_members` for the teams service.
-pub const SCHEMA_VERSION: i32 = 3;
+/// * **v4** (M7) — `files`, the driveItem cache for the files service.
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// Timeout for a busy database before `SQLITE_BUSY` is surfaced.
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -163,6 +167,41 @@ CREATE INDEX IF NOT EXISTS idx_channels_team
     ON channels (team_id);
 CREATE INDEX IF NOT EXISTS idx_team_members_team
     ON team_members (team_id);
+"#;
+
+/// v4 schema: the driveItem cache for the files service (M7).
+///
+/// Keyed `(id, profile)` (ADR-019): the driveItem id matches the store's
+/// existing `(id, profile)` convention and sidesteps keying on the nullable
+/// `drive_id`. The owning `chat_id` is a non-key column so a chat listing can
+/// be read back with [`Store::files_for_chat`]; recents and folder listings
+/// leave it `NULL`. Plain `CREATE TABLE/INDEX IF NOT EXISTS`, so the migration
+/// is re-entrant.
+const MIGRATION_V4_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS files (
+    id            TEXT NOT NULL,
+    profile       TEXT NOT NULL,
+    drive_id      TEXT,
+    chat_id       TEXT,
+    name          TEXT NOT NULL DEFAULT '[unnamed]',
+    size          INTEGER NOT NULL DEFAULT 0,
+    mime          TEXT,
+    web_url       TEXT,
+    download_url  TEXT,
+    is_folder     INTEGER NOT NULL DEFAULT 0,
+    created       TEXT,
+    modified      TEXT,
+    sender        TEXT,
+    share_url     TEXT,
+    attachment_id TEXT,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (id, profile)
+);
+
+CREATE INDEX IF NOT EXISTS idx_files_chat
+    ON files (profile, chat_id);
+CREATE INDEX IF NOT EXISTS idx_files_drive_item
+    ON files (drive_id, id);
 "#;
 
 /// One local account record.
@@ -827,6 +866,126 @@ impl Store {
         Ok(members)
     }
 
+    // ----- files (M7) -----------------------------------------------------
+
+    /// Insert or update cached driveItems for `profile`, keyed `(id, profile)`.
+    ///
+    /// Idempotent. `chat_id` is the chat a file was listed under (recents and
+    /// folder listings pass `None`). Metadata is **additive**: `chat_id`,
+    /// `drive_id`, `mime`, `web_url`, `download_url`, `sender`, `created`,
+    /// `modified`, `share_url` and `attachment_id` only overwrite the stored
+    /// value when the incoming one is non-`NULL` (`COALESCE`), so a later
+    /// recents/folder listing cannot wipe the attachment id or sharing link a
+    /// chat listing/copy-link filled in. `name`/`size`/`is_folder` take the
+    /// incoming value and `updated_at` only advances. Returns the number of
+    /// files written.
+    pub fn upsert_files(
+        &self,
+        profile: &str,
+        chat_id: Option<&str>,
+        files: &[FileEntry],
+    ) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now_unix() as i64;
+        let mut written = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO files
+                    (id, profile, drive_id, chat_id, name, size, mime, web_url,
+                     download_url, is_folder, created, modified, sender,
+                     share_url, attachment_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, ?14, ?15, ?16)
+                 ON CONFLICT(id, profile) DO UPDATE SET
+                    drive_id = COALESCE(excluded.drive_id, files.drive_id),
+                    chat_id = COALESCE(excluded.chat_id, files.chat_id),
+                    name = excluded.name,
+                    size = excluded.size,
+                    mime = COALESCE(excluded.mime, files.mime),
+                    web_url = COALESCE(excluded.web_url, files.web_url),
+                    download_url = COALESCE(excluded.download_url, files.download_url),
+                    is_folder = excluded.is_folder,
+                    created = COALESCE(excluded.created, files.created),
+                    modified = COALESCE(excluded.modified, files.modified),
+                    sender = COALESCE(excluded.sender, files.sender),
+                    share_url = COALESCE(excluded.share_url, files.share_url),
+                    attachment_id = COALESCE(excluded.attachment_id, files.attachment_id),
+                    updated_at = MAX(files.updated_at, excluded.updated_at)",
+            )?;
+            for file in files {
+                stmt.execute(params![
+                    file.id,
+                    profile,
+                    file.drive_id,
+                    chat_id,
+                    file.name,
+                    file.size as i64,
+                    file.mime,
+                    file.web_url,
+                    file.download_url,
+                    file.is_folder as i64,
+                    file.created,
+                    file.modified,
+                    file.sender,
+                    file.share_url,
+                    file.attachment_id,
+                    now
+                ])?;
+                written += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// The cached files of one chat, newest-modified first (then name, id).
+    pub fn files_for_chat(&self, profile: &str, chat_id: &str) -> Result<Vec<FileEntry>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, drive_id, name, size, mime, web_url, download_url,
+                    is_folder, created, modified, sender, share_url, attachment_id
+             FROM files
+             WHERE profile = ?1 AND chat_id = ?2
+             ORDER BY modified DESC, name COLLATE NOCASE ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![profile, chat_id], row_to_file)?;
+        let mut files = Vec::new();
+        for file in rows {
+            files.push(file?);
+        }
+        Ok(files)
+    }
+
+    /// Fetch one cached driveItem by `(drive_id, id)` within `profile`, or
+    /// `None`. The key is `(id, profile)`; the drive is an additional filter so
+    /// a drive-scoped lookup never returns another drive's item.
+    pub fn file(&self, profile: &str, drive_id: &str, item_id: &str) -> Result<Option<FileEntry>> {
+        let conn = self.lock();
+        let file = conn
+            .query_row(
+                "SELECT id, drive_id, name, size, mime, web_url, download_url,
+                        is_folder, created, modified, sender, share_url, attachment_id
+                 FROM files
+                 WHERE profile = ?1 AND drive_id = ?2 AND id = ?3",
+                params![profile, drive_id, item_id],
+                row_to_file,
+            )
+            .optional()?;
+        Ok(file)
+    }
+
+    /// Delete one cached driveItem by `(drive_id, id)`. Returns whether a row
+    /// existed.
+    pub fn delete_file(&self, profile: &str, drive_id: &str, item_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let removed = conn.execute(
+            "DELETE FROM files WHERE id = ?1 AND drive_id = ?2 AND profile = ?3",
+            params![item_id, drive_id, profile],
+        )?;
+        Ok(removed > 0)
+    }
+
     /// Shared message query: rows come back newest-first; reverse for display.
     fn messages_query(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Message>> {
         let conn = self.lock();
@@ -892,6 +1051,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if current < 3 {
         migrate_v3(&tx)?;
     }
+    if current < 4 {
+        migrate_v4(&tx)?;
+    }
     // Record the version *after* the DDL inside the same transaction, so a
     // crash can never leave a version marker ahead of the schema.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -921,6 +1083,15 @@ fn migrate_v2(tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// re-entrant even if the version marker was reset.
 fn migrate_v3(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(MIGRATION_V3_TABLES)?;
+    Ok(())
+}
+
+/// Apply the v4 additions: the `files` driveItem cache.
+///
+/// Every statement is `CREATE TABLE/INDEX IF NOT EXISTS`, so the migration is
+/// re-entrant even if the version marker was reset.
+fn migrate_v4(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(MIGRATION_V4_TABLES)?;
     Ok(())
 }
 
@@ -996,6 +1167,24 @@ fn row_to_team_member(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamMember> {
         display_name: row.get(1)?,
         email: row.get(2)?,
         roles: roles_from_json(&roles_json),
+    })
+}
+
+fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
+    Ok(FileEntry {
+        id: row.get(0)?,
+        drive_id: row.get(1)?,
+        name: row.get(2)?,
+        size: row.get::<_, i64>(3)? as u64,
+        mime: row.get(4)?,
+        web_url: row.get(5)?,
+        download_url: row.get(6)?,
+        is_folder: row.get::<_, i64>(7)? != 0,
+        created: row.get(8)?,
+        modified: row.get(9)?,
+        sender: row.get(10)?,
+        share_url: row.get(11)?,
+        attachment_id: row.get(12)?,
     })
 }
 
@@ -1791,5 +1980,148 @@ mod tests {
         let roster = store.team_members("t1").unwrap();
         assert_eq!(roster.len(), 2);
         assert!(roster[0].roles.is_empty());
+    }
+
+    // ----- M7: files --------------------------------------------------------
+
+    fn file(id: &str, drive: &str, name: &str) -> FileEntry {
+        FileEntry {
+            id: id.into(),
+            drive_id: Some(drive.into()),
+            name: name.into(),
+            size: 42,
+            mime: Some("text/plain".into()),
+            web_url: Some(format!("https://sp/{id}")),
+            download_url: Some(format!("https://dl/{id}")),
+            is_folder: false,
+            created: Some("2026-01-01T00:00:00Z".into()),
+            modified: Some("2026-01-02T00:00:00Z".into()),
+            sender: Some("Alice".into()),
+            share_url: None,
+            attachment_id: Some("att-1".into()),
+        }
+    }
+
+    #[test]
+    fn v3_database_upgrades_to_v4_adding_the_files_table() {
+        let path = temp_path("v3-to-v4");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            // Build a genuine v3 database: v1 DDL, the v2 `send_state` column +
+            // `read_state`, the v3 tables, version marker 3.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN send_state TEXT NOT NULL DEFAULT 'sent';",
+            )
+            .unwrap();
+            conn.execute_batch(MIGRATION_V2_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V3_TABLES).unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+        }
+
+        let store = Store::open(&path).expect("open the v3 database");
+        // Forward-only migration reached v4.
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        // The files table exists and is queryable (empty, not an error) ...
+        assert!(store.files_for_chat("default", "c1").unwrap().is_empty());
+        // ... and writable.
+        store
+            .upsert_files("default", Some("c1"), &[file("i1", "D1", "a.pdf")])
+            .unwrap();
+        assert_eq!(store.files_for_chat("default", "c1").unwrap().len(), 1);
+
+        // Reopening again is a clean no-op.
+        drop(store);
+        let store = Store::open(&path).expect("reopen v4 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.files_for_chat("default", "c1").unwrap().len(), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn files_round_trip_and_are_profile_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.files_for_chat("default", "c1").unwrap().is_empty());
+
+        store
+            .upsert_files("default", Some("c1"), &[file("i1", "D1", "B.txt")])
+            .unwrap();
+        let got = store.files_for_chat("default", "c1").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "i1");
+        assert_eq!(got[0].drive_id.as_deref(), Some("D1"));
+        assert_eq!(got[0].attachment_id.as_deref(), Some("att-1"));
+
+        // drive+item lookup, and the drive is part of the filter.
+        assert_eq!(
+            store.file("default", "D1", "i1").unwrap().unwrap().name,
+            "B.txt"
+        );
+        assert!(store.file("default", "D2", "i1").unwrap().is_none());
+        assert!(store.file("default", "D1", "missing").unwrap().is_none());
+
+        // Profile isolation.
+        assert!(store.files_for_chat("work", "c1").unwrap().is_empty());
+        assert!(store.file("work", "D1", "i1").unwrap().is_none());
+
+        // Idempotent re-upsert: same row, updated name.
+        store
+            .upsert_files("default", Some("c1"), &[file("i1", "D1", "B renamed.txt")])
+            .unwrap();
+        let got = store.files_for_chat("default", "c1").unwrap();
+        assert_eq!(got.len(), 1, "no duplicate row");
+        assert_eq!(got[0].name, "B renamed.txt");
+
+        // Delete drops only the named row.
+        assert!(store.delete_file("default", "D1", "i1").unwrap());
+        assert!(store.file("default", "D1", "i1").unwrap().is_none());
+        assert!(!store.delete_file("default", "D1", "i1").unwrap());
+        // A wrong-profile delete reports a miss.
+        store
+            .upsert_files("default", Some("c1"), &[file("i2", "D1", "keep.txt")])
+            .unwrap();
+        assert!(!store.delete_file("work", "D1", "i2").unwrap());
+        assert_eq!(store.files_for_chat("default", "c1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn file_upsert_is_additive_and_preserves_chat_and_enrichment() {
+        let store = Store::open_in_memory().unwrap();
+        // Listed from a chat: chat association + attachment id + sender.
+        store
+            .upsert_files("default", Some("c1"), &[file("i1", "D1", "Plan.docx")])
+            .unwrap();
+
+        // A later recents/folder listing (no chat, no attachment id, no sender)
+        // must not wipe the chat association or the enrichment.
+        let mut recent = file("i1", "D1", "Plan.docx");
+        recent.attachment_id = None;
+        recent.sender = None;
+        recent.share_url = None;
+        store.upsert_files("default", None, &[recent]).unwrap();
+        assert_eq!(
+            store.files_for_chat("default", "c1").unwrap().len(),
+            1,
+            "the chat association survives a chatless listing"
+        );
+        let row = store.file("default", "D1", "i1").unwrap().unwrap();
+        assert_eq!(row.attachment_id.as_deref(), Some("att-1"));
+        assert_eq!(row.sender.as_deref(), Some("Alice"));
+
+        // create_link caches the share url (chat_id None) without losing the
+        // chat association either.
+        let mut linked = file("i1", "D1", "Plan.docx");
+        linked.share_url = Some("https://sp/:w:/x".into());
+        linked.attachment_id = None;
+        store.upsert_files("default", None, &[linked]).unwrap();
+        let row = store.file("default", "D1", "i1").unwrap().unwrap();
+        assert_eq!(row.share_url.as_deref(), Some("https://sp/:w:/x"));
+        assert_eq!(store.files_for_chat("default", "c1").unwrap().len(), 1);
+        assert_eq!(
+            row.attachment_id.as_deref(),
+            Some("att-1"),
+            "attachment still kept"
+        );
     }
 }

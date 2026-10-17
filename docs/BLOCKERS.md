@@ -249,6 +249,49 @@ tests pin the exact paths/bodies/auth so a regression is caught; wire channel
 reactions/receipts in a live-verified follow-up (candidate for M8, alongside
 presence/notifications).
 
+### U-004 — M7 files aspects not exercised offline
+
+M7's file calls are thin wrappers over the vendored Graph code, tested offline
+against local TCP stubs (method/path/auth/body + store effects). The following
+cannot be exercised here (B-002 — no live tenant):
+
+- **Real SharePoint/OneDrive acceptance.** The exact server behaviour of the
+  Graph list endpoints (chat-service `properties.files` → `/shares/{u!…}/driveItem`
+  resolution, channel `filesFolder` + `/drives/{d}/items/{i}/children`,
+  `/me/drive/recent`), the simple-PUT upload response (does it carry a
+  `parentReference.driveId` and an eTag whose GUID is the attachment id?), the
+  resumable-session handshake (does Graph answer `202` for every non-final
+  fragment and `200` with the driveItem for the last?) and the
+  `createLink`/`versions`/`restoreVersion`/manage bodies are assumed from the
+  vendored crate + stubs, not proven. The stub tests pin the request shapes so a
+  regression is caught.
+- **The chat-service `reference` file post.** The upload works by mining the
+  uploaded item's eTag for the attachment GUID and posting a
+  `properties.files` (JSON string) message; whether the real chat service
+  accepts it (and whether a realtime `NewMessage` for the file post reconciles
+  with the cached row) is unverified. An unresolved/invalid eTag makes the
+  vendored post fail — there is no live example to confirm the eTag always
+  carries a GUID for chat-folder uploads.
+- **Chat-vs-channel upload routing.** `upload_file_data_idem` sends chat-shaped
+  ids straight to the sender's OneDrive chat-folder and channel-shaped ids to
+  the channel `filesFolder` (after a joinedTeams + per-team channels scan); only
+  the chat path is covered offline here (the channel path needs the team scan
+  stubs).
+- **Coarse download progress.** The vendored downloader buffers the whole body,
+  so `Files::download` reports only `(0,size)`/`(written,size)`; there is no way
+  to exercise (or observe) intermediate progress offline.
+- **Drive-item id collisions.** See ADR-019: the store is keyed `(id, profile)`
+  and a driveItem id collision across drives in one profile would have the
+  second listing replace the first. Not observable without two colliding drives.
+
+**Impact:** the wire-level correctness of the file calls is assumed from the
+vendored crate + stubs, not proven; only the chat upload path is exercised.
+
+**Mitigation:** keep the calls behind `ApiClient`/`Files` so a live fix is
+contained; the deterministic stub tests pin the exact paths/bodies/headers
+(including the `Content-Range` fragments and the `u!<base64url-nopad>` share
+id) so a regression is caught; streaming download/upload is a future follow-up.
+
 ## Deferred work
 
 ### D-001 — Third-party Teams app hosting (TeamsJS/web frames)

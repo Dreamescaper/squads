@@ -648,5 +648,111 @@ so callers cannot drift.
 - If the vendored crate later moves channel creation to the middle tier, the
   wrapper picks up the change with no caller impact.
 
+---
+
+## ADR-019 — Files metadata in a schema-v4 cache keyed `(id, profile)`
+
+**Status:** accepted (M7)
+
+**Context.** M7 needs to cache the driveItems the files browser shows (chat
+Shared tabs, folder children, recents, uploaded files) for an instant,
+offline-capable M10. Two key choices were on the table:
+`(drive_id, item_id)` — the natural Graph identity of a driveItem — or
+`(id, profile)`, the convention the rest of the store already uses (`chats` and
+`teams` are keyed `(id, profile)`, `messages` `(id, chat_id)`, `channels`
+`(id, team_id)`). `drive_id` is **optional** in the wire projection
+(`SharedFile.drive_id: Option<String>`): a chat file that would not resolve to a
+driveItem lists from message metadata alone with no drive.
+
+**Decision.** Add a **schema v4** `files` table keyed **`(id, profile)`** with
+non-key `drive_id` and an optional `chat_id` column, plus indexes on
+`(profile, chat_id)` and `(drive_id, id)`. `SCHEMA_VERSION` is 4 and the v3→v4
+migration is `CREATE TABLE/INDEX IF NOT EXISTS` (re-entrant); a newer
+`user_version` remains a hard error. API: `upsert_files(profile, chat_id,
+&[FileEntry])`, `files_for_chat(profile, chat_id)`, `file(profile, drive_id,
+item_id)`, `delete_file(profile, drive_id, item_id)`.
+
+The key rationale:
+
+- `(id, profile)` matches the store's existing convention and keeps the
+  `profile` isolation uniform, while `drive_id` stays a clean `Option` — keying
+  on it would force a `''` sentinel for drive-less attachments and break the
+  `Option` round-trip (SQLite unique keys treat `NULL`s as distinct).
+- The `file(drive_id, item_id)` lookup still filters on **both** `drive_id` and
+  `id`, so the drive is honoured; a driveItem id collision across two drives in
+  one profile would (worst case) have the second listing replace the first,
+  which is the same bounded, untested assumption U-001 already documents for
+  chat ids.
+- `chat_id` is a non-key column (mirroring `channels.team_id`): a chat listing
+  sets it, recents/folder listings leave it `NULL`. Upserts are **additive** —
+  `chat_id`, `drive_id`, `mime`, `web_url`, `download_url`, `sender`,
+  `created`, `modified`, `share_url` and `attachment_id` only overwrite when the
+  incoming value is non-`NULL` (`COALESCE`), so a later recents/folder listing
+  cannot wipe the attachment id that matches a message bubble, or the sharing
+  link a `create_link` cached.
+
+**Consequences.**
+
+- The files browser reads entirely from the store; `list_chat_files` is the
+  network path and write-throughs the chat's files in one pass.
+- A file shared in two chats has one row whose `chat_id` follows the last
+  listing; `files_for_chat` returns it for that chat only. This mirrors M6's
+  one-team-per-channel model; if per-chat multi-membership is ever needed, a
+  small junction table replaces the column without changing `Files`' API.
+- Listed order comes from the wire (live) and from `modified DESC` (cached);
+  the two can differ because a chat list is ordered by message time, not
+  driveItem modified time. Documented on `Files`.
+- No encryption change: file names/URLs/senders join chat content in the
+  plaintext store (B-007).
+
+---
+
+## ADR-020 — Upload by size (≤4 MiB simple PUT, >4 MiB resumable) and coarse download progress
+
+**Status:** accepted (M7)
+
+**Context.** Graph offers two upload transports. Files up to **4 MiB** can go in
+one `PUT /…/content`; larger files require an **upload session**
+(`createUploadSession` → sequential fragment `PUT`s, each carrying a
+`Content-Range`, non-final fragments answering `202`, the last `200/201` with
+the driveItem). The vendored uploader already implements both and chooses by
+size (`> 4 * 1024 * 1024` → session, fragments of 16 × 320 KiB = 5 MiB), then
+posts the uploaded item into the chat as a `reference` attachment message
+(chat service first, Graph fallback). Download has the opposite problem: the
+vendored `download_file_data` **buffers the whole response body** into memory
+and only then writes the file.
+
+**Decision.** `squads-core` **wraps** the vendored transport unchanged and makes
+the split explicit:
+
+1. `ApiClient::upload_file(chat_id, local_path, progress)` and
+   `Files::upload(chat_id, local_path, on_progress)` pass through to
+   `upload_file_data_with_progress`. The ≤4 MiB simple-PUT vs. >4 MiB resumable
+   choice, the 5 MiB fragment size and the reference-message post are the
+   vendored behaviour; the wrapper only adds instrumentation and the store
+   upsert.
+2. Progress is `(bytes_sent, bytes_total)`, reported by the vendored code once
+   per fragment (a simple PUT reports once at completion).
+3. `Files::download` reports progress **around** the buffered transfer:
+   `(0, size)` before and `(written, size)` after, where `size` is the cached
+   driveItem size. The module docs state plainly that the body is buffered, so
+   there is no streaming and no intermediate progress; a consumer that needs a
+   real progress bar would have to replace the vendored helper with a streaming
+   read (a future change).
+
+**Consequences.**
+
+- Upload and download are thin, testable wrappers; the exact wire shapes
+  (`PUT …/content`, `POST …/createUploadSession`, fragment `Content-Range`,
+  the `reference` post) are pinned by offline stub tests.
+- **Download progress is coarse by design.** Callers must not assume a smooth
+  0→100% ramp; the callback fires twice (and `size` may be `0` for an
+  unresolved attachment).
+- A >4 MiB upload allocates the whole file in memory (the vendored helper reads
+  it into a `Vec<u8>` and the session fragmenter slices it); acceptable for now,
+  recorded as a future streaming follow-up.
+- Uploads inherit the vendored idempotency shape (`clientmessageid` + verify on
+  retry) so a retried upload is not posted twice.
+
 
 

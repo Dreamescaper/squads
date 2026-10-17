@@ -36,6 +36,15 @@
 //!   ([`ApiClient::update_channel`], [`ApiClient::delete_channel`]) and team
 //!   creation ([`ApiClient::create_team`]).
 //!
+//! **Files (M7)** are **Graph** throughout, keyed by `(drive_id, item_id)`:
+//! listing ([`ApiClient::list_chat_files`], [`ApiClient::list_folder_children`],
+//! [`ApiClient::list_drive_recents`], [`ApiClient::list_message_files`]),
+//! download/upload, sharing links, versions and the rename/move/copy/delete
+//! manage actions. Chat file listings are mined from chat-service history
+//! (`properties.files`) and each ref is resolved through Graph
+//! `/shares/{u!<base64url>}/driveItem`; channel listings ride the channel
+//! `filesFolder`. See `crate::files`.
+//!
 //! Channel reactions and read receipts are **best-effort**: they ride separate
 //! Graph paths that are not live-verified, and the chat-service consumption
 //! horizon 403s on `tacv2` threads (see `docs/BLOCKERS.md`).
@@ -55,8 +64,15 @@ pub use ost::api::{MessagesPage, ReadReceipt, SentMessage};
 /// Protocol types surfaced by the M6 teams/channel calls.
 pub use ost::api::{ChannelInfo, TeamCreateResult, TeamInfo, TeamMemberInfo};
 
+/// Protocol types surfaced by the M7 file calls. `SharedLink` is deliberately
+/// **not** re-exported here: the vendored crate does not expose it, so
+/// [`ApiClient::create_link`] maps the vendored value into
+/// [`crate::model::SharedLink`].
+pub use ost::api::{FileVersion, SharedFile, UploadProgress};
+
 use crate::auth::tokens::{StoredToken, TokenSet};
 use crate::error::Result;
+use crate::model::SharedLink;
 
 /// Map our M1 [`TokenSet`] into the vendored [`ost::config::Config`].
 ///
@@ -563,6 +579,278 @@ impl ApiClient {
         .await?;
         tracing::debug!(has_id = sent.id.is_some(), call, "sent thread reply");
         Ok(sent)
+    }
+
+    // ----- M7: files ------------------------------------------------------
+
+    /// List the files shared in a chat or a channel (Graph driveItems).
+    ///
+    /// `include_folders = false` matches the vendored default (files only);
+    /// `true` keeps folder driveItems so a browser can drill into them with
+    /// [`ApiClient::list_folder_children`]. Folder entries carry
+    /// `SharedFile::is_folder`.
+    pub async fn list_chat_files(
+        &self,
+        chat_id: &str,
+        limit: usize,
+        include_folders: bool,
+    ) -> Result<Vec<SharedFile>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.list_chat_files",
+            limit,
+            include_folders,
+            call
+        );
+        let files =
+            ost::api::list_chat_files_data_opts(&self.client, chat_id, limit, include_folders)
+                .instrument(span)
+                .await?;
+        tracing::debug!(count = files.len(), call, "listed chat files");
+        Ok(files)
+    }
+
+    /// The files one message shares (timeline file chips).
+    ///
+    /// Chat ids read the chat service (`properties.files`); channel posts
+    /// (`19:…@thread.tacv2`) read the channel message under their team. See the
+    /// vendored `list_message_files_data` for the exact routing.
+    pub async fn list_message_files(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<SharedFile>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.list_message_files",
+            call
+        );
+        let files = ost::api::list_message_files_data(&self.client, conversation_id, message_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = files.len(), call, "listed message files");
+        Ok(files)
+    }
+
+    /// List one folder's children by drive + item id (files **and**
+    /// subfolders; each carries `is_folder`).
+    pub async fn list_folder_children(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SharedFile>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.list_folder_children",
+            limit,
+            call
+        );
+        let files = ost::api::list_folder_children_data(&self.client, drive_id, item_id, limit)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = files.len(), call, "listed folder children");
+        Ok(files)
+    }
+
+    /// The signed-in user's recently accessed driveItems (files only; folders
+    /// are filtered out by the vendored call).
+    pub async fn list_drive_recents(&self, limit: usize) -> Result<Vec<SharedFile>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.list_drive_recents",
+            limit,
+            call
+        );
+        let files = ost::api::list_drive_recents_data(&self.client, limit)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = files.len(), call, "listed recent files");
+        Ok(files)
+    }
+
+    /// Version history for one driveItem, newest first.
+    pub async fn list_file_versions(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+    ) -> Result<Vec<FileVersion>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.list_file_versions",
+            call
+        );
+        let versions = ost::api::list_file_versions_data(&self.client, drive_id, item_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = versions.len(), call, "listed file versions");
+        Ok(versions)
+    }
+
+    /// Restore one file version as the current item (Graph `restoreVersion`).
+    pub async fn restore_file_version(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        version_id: &str,
+    ) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.restore_file_version",
+            call
+        );
+        ost::api::restore_file_version_data(&self.client, drive_id, item_id, version_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "restored file version");
+        Ok(())
+    }
+
+    /// Download one driveItem's content to `dest_path`; returns bytes written.
+    ///
+    /// The vendored helper buffers the whole body before writing, so there is no
+    /// fine-grained progress here — see
+    /// [`Files::download`](crate::Files::download), which reports around the
+    /// transfer.
+    pub async fn download_file(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        dest_path: &str,
+    ) -> Result<u64> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.download_file", call);
+        let written = ost::api::download_file_data(&self.client, drive_id, item_id, dest_path)
+            .instrument(span)
+            .await?;
+        tracing::debug!(written, call, "downloaded file");
+        Ok(written)
+    }
+
+    /// Upload a local file to a chat or channel and post it as a `reference`
+    /// message. `progress` receives `(bytes_sent, bytes_total)` after each
+    /// fragment (a simple PUT reports once at completion).
+    ///
+    /// See [`upload_file_data_with_progress`](ost::api::upload_file_data_with_progress)
+    /// for the ≤4 MiB simple-PUT vs. resumable-session split.
+    pub async fn upload_file(
+        &self,
+        chat_id: &str,
+        local_path: &str,
+        progress: Option<&UploadProgress<'_>>,
+    ) -> Result<SharedFile> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.upload_file", call);
+        let file =
+            ost::api::upload_file_data_with_progress(&self.client, chat_id, local_path, progress)
+                .instrument(span)
+                .await?;
+        tracing::debug!(size = file.size, call, "uploaded file");
+        Ok(file)
+    }
+
+    /// Create (or fetch the existing) view-only sharing link for one driveItem.
+    /// `scope` is normalized by the vendored call
+    /// (`anonymous`/`anyone` → anyone-with-link, anything else → organization).
+    pub async fn create_link(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        scope: &str,
+    ) -> Result<SharedLink> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.create_link", call);
+        let link = ost::api::create_link_data(&self.client, drive_id, item_id, scope)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "created sharing link");
+        Ok(SharedLink {
+            url: link.url,
+            scope: link.scope,
+        })
+    }
+
+    /// Rename one driveItem (PATCH `name`). Returns the updated item.
+    pub async fn rename_file(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        new_name: &str,
+    ) -> Result<SharedFile> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.rename_file", call);
+        let file = ost::api::rename_file_data(&self.client, drive_id, item_id, new_name)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "renamed file");
+        Ok(file)
+    }
+
+    /// Move one driveItem to another folder in the same drive. Returns the
+    /// updated item.
+    pub async fn move_file(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        dest_folder_id: &str,
+    ) -> Result<SharedFile> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.move_file", call);
+        let file = ost::api::move_file_data(&self.client, drive_id, item_id, dest_folder_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "moved file");
+        Ok(file)
+    }
+
+    /// Copy one driveItem to another folder in the same drive. Graph copies
+    /// asynchronously (`202` + a `Location` monitor URL); returns that URL, or
+    /// `""` when the server omitted it.
+    pub async fn copy_file(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        dest_folder_id: &str,
+        new_name: Option<&str>,
+    ) -> Result<String> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.copy_file", call);
+        let monitor =
+            ost::api::copy_file_data(&self.client, drive_id, item_id, dest_folder_id, new_name)
+                .instrument(span)
+                .await?;
+        tracing::debug!(call, "copying file");
+        Ok(monitor)
+    }
+
+    /// Delete one driveItem.
+    pub async fn delete_file(&self, drive_id: &str, item_id: &str) -> Result<()> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(target: "squads_core::api", "api.delete_file", call);
+        ost::api::delete_file_data(&self.client, drive_id, item_id)
+            .instrument(span)
+            .await?;
+        tracing::debug!(call, "deleted file");
+        Ok(())
     }
 }
 

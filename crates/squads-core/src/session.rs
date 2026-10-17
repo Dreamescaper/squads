@@ -6,7 +6,9 @@
 //! ([`Session::api`], built lazily from the token set) and token refresh
 //! ([`Session::ensure_fresh_tokens`]). **M3** attaches the local SQLite store
 //! ([`Session::store`] / [`Session::attach_store`]), opened from
-//! [`AppDirs::store_file`] by [`Session::new`]. The realtime feed attaches in
+//! [`AppDirs::store_file`] by [`Session::new`]. **M5/M6/M7** expose the
+//! conversation, teams/channels and files services ([`Session::messaging`],
+//! [`Session::teams`], [`Session::files`]). The realtime feed attaches in
 //! M4.
 //!
 //! Network access only ever happens through the sign-in driver, a
@@ -29,6 +31,7 @@ use crate::auth::flow::{AuthDriver, AuthTransport, HttpTransport, SignInProgress
 use crate::auth::store::{DEFAULT_PROFILE, FileTokenStore, TokenStore};
 use crate::auth::tokens::TokenSet;
 use crate::error::{CoreError, Result};
+use crate::files::Files;
 use crate::messaging::Messaging;
 use crate::paths::AppDirs;
 use crate::realtime::{RealtimeEvent, RealtimeService};
@@ -249,6 +252,22 @@ impl Session {
     pub fn teams(&mut self) -> Result<Teams> {
         let client = self.api_arc()?;
         Ok(Teams::new(
+            self.profile.clone(),
+            Arc::clone(&self.store),
+            client,
+        ))
+    }
+
+    /// The M7 files service for this session.
+    ///
+    /// Shares the session's [`Store`] and protocol client (the same
+    /// `Arc<ApiClient>` [`Session::messaging`] hands out). Requires a token set
+    /// ([`CoreError::NotSignedIn`] otherwise); building is offline. The returned
+    /// [`Files`] is stateless beyond the shared store, so callers may build a
+    /// fresh handle whenever they like.
+    pub fn files(&mut self) -> Result<Files> {
+        let client = self.api_arc()?;
+        Ok(Files::new(
             self.profile.clone(),
             Arc::clone(&self.store),
             client,
@@ -900,6 +919,34 @@ mod tests {
         assert!(Arc::ptr_eq(teams.store(), session.store()));
         assert_eq!(
             teams.client().request_count(),
+            0,
+            "building the service is offline"
+        );
+        assert!(session.has_api());
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp2).ok();
+    }
+
+    #[test]
+    fn files_requires_tokens_and_shares_the_store_and_client() {
+        let (tmp, dirs_a) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs_a, "default", store).expect("session");
+        // No tokens yet: building the service must fail cleanly, no network.
+        let err = session.files().unwrap_err();
+        assert!(matches!(err, CoreError::NotSignedIn), "got {err:?}");
+
+        let (tmp2, dirs2) = dirs();
+        let store2 = Arc::new(MemoryTokenStore::new());
+        store2.save("work", &sample_set()).unwrap();
+        let mut session = Session::with_store(dirs2, "work", store2).expect("session");
+        session.restore().expect("restore");
+
+        let files = session.files().expect("files");
+        assert_eq!(files.profile(), "work");
+        assert!(Arc::ptr_eq(files.store(), session.store()));
+        assert_eq!(
+            files.client().request_count(),
             0,
             "building the service is offline"
         );

@@ -10,6 +10,7 @@
 pub mod api;
 pub mod auth;
 pub mod error;
+pub mod files;
 pub mod messaging;
 pub mod model;
 pub mod paths;
@@ -23,10 +24,11 @@ pub mod text;
 pub use api::{ApiClient, tokens_to_config};
 pub use auth::{AuthDriver, AuthTransport, SignInProgress, TokenKind, TokenSet};
 pub use error::{CoreError, Result};
+pub use files::Files;
 pub use messaging::{HistoryPage, Messaging};
 pub use model::{
-    Channel, Chat, Message, Reaction, Reactor, SendState, Team, TeamMember,
-    is_channel_conversation_id,
+    Channel, Chat, FileEntry, FileVersion, Message, Reaction, Reactor, SendState, SharedLink, Team,
+    TeamMember, is_channel_conversation_id,
 };
 pub use paths::AppDirs;
 pub use realtime::{EventBus, RealtimeEvent, RealtimeService};

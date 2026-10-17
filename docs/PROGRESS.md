@@ -13,7 +13,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ not started · ⛔ blocked (see [BLO
 | M4 | Realtime (Trouter) | ✅ | Wrap the vendored Trouter loop; `RealtimeEvent` decode; `EventBus` broadcast fan-out; collector write-through; `Session::start_realtime`/`subscribe`. |
 | M5 | Messaging | ✅ | `api` chat wrappers (page/send/reply/edit/delete/react/receipts); offline-first `Messaging` (open/load_older, optimistic `SendState` send + idempotent retry); shared `text` module; schema **v2** (`send_state`, `read_state`); `Session::messaging()`. |
 | M6 | Teams & channels | ✅ | `api` teams wrappers (list teams/members, thread reply, channel/team writes); `model::{Team,Channel,TeamMember}`; schema **v3** (`teams`,`channels`,`team_members`); offline-first `Teams` (metadata cache, channel history via `Messaging`, optimistic channel post + thread reply); `Session::teams()`. |
-| M7 | Files | ⬜ | |
+| M7 | Files | ✅ | Graph files wrappers + `FileEntry`/`FileVersion`/`SharedLink` model; schema **v4** (`files`); offline-first `Files` (chat/folder/recents list, coarse download progress, upload simple-PUT vs resumable, links, versions, manage); `Session::files()`. |
 | M8 | Presence & notifications | ⬜ | |
 | M9 | Audio/video calls | ⬜ | |
 | M10 | egui UI | ⬜ | |
@@ -486,4 +486,112 @@ best-effort and **not wired**; `create_channel` rides Graph in the vendored
 crate, not the middle tier; the exact middle-tier/Graph write acceptance is
 unproven). B-007 (channel/team metadata joins chat content in the unencrypted
 store).
+
+---
+
+## M7 — Files
+
+**Goal.** Turn the M2 client + M3 store into the files service the M10 browser
+drives: browse the files shared in chats/channels, drill into folders, list
+recents, download with progress, upload (simple ≤4 MiB + resumable >4 MiB),
+sharing links, version history and the rename/move/copy/delete manage actions —
+all testable offline against local TCP stubs.
+
+**Landed.**
+
+- `api` (M2 module, extended) — typed, instrumented Graph wrappers in the
+  existing `ApiClient` style (redacting `Debug`, request counter, `tracing`
+  spans): `list_chat_files` (chat/channel Shared list; `include_folders`),
+  `list_message_files` (timeline file chips), `list_folder_children`,
+  `list_drive_recents`, `list_file_versions`, `restore_file_version`,
+  `download_file`, `upload_file` (optional progress callback), `create_link`,
+  `rename_file`, `move_file`, `copy_file`, `delete_file`. Protocol types
+  `SharedFile` / `FileVersion` / `UploadProgress` are re-exported. The module
+  docs now note that **files are Graph throughout** and that a chat list is
+  mined from chat-service history + `/shares/{u!…}/driveItem` resolution while
+  a channel list rides the channel `filesFolder`.
+- `model` — `FileEntry` (owned mirror of `SharedFile`;
+  `from_shared` / `From<&SharedFile>` / `From<SharedFile>`), `FileVersion`
+  (`from_wire` / `From<&FileVersion>`) and `SharedLink`, so the store and the UI
+  never touch the wire projection. `FileEntry.drive_id` stays `Option` (an
+  unresolved chat attachment lists from message metadata alone and cannot be
+  downloaded).
+- `store` — **schema v4**. A `files` table keyed `(id, profile)` with an
+  optional owning `chat_id`, plus indexes on `(profile, chat_id)` and
+  `(drive_id, id)`; methods `upsert_files(profile, chat_id, &[FileEntry])`,
+  `files_for_chat(profile, chat_id)`, `file(profile, drive_id, item_id)`,
+  `delete_file(profile, drive_id, item_id)`. Upserts are idempotent and
+  **additive** (`COALESCE` on `chat_id`/`drive_id`/`mime`/`web_url`/
+  `download_url`/`sender`/`created`/`modified`/`share_url`/`attachment_id`, so a
+  recents/folder listing never wipes a chat's attachment id or a cached link;
+  `updated_at` only advances). `SCHEMA_VERSION = 4`; the v3→v4 migration is
+  `CREATE TABLE/INDEX IF NOT EXISTS` (re-entrant) and the "newer version is a
+  hard error" behaviour is unchanged.
+- `files` — the offline-first service `Files { profile, Arc<Store>,
+  Arc<ApiClient> }`:
+  - `cached_chat_files` (local-only) and `list_chat_files` (fetch chat/channel
+    files, upsert under the chat, return wire order; folders included).
+  - `message_files` (one message's file chips), `list_folder(drive_id,
+    item_id)` (drill in; files **and** folders), `recents()`.
+  - `download(&FileEntry, dest_path, on_progress)` — wraps
+    `download_file_data`, reporting `(0, size)` before and `(written, size)`
+    after. The vendored helper buffers the whole body, so the progress is
+    deliberately coarse (documented); a file with no `drive_id` is rejected
+    before any network.
+  - `upload(chat_id, local_path, on_progress)` — wraps
+    `upload_file_data_with_progress`; ≤4 MiB is a single simple PUT, larger
+    files create a resumable session and PUT `<320 KiB-multiple>` fragments
+    (each with `Content-Range`), then post a `reference` file message; progress
+    fires once per fragment.
+  - `create_link` (caches the returned `share_url` on the cached row),
+    `versions`, `restore_version`, `rename`, `move_file`, `copy_file` (returns
+    the async monitor URL), `delete`.
+- `session` — `Session::files()` mirrors `Session::messaging()` /
+  `Session::teams()`: shares the session's store and `Arc<ApiClient>`, offline
+  to build, `NotSignedIn` without tokens.
+
+**Decisions.** **ADR-019** (schema v4: a `files` table keyed `(id, profile)`
+with an optional `chat_id`, and the additive-upsert rule), **ADR-020** (upload
+strategy: ≤4 MiB simple PUT vs. >4 MiB resumable session; and the coarse
+download progress limitation).
+
+**Tests.** `cargo test -p squads-core` — **191** offline unit tests (166 from
+M1–M6 + 25 new: 3 `model`, 3 `store`, 18 `files`, 1 `session`). `cargo test -p
+squads-protocol` still passes **377**. New coverage includes: the vendored
+chunk planner boundaries (0, exactly one chunk, chunk+1, several+remainder, and
+a floored chunk size), `content_range_value`, `upload_session_body`, and the
+Graph `u!<base64url-nopad>` share-id form (pinned as a known answer, and
+**proved on the wire** by the chat-list test resolving through
+`/shares/{u!…}/driveItem`); a chat Shared list parsed from a chat-service page
++ a `/shares` resolve, cached under the chat; folder children (files **and**
+folders) and recents parsed from Graph stubs and cached; download writes the
+file and fires `(0,size)`/`(written,size)`; a **≤4 MiB upload does a single
+`PUT …/content`** while a **>4 MiB upload creates an upload session and PUTs
+two fragments carrying `Content-Range: bytes 0-5242879/5242881` and
+`bytes 5242880-5242880/5242881`**, each posting the reference message after; a
+drive-less download rejected pre-network without a request; `create_link`
+POSTing `createLink` and caching the share url without losing the chat
+association; versions parsing (editor name, sparse size 0); rename/delete on
+the driveItem updating the cache; copy returning the async `Location`; the
+**v3→v4 upgrade** (open a hand-built v3 database → reopen → the `files` table
+exists and is writable, data survives); and the additive-upsert rule (a
+chatless recents listing keeps the chat association, attachment id and sender;
+a copy-link upsert keeps them too).
+
+**How to verify manually** (real tenant; not runnable here): sign in, build
+`session.files()`, `list_chat_files(chat)` and confirm the Shared tab lists the
+files (and that `cached_chat_files(chat)` returns them in a fresh process with
+no network); drill into a folder with `list_folder(drive_id, item_id)`;
+`recents()` lists OneDrive/SharePoint recent files; `download(&file, path, …)`
+writes the file and `upload(chat, path, …)` posts it (a >4 MiB file must create
+an upload session and PUT chunks with `Content-Range`); `create_link` returns a
+view-only link; `versions` lists history and `restore_version` restores one;
+`rename`/`move_file`/`copy_file`/`delete` and confirm the tenant agrees.
+
+**Blockers.** **U-004** (untested live: real SharePoint/OneDrive acceptance of
+the Graph list/resolve/upload/download/createLink/versions/manage calls; the
+chat-service file post's `reference` shape and the attachment-GUID-from-eTag
+bubble match; the resumable-session fragment size/`202` semantics; and the
+chat-vs-channel upload routing). B-007 (file names/URLs/senders join chat
+content in the unencrypted store).
 
