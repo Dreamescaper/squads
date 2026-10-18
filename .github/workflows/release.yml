@@ -97,6 +97,67 @@ jobs:
           set -euo pipefail
           cargo build --locked --release --target "${{ matrix.target }}" ${{ env.BIN_CRATES }}
 
+      # ---------------------------------------------------------------- macOS signing
+      - name: Import Apple signing certificate (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APPLE_CERTIFICATE:-}" ]]; then
+            echo "::error::APPLE_CERTIFICATE is not set"; exit 1
+          fi
+          if [[ -z "${APPLE_CERTIFICATE_PASSWORD:-}" ]]; then
+            echo "::error::APPLE_CERTIFICATE_PASSWORD is not set"; exit 1
+          fi
+          if [[ -z "${KEYCHAIN_PASSWORD:-}" ]]; then
+            echo "::error::KEYCHAIN_PASSWORD is not set"; exit 1
+          fi
+
+          # The secret must be base64 *text* of the .p12 export, not raw bytes.
+          CERT_PATH="$RUNNER_TEMP/DeveloperID.p12"
+          if ! printf '%s' "$APPLE_CERTIFICATE" | base64 -d > "$CERT_PATH" 2>/dev/null; then
+            echo "::error::APPLE_CERTIFICATE is not valid base64 text"; exit 1
+          fi
+          if [[ ! -s "$CERT_PATH" ]]; then
+            echo "::error::APPLE_CERTIFICATE decoded to an empty file"; exit 1
+          fi
+
+          KEYCHAIN="$RUNNER_TEMP/teamtrim-signing.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+
+          # Fail loudly on a wrong password, a non-.p12, or an expired cert.
+          # There is deliberately no fallback signing path.
+          if ! security import "$CERT_PATH" -k "$KEYCHAIN" \
+              -P "$APPLE_CERTIFICATE_PASSWORD" \
+              -T /usr/bin/codesign -T /usr/bin/security; then
+            echo "::error::Failed to import APPLE_CERTIFICATE — wrong APPLE_CERTIFICATE_PASSWORD, or the secret is not a .p12."
+            exit 1
+          fi
+          rm -f "$CERT_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+
+          if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+            IDENTITY="$APPLE_SIGNING_IDENTITY"
+          else
+            IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+              | awk -F'"' '/Developer ID Application/{print $2; exit}')"
+          fi
+          if [[ -z "$IDENTITY" ]]; then
+            echo "::error::No 'Developer ID Application' identity found in the imported certificate."
+            security find-identity -v -p codesigning "$KEYCHAIN" || true
+            exit 1
+          fi
+          echo "Signing with: $IDENTITY"
+          echo "SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
       # ---------------------------------------------------------------- Linux
       - name: Package (Linux)
         if: runner.os == 'Linux'
@@ -113,7 +174,7 @@ jobs:
           tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "$(basename "$STAGE")"
 
       # ---------------------------------------------------------------- macOS
-      - name: Package (macOS)
+      - name: Package & sign app (macOS)
         if: runner.os == 'macOS'
         shell: bash
         run: |
@@ -121,6 +182,8 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           REL="target/${{ matrix.target }}/release"
           APP="dist/TeamTrim.app"
+          : "${SIGNING_IDENTITY:?SIGNING_IDENTITY not set — did the certificate import step run?}"
+          IDENTITY="$SIGNING_IDENTITY"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp "$REL/teamtrim" "$APP/Contents/MacOS/teamtrim"
           chmod +x "$APP/Contents/MacOS/teamtrim"
@@ -144,15 +207,102 @@ jobs:
           </plist>
           PLIST
 
-          # Ad-hoc signature so Gatekeeper allows a local run. Real distribution
-          # needs a Developer ID + notarization (see docs/PACKAGING.md).
-          codesign --force --deep --sign - "$APP" || echo "ad-hoc codesign skipped"
+          # Developer ID signature with the hardened runtime. No ad-hoc fallback:
+          # if this fails, the job fails.
+          xattr -cr "$APP" || true
+          codesign --force --options runtime --timestamp \
+            --sign "$IDENTITY" "$APP/Contents/MacOS/teamtrim"
+          codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
+          codesign --verify --strict --verbose=4 "$APP"
+          if ! codesign -dv --verbose=4 "$APP" 2>&1 | grep -q "Authority=Developer ID Application"; then
+            echo "::error::App is not signed with a Developer ID Application certificate"
+            codesign -dv --verbose=4 "$APP" 2>&1 || true
+            exit 1
+          fi
 
           mkdir -p "dist/teamtrim-${VERSION}-${{ matrix.label }}"
           cp "$REL/teamtrim-cli" LICENSE NOTICE README.md "dist/teamtrim-${VERSION}-${{ matrix.label }}/"
+          ( cd "dist/teamtrim-${VERSION}-${{ matrix.label }}" && zip -q -r "../${{ matrix.artifact }}-cli.zip" . )
           # ditto preserves the bundle structure and resource forks.
           ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/${{ matrix.artifact }}.zip"
-          ( cd "dist/teamtrim-${VERSION}-${{ matrix.label }}" && zip -q -r "../${{ matrix.artifact }}-cli.zip" . )
+
+      - name: Notarize & staple app (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          APP="dist/TeamTrim.app"
+          ART="${{ matrix.artifact }}"
+          if [[ -z "${APPLE_API_KEY:-}" || -z "${APPLE_API_KEY_ID:-}" || -z "${APPLE_API_ISSUER:-}" ]]; then
+            echo "::error::App Store Connect API key secrets are not set (APPLE_API_KEY / APPLE_API_KEY_ID / APPLE_API_ISSUER)"
+            exit 1
+          fi
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          if grep -q "BEGIN PRIVATE KEY" <<<"$APPLE_API_KEY"; then
+            printf '%s' "$APPLE_API_KEY" > "$KEY_PATH"
+          else
+            printf '%s' "$APPLE_API_KEY" | base64 -d > "$KEY_PATH"
+          fi
+
+          echo "Notarizing with App Store Connect API key ${APPLE_API_KEY_ID}."
+          xcrun notarytool submit "dist/${ART}.zip" \
+            --key "$KEY_PATH" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait
+          rm -f "$KEY_PATH"
+
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+
+          # Re-create the archive after stapling so the shipped zip carries the ticket.
+          rm -f "dist/${ART}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/${ART}.zip"
+
+      - name: Package DMG (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          APP="dist/TeamTrim.app"
+          ART="${{ matrix.artifact }}"
+          : "${SIGNING_IDENTITY:?SIGNING_IDENTITY not set}"
+          IDENTITY="$SIGNING_IDENTITY"
+
+          DMG_ROOT="$RUNNER_TEMP/dmgroot"
+          rm -rf "$DMG_ROOT"
+          mkdir -p "$DMG_ROOT"
+          cp -R "$APP" "$DMG_ROOT/"
+          ln -s /Applications "$DMG_ROOT/Applications"
+          hdiutil create -volname "TeamTrim ${VERSION}" -srcfolder "$DMG_ROOT" \
+            -ov -format UDZO "dist/${ART}.dmg"
+          codesign --force --timestamp --sign "$IDENTITY" "dist/${ART}.dmg"
+
+          if [[ -z "${APPLE_API_KEY:-}" || -z "${APPLE_API_KEY_ID:-}" || -z "${APPLE_API_ISSUER:-}" ]]; then
+            echo "::error::App Store Connect API key secrets are not set (APPLE_API_KEY / APPLE_API_KEY_ID / APPLE_API_ISSUER)"
+            exit 1
+          fi
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          if grep -q "BEGIN PRIVATE KEY" <<<"$APPLE_API_KEY"; then
+            printf '%s' "$APPLE_API_KEY" > "$KEY_PATH"
+          else
+            printf '%s' "$APPLE_API_KEY" | base64 -d > "$KEY_PATH"
+          fi
+
+          echo "Notarizing with App Store Connect API key ${APPLE_API_KEY_ID}."
+          xcrun notarytool submit "dist/${ART}.dmg" \
+            --key "$KEY_PATH" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait
+          rm -f "$KEY_PATH"
+
+          xcrun stapler staple "dist/${ART}.dmg"
+          xcrun stapler validate "dist/${ART}.dmg"
+          spctl -a -vv -t open --context context:primary-signature "dist/${ART}.dmg"
 
       # -------------------------------------------------------------- Windows
       - name: Package (Windows)
@@ -172,7 +322,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*.dmg
           if-no-files-found: error
           retention-days: 14
 
