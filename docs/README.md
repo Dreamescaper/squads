@@ -1,4 +1,4 @@
-# Squads — engineering docs
+# TeamTrim — engineering docs
 
 An alternative, cross-platform Microsoft Teams client in **Rust + egui**.
 
@@ -23,10 +23,10 @@ export PATH="$HOME/.cargo/bin:$PATH"   # if cargo is not on PATH
 cargo build
 
 # Run the GUI (needs a display server)
-cargo run -p squads-app
+cargo run -p teamtrim-app
 
 # Headless protocol CLI (login / api testing)
-cargo run -p squads-protocol --bin squads-cli -- --help
+cargo run -p teamtrim-protocol --bin teamtrim-cli -- --help
 
 # Tests
 cargo test --workspace

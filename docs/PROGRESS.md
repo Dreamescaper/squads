@@ -30,15 +30,15 @@ core, a UI-free core crate, and the egui app; document the architecture.
 
 **Landed.**
 
-- Root `Cargo.toml` converted to a workspace (`crates/squads-protocol`, `crates/squads-core`,
-  `crates/squads-app`), with shared dependency versions and the egui-oriented
+- Root `Cargo.toml` converted to a workspace (`crates/teamtrim-protocol`, `crates/teamtrim-core`,
+  `crates/teamtrim-app`), with shared dependency versions and the egui-oriented
   dev/release profiles.
-- Vendored `ost` (from the better-teams fork of `eisbaw/ost`) as `crates/squads-protocol`
-  (package `squads-protocol`, library name `ost`), keeping its CLI as `squads-cli` for
+- Vendored `ost` (from the better-teams fork of `eisbaw/ost`) as `crates/teamtrim-protocol`
+  (package `teamtrim-protocol`, library name `ost`), keeping its CLI as `teamtrim-cli` for
   headless protocol testing. `LICENSE` preserved; attribution added in `NOTICE`.
-- `crates/squads-core`: `AppDirs` (platform paths), `CoreError`/`Result`, and a
+- `crates/teamtrim-core`: `AppDirs` (platform paths), `CoreError`/`Result`, and a
   `Session`/`SessionState` skeleton, with unit tests.
-- `crates/squads-app`: the `squads` egui binary now depends on `squads-core` and renders
+- `crates/teamtrim-app`: the `teamtrim` egui binary now depends on `teamtrim-core` and renders
   the resolved session state, proving the workspace wiring.
 - Docs: `PLAN.md`, `ARCHITECTURE.md`, `DECISIONS.md`, `PROGRESS.md`, `BLOCKERS.md`,
   `reference/` (live e2e probes), root `README.md`, `NOTICE`.
@@ -54,7 +54,7 @@ core, a UI-free core crate, and the egui app; document the architecture.
 **Goal.** Sign a user in against Azure AD, mint the full Teams token set and
 persist it securely, without letting the network leak into the UI or the tests.
 
-**Landed.** New module `crates/squads-core/src/auth/`:
+**Landed.** New module `crates/teamtrim-core/src/auth/`:
 
 - `tokens` — the five-token model. `StoredToken` (`token` + absolute
   `expires_at`, five-minute refresh skew), `TokenKind`
@@ -91,10 +91,10 @@ later).
 
 **How to verify manually** (real tenant; not runnable in this headless env):
 
-1. `cargo test -p squads-core` — 43 offline unit tests.
-2. On a machine with a browser, from a scratch binary or `squads-cli`, run the
+1. `cargo test -p teamtrim-core` — 43 offline unit tests.
+2. On a machine with a browser, from a scratch binary or `teamtrim-cli`, run the
    device-code flow; AAD prints a code + `https://microsoft.com/devicelogin`.
-   Complete it and confirm `~/.config/squads/tokens.json` is created with mode
+   Complete it and confirm `~/.config/teamtrim/tokens.json` is created with mode
    `600` (`stat -c '%a' …`) and contains `spaces`/`skype`/`graph`/`ic3`/`recorder`.
 3. Re-run after the access tokens expire (or edit `expires_at`) and confirm only
    expired entries change.
@@ -111,7 +111,7 @@ that one call is not unit-testable).
 `Session`/client lifecycle and region routing, and prove a `Session` can list
 chats against a fake transport — entirely offline.
 
-**Landed.** New module `crates/squads-core/src/api/` and `Session` wiring:
+**Landed.** New module `crates/teamtrim-core/src/api/` and `Session` wiring:
 
 - `api::tokens_to_config(&TokenSet) -> ost::config::Config` — pure mapping of the
   M1 five-token model into the vendored config. Each token carries our
@@ -133,7 +133,7 @@ chats against a fake transport — entirely offline.
   store and drops the cached client; `ensure_fresh_tokens_with_driver(..)` takes
   a fake transport for offline tests. `restore`/`sign_out`/sign-in completion
   all invalidate the cached client.
-- **Exit criterion (offline):** `crates/squads-core/src/api/mod.rs` starts a
+- **Exit criterion (offline):** `crates/teamtrim-core/src/api/mod.rs` starts a
   one-shot `tokio::net::TcpListener` stub that answers the CSA conversations
   request, points `region_gtms.csaBase` at it, and asserts the parsed
   `ChatInfo`s (name, group flag, sender, preview, time). `read_messages` is
@@ -142,8 +142,8 @@ chats against a fake transport — entirely offline.
 
 **Decisions.** ADR-010 (vendored embedding patch).
 
-**Tests.** `cargo test -p squads-core` — 55 offline unit tests (43 from M1 + 12
-new: 7 in `api`, 5 in `session`). `cargo test -p squads-protocol` still passes
+**Tests.** `cargo test -p teamtrim-core` — 55 offline unit tests (43 from M1 + 12
+new: 7 in `api`, 5 in `session`). `cargo test -p teamtrim-protocol` still passes
 377.
 
 **How to verify manually** (real tenant; not runnable in this headless env):
@@ -167,7 +167,7 @@ versioned schema, behind a synchronous, offline-testable API; add a small JSON
 settings file; and hand the store to `Session` so the UI (M10) and realtime
 (M4) can read/write through one place.
 
-**Landed.** New modules in `crates/squads-core/src/`:
+**Landed.** New modules in `crates/teamtrim-core/src/`:
 
 - `model` — UI-facing domain types **decoupled from the protocol crate**:
   `Chat`, `Message`, `Reaction`/`Reactor`, with `Chat::from_info` /
@@ -209,9 +209,9 @@ settings file; and hand the store to `Session` so the UI (M10) and realtime
 not SQLCipher — encryption-at-rest is deferred and recorded as B-007);
 **ADR-012** (`Mutex<Connection>` concurrency model).
 
-**Tests.** `cargo test -p squads-core` — **85** offline unit tests (55 from
+**Tests.** `cargo test -p teamtrim-core` — **85** offline unit tests (55 from
 M1/M2 + 30 new: 8 `model`, 14 `store`, 6 `settings`, 2 `session`).
-`cargo test -p squads-protocol` still passes **377**. New coverage includes:
+`cargo test -p teamtrim-protocol` still passes **377**. New coverage includes:
 fresh DB reaches v1; reopen + version-reset are idempotent; a newer foreign
 `user_version` is a clear error; chat upsert idempotency + `last_message_time`
 ordering (NULLs last); message round-trip with reactions JSON + `reply_to` +
@@ -234,7 +234,7 @@ no network.
 write-through to the local store, without reimplementing the socket layer and
 without any network or timing in the tests.
 
-**Landed.** New module `crates/squads-core/src/realtime/`:
+**Landed.** New module `crates/teamtrim-core/src/realtime/`:
 
 - `event` — the owned [`RealtimeEvent`] domain enum: `NewMessage { chat_id,
   message }`, `MessageEdited { chat_id, message_id, content, edited_id }`,
@@ -281,10 +281,10 @@ without any network or timing in the tests.
 `event_hub` polling, collector design, no socket-layer fork; call frames are
 filtered upstream).
 
-**Tests.** `cargo test -p squads-core` — **120** offline unit tests (85 from
+**Tests.** `cargo test -p teamtrim-core` — **120** offline unit tests (85 from
 M1–M3 + 35 new: 19 `realtime::event`, 5 `realtime::bus`, 6
 `realtime::service`, 3 `session` realtime, 2 new `store` methods).
-`cargo test -p squads-protocol` still passes **377**. New coverage includes:
+`cargo test -p teamtrim-protocol` still passes **377**. New coverage includes:
 every `RealtimeEvent` variant with realistic fixtures; case-insensitive keys;
 `eventMessages` batches; wrapper unwrapping; invalid JSON / missing ids → the
 defensive `Unknown`; the bus fan-out, the zero-subscriber case and the
@@ -364,9 +364,9 @@ testable offline against local TCP stubs, with a shared HTML/text story.
 vendored), **ADR-016** (the paging cursor lives in memory, per `Messaging`
 handle).
 
-**Tests.** `cargo test -p squads-core` — **146** offline unit tests (120 from
+**Tests.** `cargo test -p teamtrim-core` — **146** offline unit tests (120 from
 M1–M4 + 26 new: 12 `messaging`, 9 `text`, 5 `store`). `cargo test -p
-squads-protocol` still passes **377**. New coverage includes: the exact send
+teamtrim-protocol` still passes **377**. New coverage includes: the exact send
 request shape (`<p>…</p>`, `"messagetype":"RichText/Html"`, our
 `clientmessageid`) and server-id capture from the `Location` header; the
 optimistic boundary (a `Pending` row exists *before* the gated stub replies,
@@ -456,9 +456,9 @@ offline against local TCP stubs.
 for the writes Graph refuses; and the thread-reply conversation mapping
 `<channel>;messageid=<root>`).
 
-**Tests.** `cargo test -p squads-core` — **166** offline unit tests (146 from
+**Tests.** `cargo test -p teamtrim-core` — **166** offline unit tests (146 from
 M1–M5 + 20 new: 3 `model`, 3 `store`, 13 `teams`, 1 `session`). `cargo test -p
-squads-protocol` still passes **377**. New coverage includes: `list_teams`
+teamtrim-protocol` still passes **377**. New coverage includes: `list_teams`
 parsing + caching teams and channels into the store (stub `/me/joinedTeams` +
 `/teams/{id}/channels`); `channels` refresh; member parsing incl. owner roles +
 caching; `open_channel`/`load_older_channel` paging through the chat service;
@@ -557,9 +557,9 @@ with an optional `chat_id`, and the additive-upsert rule), **ADR-020** (upload
 strategy: ≤4 MiB simple PUT vs. >4 MiB resumable session; and the coarse
 download progress limitation).
 
-**Tests.** `cargo test -p squads-core` — **191** offline unit tests (166 from
+**Tests.** `cargo test -p teamtrim-core` — **191** offline unit tests (166 from
 M1–M6 + 25 new: 3 `model`, 3 `store`, 18 `files`, 1 `session`). `cargo test -p
-squads-protocol` still passes **377**. New coverage includes: the vendored
+teamtrim-protocol` still passes **377**. New coverage includes: the vendored
 chunk planner boundaries (0, exactly one chunk, chunk+1, several+remainder, and
 a floored chunk size), `content_range_value`, `upload_session_body`, and the
 Graph `u!<base64url-nopad>` share-id form (pinned as a known answer, and
@@ -668,9 +668,9 @@ against local TCP stubs.
 unverified unified token/audience — defaults to the skype token). **ADR-022**
 (the `Notifier` trait and desktop notifications behind a default-off feature).
 
-**Tests.** `cargo test -p squads-core` — **230** offline unit tests (191 from
+**Tests.** `cargo test -p teamtrim-core` — **230** offline unit tests (191 from
 M1–M7 + 39 new: 7 `text` mentions, 15 `presence`, 12 `notifications`, 3 `store`,
-2 `session`). `cargo test -p squads-protocol` still passes **377**. New coverage
+2 `session`). `cargo test -p teamtrim-protocol` still passes **377**. New coverage
 includes: `Availability`/`Activity` wire mapping incl. unknowns and aliases; the
 unified mapping fixtures (array/wrapper/nested, unknown values, status-message
 shapes, entries without an MRI); the **unified backend against a local stub**
@@ -713,7 +713,7 @@ signalling (place/accept/end), an offline-testable media seam, incoming-call
 handling and local call history — all testable **offline and deterministically**,
 with no device, camera, microphone, tenant or network in the default build.
 
-**Landed.** New module `crates/squads-core/src/calls/`:
+**Landed.** New module `crates/teamtrim-core/src/calls/`:
 
 - `state` — the UI lifecycle [`CallState`] (`Idle`, `Placing`, `Ringing`,
   `Connecting`, `Connected`, `Ended { reason }`), [`EndReason`] and the
@@ -778,10 +778,10 @@ HTTP client and endpoints), **ADR-024** (media behind default-off
 `audio`/`video-capture` features; the loopback backs the offline tests),
 **ADR-025** (schema v6 `call_log`).
 
-**Tests.** `cargo test -p squads-core` — **281** offline unit tests (230 from
+**Tests.** `cargo test -p teamtrim-core` — **281** offline unit tests (230 from
 M1–M8 + **51** new: 8 `calls::state`, 13 `calls::signaling`, 7 `calls::media`,
 4 `calls::incoming`, 5 `calls::recording`, 8 `calls::tests` (service), 2 `model`,
-3 `store`, 1 `session`). `cargo test -p squads-protocol` still passes **377**.
+3 `store`, 1 `session`). `cargo test -p teamtrim-protocol` still passes **377**.
 New coverage includes: every legal state transition and the rejected ones (with
 the reported `from`/`to`); endpoint derivation (our key → vendored key →
 potential-URL derivation → fallback) and skype-JWT identity decoding (skypeid,
@@ -828,7 +828,7 @@ path are unverified).
 calls / settings screens, an async runtime bridge, and headless `egui_kittest`
 tests — all compiling and testable **without a display, network or tenant**.
 
-**Landed.** `crates/squads-app/src/` was restructured from the M0 stub into:
+**Landed.** `crates/teamtrim-app/src/` was restructured from the M0 stub into:
 
 - `runtime.rs` — `AppRuntime`: owns a multi-threaded `tokio::runtime::Runtime`
   (ADR-004) and bridges it to the UI with a `tokio::sync::mpsc` channel of
@@ -837,7 +837,7 @@ tests — all compiling and testable **without a display, network or tenant**.
   through a cloneable `EventSender`; `drain()` returns everything pending with a
   non-blocking `try_recv`. `EventSender::send` calls `ctx.request_repaint()`
   once, so a background result wakes the UI without polling (ADR-027).
-- `app.rs` — `SquadsApp` holds the `Session`, the shared `Arc<Store>`, the
+- `app.rs` — `TeamTrimApp` holds the `Session`, the shared `Arc<Store>`, the
   service handles (`Arc<Messaging>`/`Arc<Teams>`/`Arc<Files>`/`Arc<CallService>`,
   built from the session once signed in), the view state (page, selection,
   drafts, caches, toasts) and a `Vec<Action>`. `impl eframe::App`:
@@ -881,13 +881,13 @@ bridge, and the UI → Action → apply pattern), **ADR-027** (`request_repaint`
 discipline: only on an applied event, never unconditionally), **ADR-028**
 (headless UI testing via `egui_kittest` + `accesskit`).
 
-**Tests.** `cargo test -p squads-app` — 5 headless UI tests. `cargo test -p
-squads-core` still passes **281**; `cargo test -p squads-protocol` still passes
+**Tests.** `cargo test -p teamtrim-app` — 5 headless UI tests. `cargo test -p
+teamtrim-core` still passes **281**; `cargo test -p teamtrim-protocol` still passes
 **377**. `cargo build --workspace` (default features) is device/network-free.
 
 **How to run the GUI locally** (needs a display; not possible here — B-001):
 
-1. `cargo run -p squads-app` (binary name `squads`). It opens the login screen
+1. `cargo run -p teamtrim-app` (binary name `teamtrim`). It opens the login screen
    when no credentials are stored; with no display this step fails (B-001).
 2. Press **Sign in**; AAD shows a device code + `https://microsoft.com/devicelogin`
    in the window. Complete it and the shell appears with the cached chat list,
@@ -915,7 +915,7 @@ with default features**.
 
 **Landed.**
 
-- `crates/squads-app/src/shortcuts.rs` (new) — the **pure** shortcut mapping.
+- `crates/teamtrim-app/src/shortcuts.rs` (new) — the **pure** shortcut mapping.
   `resolve(key, modifiers) -> Option<Shortcut>` covers `Ctrl/Cmd+K` (quick
   switcher), `Ctrl/Cmd+F` (in-conversation search), `Esc` (close overlays /
   clear search), `Ctrl/Cmd+,` (settings), `Ctrl/Cmd+Shift+M` (mute placeholder),
@@ -936,13 +936,13 @@ with default features**.
 - `views/settings.rs` — the real preferences screen: theme, **accent**, **font
   scale** slider, **compact mode**, notification switches, a **download
   directory** field, and the account/sign-out block.
-- `crates/squads-core/src/settings.rs` — `Settings` grows `accent`, `font_scale`,
+- `crates/teamtrim-core/src/settings.rs` — `Settings` grows `accent`, `font_scale`,
   `compact_mode`, `notifications_enabled`, `notify_only_mentions` and
   `download_dir`, with a hand-written `Default` and **container-level**
   `#[serde(default)]` so an old file missing the new keys still loads with the
   meaningful defaults (ADR-030). `Settings::effective_font_scale` clamps a
   hand-edited value. New `Accent` enum.
-- `crates/squads-core/src/notifications.rs` — `NotificationContext` gains
+- `crates/teamtrim-core/src/notifications.rs` — `NotificationContext` gains
   `notifications_enabled` and `notify_only_mentions` (both permissive by
   default, so existing behaviour is unchanged); `route` honours them. The app
   builds the context from the persisted settings and the store's muted chats and
@@ -950,13 +950,13 @@ with default features**.
 - `theme.rs` — light **and** dark visuals, a small accent palette, the font
   scale via `Context::set_zoom_factor`, and compact spacing; re-applied and
   persisted on every settings change, and applied on the next start.
-- `packaging/` — `dev.squads.squads.desktop`, a placeholder `dev.squads.squads.svg`
+- `packaging/` — `dev.teamtrim.teamtrim.desktop`, a placeholder `dev.teamtrim.teamtrim.svg`
   icon and a short `README.md`. `docs/PACKAGING.md` has the concrete Linux
   (install + AppImage/Flatpak sketches + system libs), macOS (`.app` layout +
   `Info.plist`) and Windows (zip/MSI) instructions, the runtime prerequisites,
   and the config/data/cache locations.
-- `.github/workflows/ci.yml` — push/PR: `cargo fmt -p squads-core -p squads-app
-  -- --check`, `cargo clippy -p squads-core -p squads-app --all-targets` (no
+- `.github/workflows/ci.yml` — push/PR: `cargo fmt -p teamtrim-core -p teamtrim-app
+  -- --check`, `cargo clippy -p teamtrim-core -p teamtrim-app --all-targets` (no
   `-D warnings`), `cargo test --workspace`, `cargo build --release` (ADR-031).
 - Root `Cargo.toml` — the release profile keeps `lto = "thin"` /
   `codegen-units = 1` and adds `strip = "symbols"` (release-only, so tests are
@@ -969,27 +969,27 @@ with default features**.
 **ADR-030** (settings forward-compatibility via container-level serde defaults),
 **ADR-031** (CI scope — our crates only — and the release profile).
 
-**Tests.** `cargo test -p squads-app` — **18** (the 5 M10 headless tests + 6
+**Tests.** `cargo test -p teamtrim-app` — **18** (the 5 M10 headless tests + 6
 `shortcuts` unit tests + 2 `theme` tests + 5 new headless tests: the command
 shortcuts open/close the overlays, `apply_shortcut` dispatches (including the
 draft send), `j`/`k` navigate the chat list, the settings screen edits
 preferences, and the notification context follows the settings). `cargo test -p
-squads-core` — **285** (281 from M1–M9 + 2 `settings` and 2 `notifications`
+teamtrim-core` — **285** (281 from M1–M9 + 2 `settings` and 2 `notifications`
 tests: the old-file-missing-new-keys forward-compatibility case, the font-scale
 clamp, disabled notifications, and notify-only-mentions). `cargo test -p
-squads-protocol` still passes **377**. `cargo build --workspace` and `cargo
-build --workspace --release` both succeed; `cargo fmt -p squads-core -p
-squads-app -- --check` is clean.
+teamtrim-protocol` still passes **377**. `cargo build --workspace` and `cargo
+build --workspace --release` both succeed; `cargo fmt -p teamtrim-core -p
+teamtrim-app -- --check` is clean.
 
 **How to verify by hand** (needs a display; B-001):
 
-1. `cargo run -p squads-app`, sign in, and press each shortcut:
+1. `cargo run -p teamtrim-app`, sign in, and press each shortcut:
    `Ctrl/Cmd+K` (quick switcher), `Ctrl/Cmd+F` (message search), `Esc` (close),
    `Ctrl/Cmd+,` (settings), `Ctrl/Cmd+Shift+M` (mute placeholder),
    `j`/`k` (chat navigation), `Ctrl/Cmd+Enter` (send).
 2. In **Settings** choose Light + an accent, drag the font scale, toggle compact
    mode and the notification switches, set a download folder; restart and confirm
-   the choices are still in effect (`~/.config/squads/settings.json`).
+   the choices are still in effect (`~/.config/teamtrim/settings.json`).
 3. Follow `docs/PACKAGING.md` for a local install and `docs/STATUS.md` for the
    full hand-verification checklist.
 
@@ -1002,7 +1002,7 @@ The mute shortcut and the attachment picker remain placeholders (B-011/B-012).
 
 Added [`.github/workflows/release.yml`](../.github/workflows/release.yml) (ADR-032):
 a native-runner matrix builds a downloadable archive for Linux (`.tar.gz`),
-macOS Intel + Apple Silicon (`.zip` containing an ad-hoc-signed `Squads.app`) and
+macOS Intel + Apple Silicon (`.zip` containing an ad-hoc-signed `TeamTrim.app`) and
 Windows (`.zip`), uploads them as Actions artifacts, and on `v*` tags publishes a
 GitHub Release with all of them attached. Builds use `--locked --release` with
 **default features**, matching the verified state. Installers
@@ -1022,7 +1022,7 @@ stubs, with no tenant, network or display.
 
 **Landed.**
 
-- `model` — [`Meeting`](../crates/squads-core/src/model.rs), an owned,
+- `model` — [`Meeting`](../crates/teamtrim-core/src/model.rs), an owned,
   protocol-independent mirror of the vendored `MeetingInfo`
   (`Meeting::from_info` / `From<&MeetingInfo>`). Two **wire facts** are
   documented rather than guessed: `start`/`end` are the Graph `dateTime` values
@@ -1069,7 +1069,7 @@ stubs, with no tenant, network or display.
 - `session` — `Session::calendar()` mirrors `Session::messaging()` /
   `Session::teams()`: shares the session's store and `Arc<ApiClient>`, offline
   to build, `NotSignedIn` without tokens.
-- `crates/squads-app` — a **Calendar** page: `Page::Calendar` (inserted after
+- `crates/teamtrim-app` — a **Calendar** page: `Page::Calendar` (inserted after
   Chats), a nav-rail entry, the `Ctrl/Cmd+2` page slot (`Ctrl/Cmd+1`…`5` map to
   the pages; Settings keeps `Ctrl/Cmd+,`), the `RefreshCalendar` /
   `RefreshCalendarWeek` / `JoinMeeting` / `ScheduleMeeting` / `CancelMeeting`
@@ -1084,12 +1084,12 @@ stubs, with no tenant, network or display.
 **Decisions.** **ADR-033** (calendar service, schema v7 `meetings`, and the join
 hand-off to calls).
 
-**Tests.** `cargo test -p squads-core` — **302** (285 from M1–M11 + **17** new: 4
-`model`, 3 `store`, 9 `calendar`, 1 `session`). `cargo test -p squads-app` —
+**Tests.** `cargo test -p teamtrim-core` — **302** (285 from M1–M11 + **17** new: 4
+`model`, 3 `store`, 9 `calendar`, 1 `session`). `cargo test -p teamtrim-app` —
 **21** (18 from M10/M11 + **3** new: 2 headless `egui_kittest` calendar tests,
-1 `shortcuts` page-slot test). `cargo test -p squads-protocol` still passes
+1 `shortcuts` page-slot test). `cargo test -p teamtrim-protocol` still passes
 **377**. `cargo build --workspace` (default features) succeeds and
-`cargo fmt -p squads-core -p squads-app -- --check` is clean. New coverage
+`cargo fmt -p teamtrim-core -p teamtrim-app -- --check` is clean. New coverage
 includes: the `Meeting` conversion (carried fields + the five honest defaults +
 redacting `Debug` + JSON round-trip); `upcoming` against a local stub (the exact
 `GET /me/calendar/calendarView?…` path/params/`$select`, parsed fields, cached
@@ -1174,7 +1174,7 @@ to test.
   object-store vs. chat-service scheme), so it never leaks to third parties.
   `with_client` injects the HTTP client for the local-stub tests; writes are
   atomic (temp + rename) and capped at `MAX_BYTES`.
-- `crates/squads-app` — `egui_extras` (feature `image`) is added and its
+- `crates/teamtrim-app` — `egui_extras` (feature `image`) is added and its
   loaders installed in `theme::install`; the app owns a `MediaCache` (built once
   signed in) and a per-URL `MediaState` map; the conversation timeline renders
   each `image_urls(message.raw)` entry as an `egui::Image` (bounded to
@@ -1191,14 +1191,14 @@ to test.
 `text::image_urls` + the deterministic `MediaCache` + `egui_extras` image
 loading).
 
-**Tests.** `cargo test -p squads-core` — **326** (302 from M1–M12 + **24** new:
+**Tests.** `cargo test -p teamtrim-core` — **326** (302 from M1–M12 + **24** new:
 2 `model`, 1 `store` migration (+ the account identity round-trip folded into the
 existing test), 3 `api`, 5 `media`, 3 `messaging`, 2 `realtime`, 2 `session`,
-6 `text`). `cargo test -p squads-app` — **23** (21 from M10–M12 + **2** new: an
+6 `text`). `cargo test -p teamtrim-app` — **23** (21 from M10–M12 + **2** new: an
 own message marked/rendered from the injected identity, and an `<img>` message
 rendering a placeholder plus a queued `LoadMedia`). `cargo test -p
-squads-protocol` still passes **377**. `cargo build --workspace` (default
-features) succeeds and `cargo fmt -p squads-core -p squads-app -- --check` is
+teamtrim-protocol` still passes **377**. `cargo build --workspace` (default
+features) succeeds and `cargo fmt -p teamtrim-core -p teamtrim-app -- --check` is
 clean. New coverage includes: `Identity::from_whoami` (MRI derivation + the
 empty-id case); `whoami` mapping against a local stub (the `GET /me` request
 line and the Graph bearer); the media host rule (Microsoft hosts authenticate,
@@ -1220,14 +1220,14 @@ reaching the messaging service; and `restore` recovering the persisted identity.
 posted in and confirm your messages render on the own side (the store rows carry
 `is_own`); send yourself a message from another client and confirm the realtime
 bubble is also on the own side. Open a chat with an image/GIF and confirm it
-renders (and that `~/.cache/squads/media/` fills with hashed files, one per URL,
+renders (and that `~/.cache/teamtrim/media/` fills with hashed files, one per URL,
 with no refetch on scroll); confirm a Microsoft-hosted image loads authenticated
 while a Giphy link loads without the token.
 
 **Blockers.** **U-008** (live whoami and inline-media acceptance — the real
 `GET /me` identity and whether the real media hosts/`Content-Type`s match — is
 unverified; see B-002). **B-007** (the media cache writes fetched image bytes
-**unencrypted** into `~/.cache/squads/media/`, joining the rest of the local
+**unencrypted** into `~/.cache/teamtrim/media/`, joining the rest of the local
 cache). B-001/B-012 (the timeline's actual pixels are verified by the headless
 `egui_kittest` placeholder test, not by a screenshot).
 
@@ -1269,7 +1269,7 @@ to the matched message, and offline tests throughout.
 - `session` — `Session::search()` mirrors the other services but **never fails**:
   it shares the store and, when tokens are loaded, the shared `Arc<ApiClient>`;
   a signed-out session gets a local-only handle.
-- `crates/squads-app` — a **Search** page: `Page::Search` (nav rail, after
+- `crates/teamtrim-app` — a **Search** page: `Page::Search` (nav rail, after
   Calls), the `Ctrl/Cmd+Shift+F` binding (plain `Ctrl/Cmd+F` keeps its M11
   in-conversation meaning), a query box, a result list (snippet, chat name,
   sender, time) with the selected row highlighted, `Up`/`Down`/`j`/`k`
@@ -1283,17 +1283,17 @@ to the matched message, and offline tests throughout.
 **Decisions.** **ADR-036** (local-first search, the schema-v9 index and why not
 FTS5, and the optional Graph server fallback + the `Chat.Read` limitation).
 
-**Tests.** `cargo test -p squads-core` — **344** (326 from M1–M13 + **18** new: 4
+**Tests.** `cargo test -p teamtrim-core` — **344** (326 from M1–M13 + **18** new: 4
 `store` (v8→v9 migration, case-insensitivity/order/limit/chat-filter, wildcard
 escaping + rowid ties, blank-query/unicode), 12 `search` (escape/pattern, the
 snippet cases, the local service, the server wrapper against a stub, the
 local-first fallback, no-client), 2 `session`). `cargo
-test -p squads-app` — **25** (23 from M10–M13 + **2** new: the Search page renders
+test -p teamtrim-app` — **25** (23 from M10–M13 + **2** new: the Search page renders
 results, ArrowDown moves the selection without navigating chats, and selecting a
 row opens the chat + highlights the message; and `Ctrl/Cmd+Shift+F` opens the
-Search page). `cargo test -p squads-protocol` still passes **377**. `cargo build
---workspace` (default features) succeeds and `cargo fmt -p squads-core -p
-squads-app -- --check` is clean.
+Search page). `cargo test -p teamtrim-protocol` still passes **377**. `cargo build
+--workspace` (default features) succeeds and `cargo fmt -p teamtrim-core -p
+teamtrim-app -- --check` is clean.
 
 **How to verify manually** (real tenant; not runnable here): sign in, browse a
 few chats so the store is populated, press `Ctrl/Cmd+Shift+F` (or the **Search**
@@ -1343,7 +1343,7 @@ must be testable **offline** against local TCP stubs.
   into [`Person`]. Redacting `Debug`; single-window/bounded (no `load_more`).
 - `session` — `Session::people()` mirrors the other services (shares the cached
   `Arc<ApiClient>`, offline to build, `NotSignedIn` without tokens).
-- `crates/squads-app` — a **Files-page search box** (B3): a non-empty query
+- `crates/teamtrim-app` — a **Files-page search box** (B3): a non-empty query
   switches the page from the chat's files to **global drive results**, rendered
   with the same `FileEntry` row + **Download** action (a searched file is
   downloadable — the download resolves the row from the in-memory results);
@@ -1351,7 +1351,7 @@ must be testable **offline** against local TCP stubs.
   files. Plus a **reusable people picker** overlay
   (`views/people_picker.rs`): a query box (queues `Action::SearchPeople`),
   async directory results (`AppEvent::PeopleResults`), multi-select, removable
-  selected chips, and `SquadsApp::selected_people()` for the caller. It is
+  selected chips, and `TeamTrimApp::selected_people()` for the caller. It is
   reachable now from the **Search** page's "Find people" button (and via
   `Action::TogglePeoplePicker`); `Esc` closes it but keeps the selection.
   Repaints only when something changed (ADR-027).
@@ -1359,17 +1359,17 @@ must be testable **offline** against local TCP stubs.
 **Decisions.** **ADR-037** (file/people search wrappers + the schema-free
 `People` service, and the **people-picker contract** B2a consumes).
 
-**Tests.** `cargo test -p squads-core` — **353** (344 from M1–M13/B1 + **9**
+**Tests.** `cargo test -p teamtrim-core` — **353** (344 from M1–M13/B1 + **9**
 new: 2 `model` (`Person` conversion + label/serde), 5 `people` (the directory
 stub incl. the `ConsistencyLevel` header, the limit clamp, the empty-query guard,
 unknown shapes, `Send + Sync`/redacting `Debug`), 1 `files`
 (`search_files` path/`$top=25` clamp/parse/cache), 1 `session` (`people` requires
-tokens + shares the client)). `cargo test -p squads-app` — **27** (25 from
+tokens + shares the client)). `cargo test -p teamtrim-app` — **27** (25 from
 M10–M13/B1 + **2** new: the people picker renders a query's results and a
 selection yields the person's id (and the chip toggles it back off); the
 Files-page search renders global results and queues the Download action).
-`cargo test -p squads-protocol` still passes **377**. `cargo build --workspace`
-(default features) succeeds and `cargo fmt -p squads-core -p squads-app --
+`cargo test -p teamtrim-protocol` still passes **377**. `cargo build --workspace`
+(default features) succeeds and `cargo fmt -p teamtrim-core -p teamtrim-app --
 --check` is clean.
 
 **How to verify manually** (real tenant; not runnable here): sign in, open
@@ -1377,7 +1377,7 @@ Files-page search renders global results and queues the Download action).
 results render and download; clear it and confirm the selected chat's files
 return. On the **Search** page press **Find people**, type a colleague's name
 and confirm directory results render; select one (or several) and read
-`SquadsApp::selected_people()`.
+`TeamTrimApp::selected_people()`.
 
 **Blockers.** **U-010** (the live Graph drive-search and `/users` `$search`
 acceptance — the actual response shapes and whether the Teams first-party Graph
@@ -1413,7 +1413,7 @@ M8's **local** mute flag.
   `leave_member_url`, `ChatMemberInfo`, `RosterSource`). Creation and leave ride
   the **chat service** (Graph `POST /me/chats` answers `405` and `POST /chats`
   needs `Chat.Create`).
-- `model` — [`ChatMember`](../crates/squads-core/src/model.rs) (`mri`, `id`,
+- `model` — [`ChatMember`](../crates/teamtrim-core/src/model.rs) (`mri`, `id`,
   `display_name`, `email`, `roles`, `is_owner`), `ChatMember::from_info` /
   `From<&ChatMemberInfo>` and a `label()` helper. A dedicated type rather than
   [`Person`]: a roster entry is keyed by the chat-service **MRI** (the leave
@@ -1432,7 +1432,7 @@ M8's **local** mute flag.
   `members` (map the roster into [`ChatMember`]s). Redacting `Debug`.
 - `session` — `Session::chats()` mirrors the other services (shares the store and
   the cached `Arc<ApiClient>`; offline to build; `NotSignedIn` without tokens).
-- `crates/squads-app` — the **New chat** flow and the chat **context menu**:
+- `crates/teamtrim-app` — the **New chat** flow and the chat **context menu**:
   - a **New chat** button in the chat list opens B3's people picker in "new chat"
     mode (`Action::NewChat`); picking one person creates a 1:1, several reveal a
     **Group topic** field and create a group (`Action::CreateChat` → `Chats`),
@@ -1452,18 +1452,18 @@ M8's **local** mute flag.
 **Decisions.** **ADR-038** (chat creation/leave via the chat service + the
 server-vs-local mute reconciliation + schema v10).
 
-**Tests.** `cargo test -p squads-core` — **376** (353 from M1–M13/B1/B3 + **23**
+**Tests.** `cargo test -p teamtrim-core` — **376** (353 from M1–M13/B1/B3 + **23**
 new: 9 `api` (the 1:1 probe/create, group create + `Location`, leave, mute, hide,
 roster, the response parsing and the pure write shapes), 2 `model` (`ChatMember`
 conversion + label), 3 `store` (hidden + server-mute round-trips, the **v9→v10**
 migration), 8 `chats` (create 1:1/group caching, leave dropping the chat +
 messages, the mute reconciliation online + offline, hide, roster, `Send + Sync`/
-redacting `Debug`), 1 `session`). `cargo test -p squads-app` — **32** (27 from
+redacting `Debug`), 1 `session`). `cargo test -p teamtrim-app` — **32** (27 from
 M10–M13/B1/B3 + **5** new: the new-chat flow (pick a person → Create chat), the
 group topic field, the context menu mute toggle, hide → show-hidden → unhide, and
-leave-confirms-first). `cargo test -p squads-protocol` still passes **377**.
+leave-confirms-first). `cargo test -p teamtrim-protocol` still passes **377**.
 `cargo build --workspace` (default features) succeeds and `cargo fmt -p
-squads-core -p squads-app -- --check` is clean.
+teamtrim-core -p teamtrim-app -- --check` is clean.
 
 **How to verify manually** (real tenant; not runnable here): sign in, press
 **New chat**, search a colleague and select them (one → a 1:1 opens; two or more
@@ -1503,9 +1503,9 @@ unstubbable.
   `CHATSVCAGG_SCOPE`; `thread_pins_url`, `graph_pins_path`, `graph_unpin_path`,
   `parse_thread_pins`, `parse_graph_pins`, `pick_pins`, `fill_pin_from_message`,
   `PinnedRef`, `PinSource`).
-- `model` — [`ChatFolder`](../crates/squads-core/src/model.rs)
+- `model` — [`ChatFolder`](../crates/teamtrim-core/src/model.rs)
   (id/name/folder_type, `is_system` computed from `SYSTEM_FOLDER_TYPES`,
-  `item_ids`) and [`PinnedMessage`](../crates/squads-core/src/model.rs)
+  `item_ids`) and [`PinnedMessage`](../crates/teamtrim-core/src/model.rs)
   (chat_id/message_id/sender/preview/time/pinned_at/by/graph_pin_id, plus an
   `Option<Message>` resolved from the store on read). `is_system_folder` is a
   pure helper.
@@ -1529,7 +1529,7 @@ unstubbable.
 - `session` — `Session::folders()` / `Session::pins()` mirror the other
   services (share the store and the cached `Arc<ApiClient>`; offline to build;
   `NotSignedIn` without tokens).
-- `crates/squads-app` — **folder tabs** in the chat list (All + one per cached
+- `crates/teamtrim-app` — **folder tabs** in the chat list (All + one per cached
   folder, with counts) that filter the list (`Action::SelectFolder`), a
   **Move to folder** row in the B2a context menu (`Action::MoveChatToFolder`),
   and a **pinned-messages panel** in the conversation info pane (sender,
@@ -1543,15 +1543,15 @@ unstubbable.
 pin-membership table, schema v11; the local-first folder move; the
 Graph-vs-thread pin sources and the unavailable server unpin).
 
-**Tests.** `cargo test -p squads-core` — **395** (B2a's 376 + **19** new: 2
+**Tests.** `cargo test -p teamtrim-core` — **395** (B2a's 376 + **19** new: 2
 `model`, 3 `store` (folders round-trip + membership, pins round-trip + remove,
 the **v10→v11** migration), 5 `api` (folders token guard, the pins thread read,
 unpin refusal, the folder pure shapes, the Graph/thread pin parsers), 5 `folders`
-and 4 `pins`). `cargo test -p squads-app` — **35** (B2a's 32 + **3** new: folder
+and 4 `pins`). `cargo test -p teamtrim-app` — **35** (B2a's 32 + **3** new: folder
 tabs filter the list, the pinned panel renders and unpin removes, and the
 move-to-folder menu queues the action).
-`cargo test -p squads-protocol` still passes **377**. `cargo build --workspace`
-(default features) succeeds and `cargo fmt -p squads-core -p squads-app --
+`cargo test -p teamtrim-protocol` still passes **377**. `cargo build --workspace`
+(default features) succeeds and `cargo fmt -p teamtrim-core -p teamtrim-app --
 --check` is clean. New coverage includes: the `ChatFolder`/`PinnedMessage`
 conversions + `is_system_folder`; the folder store round-trip, membership
 (one folder per chat), the folder move/clear and profile isolation; the pin
@@ -1609,10 +1609,10 @@ picker) and a channel reaction affordance in the conversation view.
   `channel_set_reaction_path`, `channel_unset_reaction_path`,
   `channel_reply_set_reaction_path`, `channel_reply_unset_reaction_path`,
   `channel_react_body`).
-- `model` — [`PublicTeam`](../crates/squads-core/src/model.rs)
+- `model` — [`PublicTeam`](../crates/teamtrim-core/src/model.rs)
   (id/display_name/description/visibility + a **local** `is_joined` the wire does
   not carry, so `From` defaults it `false` and the service marks it against the
-  joined cache) and [`TeamSettings`](../crates/squads-core/src/model.rs)
+  joined cache) and [`TeamSettings`](../crates/teamtrim-core/src/model.rs)
   (the two `memberSettings` flags + the General channel id, each `None` when the
   read failed — **unknown**, never a guessed `false`). `TeamMember` gains a
   non-persisted `user_id` (the vendored projection carries it) so the app can
@@ -1631,7 +1631,7 @@ picker) and a channel reaction affordance in the conversation view.
   id (falling back to the stored `reply_to`), performs the API call, then
   adjusts the stored message's reactions (the same coarse ±1 as chat reactions).
   The pure `split_thread_conversation` is the inverse of `thread_conversation`.
-- `crates/squads-app` — a **Browse public teams** search on the Teams page
+- `crates/teamtrim-app` — a **Browse public teams** search on the Teams page
   (query → results with Join/Joined), an **owner-gated member roster** (shown
   when the fetched roster names the signed-in user as an owner: **Add member**
   opens B3's people picker in "add member" mode with an owner-role toggle, and
@@ -1647,12 +1647,12 @@ picker) and a channel reaction affordance in the conversation view.
 the schema-free reverse lookup, and the dedicated Graph channel-reaction lanes
 and why they differ from chat reactions).
 
-**Tests.** `cargo test -p squads-core` — **417** (B2b's 395 + **22** new: 11
-`api`, 2 `model`, 1 `store`, 8 `teams`). `cargo test -p squads-app` — **38**
+**Tests.** `cargo test -p teamtrim-core` — **417** (B2b's 395 + **22** new: 11
+`api`, 2 `model`, 1 `store`, 8 `teams`). `cargo test -p teamtrim-app` — **38**
 (B2b's 35 + **3** new: the public-team search/join flow, member management with
 add-via-picker + remove-with-confirmation, and reacting to a channel message).
-`cargo test -p squads-protocol` still passes **377**. `cargo build --workspace`
-(default features) succeeds and `cargo fmt -p squads-core -p squads-app --
+`cargo test -p teamtrim-protocol` still passes **377**. `cargo build --workspace`
+(default features) succeeds and `cargo fmt -p teamtrim-core -p teamtrim-app --
 --check` is clean. New coverage includes: the public-team `/groups` `$search`
 shape (only public rows, dedupe, blank-name fallback) and the `/teams`
 `startswith` fallback on a refused groups read; a blank query rejected before any
@@ -1712,10 +1712,10 @@ info pane and offline tests throughout.
   list; there is no per-chat/per-channel variant and no paging cursor, so a limit
   is clamped by the vendored path builder (`1..=50` recordings, `1..=100`
   transcripts).
-- `model` — [`Recording`](../crates/squads-core/src/model.rs) and
-  [`Transcript`](../crates/squads-core/src/model.rs) (owned mirrors of the
+- `model` — [`Recording`](../crates/teamtrim-core/src/model.rs) and
+  [`Transcript`](../crates/teamtrim-core/src/model.rs) (owned mirrors of the
   vendored `RecordingInfo`/`TranscriptInfo`), plus an owned
-  [`RecordingSource`](../crates/squads-core/src/model.rs) (`OneDrive` /
+  [`RecordingSource`](../crates/teamtrim-core/src/model.rs) (`OneDrive` /
   `Channel { team, channel }`, with `is_channel`/`label`/`team_name`/
   `channel_name`; `TranscriptSource` is the same shape under its own name). A
   recording carries `is_video` (computed with the vendored predicate; always
@@ -1746,14 +1746,14 @@ info pane and offline tests throughout.
   `transcripts_for_chat`/`transcripts_for_channel`/`search_transcripts`, the
   local reads `cached_recordings`/`cached_transcripts`, and `download` /
   `download_transcript` — which project the entry onto a
-  [`FileEntry`](../crates/squads-core/src/model.rs) and call the M7
-  [`Files::download`](../crates/squads-core/src/files.rs), so the buffered
+  [`FileEntry`](../crates/teamtrim-core/src/model.rs) and call the M7
+  [`Files::download`](../crates/teamtrim-core/src/files.rs), so the buffered
   transfer and coarse `(0,size)`/`(written,size)` progress are exactly the M7
   ones. Redacting `Debug`.
 - `session` — `Session::recordings()` mirrors the other services (shares the
   store and the cached `Arc<ApiClient>`; offline to build; `NotSignedIn` without
   tokens).
-- `crates/squads-app` — a **Recordings & transcripts** section in the
+- `crates/teamtrim-app` — a **Recordings & transcripts** section in the
   conversation info pane: each recording/transcript row shows its name, source
   label, size, modified date and (recordings) duration, with a **Download**
   action (disabled when the wire named no drive) reusing the M7 download; a
@@ -1767,17 +1767,17 @@ info pane and offline tests throughout.
 `(id, profile)` + `scope` key, the global-lane source split, and the reuse of the
 M7 download path).
 
-**Tests.** `cargo test -p squads-core` — **442** (B4's 417 + **25** new: 2
+**Tests.** `cargo test -p teamtrim-core` — **442** (B4's 417 + **25** new: 2
 `model` (the `Recording`/`Transcript` conversions + the file-entry projection),
 3 `store` (the recordings/transcripts round-trip + scope, the additive upsert,
 the **v11→v12** migration), 3 `api` (the OneDrive list request line + the Graph
 bearer, the transcripts drive-search + blank-query refusal, the re-exported pure
-helpers), 16 `recordings` and 1 `session`). `cargo test -p squads-app` — **40**
+helpers), 16 `recordings` and 1 `session`). `cargo test -p teamtrim-app` — **40**
 (B4's 38 + **2** new: the info-pane panel renders seeded recordings/transcripts
 and queues the Download actions; the empty state renders and Refresh queues the
-action). `cargo test -p squads-protocol` still passes **377**. `cargo build
---workspace` (default features) succeeds and `cargo fmt -p squads-core -p
-squads-app -- --check` is clean. New coverage includes: the `Recording`/
+action). `cargo test -p teamtrim-protocol` still passes **377**. `cargo build
+--workspace` (default features) succeeds and `cargo fmt -p teamtrim-core -p
+teamtrim-app -- --check` is clean. New coverage includes: the `Recording`/
 `Transcript` conversions (source mirror + labels + `is_video` + the transcript's
 absent download URL + JSON round-trip); the **full global lane request shapes**
 against a stub (the OneDrive `Recordings` children path, the `joinedTeams` scan,

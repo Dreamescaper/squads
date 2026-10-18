@@ -1,7 +1,7 @@
 # Reference: live end-to-end probes
 
 These shell scripts were inherited from the vendored protocol core
-(`crates/squads-protocol`, originally `better-teams`/`ost`). They are **not** run by CI
+(`crates/teamtrim-protocol`, originally `better-teams`/`ost`). They are **not** run by CI
 and require a real Microsoft sign-in, so they exist purely as **manual verification**
 probes for a developer with a live account.
 
@@ -20,5 +20,5 @@ export TEAMS_EMAIL=you@example.com
 ./docs/reference/e2e_chats.sh
 ```
 
-See `crates/squads-protocol/README.md` and `AGENTS.md` for the environment variables the
+See `crates/teamtrim-protocol/README.md` and `AGENTS.md` for the environment variables the
 original project used (`TEAMS_*`, region overrides, `TEAMS_MANUAL_CALLS`, …).

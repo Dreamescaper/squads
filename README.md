@@ -1,4 +1,4 @@
-# Squads
+# TeamTrim
 
 An alternative, cross-platform **Microsoft Teams** client built with **Rust** and
 [**egui**](https://github.com/emilk/egui) (immediate-mode, event-driven, glow/OpenGL).
@@ -14,7 +14,7 @@ An alternative, cross-platform **Microsoft Teams** client built with **Rust** an
 ## Why
 
 The official Teams client is heavy and the notable open-source alternative,
-[better-teams](https://github.com/mrowlinson/better-teams), is macOS-only. Squads pairs a
+[better-teams](https://github.com/mrowlinson/better-teams), is macOS-only. TeamTrim pairs a
 portable Rust protocol core with a native egui UI so it can run on Linux, macOS and
 Windows, while staying easy on RAM and CPU.
 
@@ -30,16 +30,16 @@ See [`docs/DECISIONS.md`](docs/DECISIONS.md) (ADR-006).
 Teams has no public chat/call API. Chat uses Microsoft's proprietary `ng.msg` service
 (authenticated with a `skypetoken`), realtime uses Microsoft **Trouter** (socket.io v1 over
 WebSocket), and calls use epconv SDP signalling with ICE/TURN/SRTP/RTP. Rather than
-reimplement this fragile, reverse-engineered surface, Squads vendors the MIT-licensed
+reimplement this fragile, reverse-engineered surface, TeamTrim vendors the MIT-licensed
 Rust protocol core from [`eisbaw/ost`](https://github.com/eisbaw/ost) (via the
 [better-teams](https://github.com/mrowlinson/better-teams) fork) and builds a new
 cross-platform UI on top. See [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 ```
 crates/
-  squads-protocol/   vendored protocol core (lib `ost`): auth, api, trouter, calling
-  squads-core/       session lifecycle, event bus, local store, config
-  squads-app/        the egui application
+  teamtrim-protocol/   vendored protocol core (lib `ost`): auth, api, trouter, calling
+  teamtrim-core/       session lifecycle, event bus, local store, config
+  teamtrim-app/        the egui application
 ```
 
 ## Feature status
@@ -73,7 +73,7 @@ The full blocker list is in [`docs/BLOCKERS.md`](docs/BLOCKERS.md).
 export PATH="$HOME/.cargo/bin:$PATH"   # if cargo is not on PATH
 
 cargo build                 # workspace, default features (device/network-free)
-cargo run -p squads-app     # GUI (binary `squads`; requires a display server)
+cargo run -p teamtrim-app     # GUI (binary `teamtrim`; requires a display server)
 cargo test --workspace      # offline test suite
 cargo build --release       # shipped configuration
 ```
@@ -95,14 +95,14 @@ Calls · `j`/`k` or `↓`/`↑` chat navigation · `Ctrl/Cmd+Enter` send.
 
 ## Configuration & data
 
-Resolved by `squads_core::AppDirs` (`directories`, project id
-`dev.squads.squads`):
+Resolved by `teamtrim_core::AppDirs` (`directories`, project id
+`dev.teamtrim.teamtrim`):
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
-| Config | `~/.config/squads` | `~/Library/Application Support/dev.squads.squads` | `%APPDATA%\squads\squads\config` |
-| Data | `~/.local/share/squads` | `~/Library/Application Support/dev.squads.squads` | `%APPDATA%\squads\squads\data` |
-| Cache | `~/.cache/squads` | `~/Library/Caches/dev.squads.squads` | `%LOCALAPPDATA%\squads\squads\cache` |
+| Config | `~/.config/teamtrim` | `~/Library/Application Support/dev.teamtrim.teamtrim` | `%APPDATA%\teamtrim\teamtrim\config` |
+| Data | `~/.local/share/teamtrim` | `~/Library/Application Support/dev.teamtrim.teamtrim` | `%APPDATA%\teamtrim\teamtrim\data` |
+| Cache | `~/.cache/teamtrim` | `~/Library/Caches/dev.teamtrim.teamtrim` | `%LOCALAPPDATA%\teamtrim\teamtrim\cache` |
 
 - `settings.json` — preferences (theme, accent, font scale, compact mode,
   notifications, download directory).
@@ -114,10 +114,10 @@ Resolved by `squads_core::AppDirs` (`directories`, project id
 
 ## Troubleshooting
 
-- **The window never opens / "no display".** Squads is a GUI app and needs an X11
+- **The window never opens / "no display".** TeamTrim is a GUI app and needs an X11
   or Wayland session. In a headless shell (CI, containers, SSH) `cargo run -p
-  squads-app` cannot show a window; use the tests and the
-  [`squads-cli`](crates/squads-protocol) binary for protocol work instead. This
+  teamtrim-app` cannot show a window; use the tests and the
+  [`teamtrim-cli`](crates/teamtrim-protocol) binary for protocol work instead. This
   is why the UI is verified by compilation and headless `egui_kittest` tests,
   not screenshots (B-001/B-012).
 - **`libEGL`/`libGL`/`libwayland` errors at start.** Install the graphics and
@@ -133,4 +133,4 @@ Resolved by `squads_core::AppDirs` (`directories`, project id
 ## License
 
 MIT. Vendored third-party code retains its own licenses and attribution; see
-[`NOTICE`](NOTICE) and [`crates/squads-protocol/LICENSE`](crates/squads-protocol/LICENSE).
+[`NOTICE`](NOTICE) and [`crates/teamtrim-protocol/LICENSE`](crates/teamtrim-protocol/LICENSE).

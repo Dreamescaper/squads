@@ -1,6 +1,6 @@
 # Packaging & distribution
 
-Concrete build and packaging notes for Squads. The assets referenced here live
+Concrete build and packaging notes for TeamTrim. The assets referenced here live
 in [`packaging/`](../packaging/); the honest state of what is actually verified
 is in [`STATUS.md`](STATUS.md).
 
@@ -12,11 +12,11 @@ is in [`STATUS.md`](STATUS.md).
 
 ## 0. The binary
 
-One binary, `squads`, from `crates/squads-app`:
+One binary, `teamtrim`, from `crates/teamtrim-app`:
 
 ```sh
-cargo build --release            # -> target/release/squads (squads.exe on Windows)
-cargo run   -p squads-app        # debug run (needs a display)
+cargo build --release            # -> target/release/teamtrim (teamtrim.exe on Windows)
+cargo run   -p teamtrim-app        # debug run (needs a display)
 ```
 
 ### Release profile
@@ -65,17 +65,17 @@ sudo apt-get install -y \
 ### 2.2 Install
 
 ```sh
-install -Dm755 target/release/squads "$HOME/.local/bin/squads"
-install -Dm644 packaging/dev.squads.squads.desktop \
-  "$HOME/.local/share/applications/dev.squads.squads.desktop"
-install -Dm644 packaging/dev.squads.squads.svg \
-  "$HOME/.local/share/icons/hicolor/scalable/apps/dev.squads.squads.svg"
+install -Dm755 target/release/teamtrim "$HOME/.local/bin/teamtrim"
+install -Dm644 packaging/dev.teamtrim.teamtrim.desktop \
+  "$HOME/.local/share/applications/dev.teamtrim.teamtrim.desktop"
+install -Dm644 packaging/dev.teamtrim.teamtrim.svg \
+  "$HOME/.local/share/icons/hicolor/scalable/apps/dev.teamtrim.teamtrim.svg"
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 ```
 
-`StartupWMClass=dev.squads.squads` in the `.desktop` file matches
-`ViewportBuilder::with_app_id("dev.squads.squads")` in
-`crates/squads-app/src/main.rs`, so the compositor finds the icon and groups the
+`StartupWMClass=dev.teamtrim.teamtrim` in the `.desktop` file matches
+`ViewportBuilder::with_app_id("dev.teamtrim.teamtrim")` in
+`crates/teamtrim-app/src/main.rs`, so the compositor finds the icon and groups the
 window. For a system-wide install use `/usr/local/...` and
 `/usr/share/applications` instead of the `$HOME/.local` paths.
 
@@ -84,7 +84,7 @@ window. For a system-wide install use `/usr/local/...` and
 No AppImage recipe is committed. The usual route:
 
 1. `cargo build --release`.
-2. Build an AppDir containing `usr/bin/squads`, the `.desktop` file and the icon.
+2. Build an AppDir containing `usr/bin/teamtrim`, the `.desktop` file and the icon.
 3. Run [`linuxdeploy`](https://github.com/linuxdeploy/linuxdeploy) over it.
 
 AppImages must bundle or rely on `libssl`, `libxkbcommon`, the Wayland/X11
@@ -115,30 +115,30 @@ Build for one architecture, or both then `lipo`:
 cargo build --release --target aarch64-apple-darwin
 cargo build --release --target x86_64-apple-darwin
 lipo -create \
-  target/aarch64-apple-darwin/release/squads \
-  target/x86_64-apple-darwin/release/squads \
-  -output target/release/squads
+  target/aarch64-apple-darwin/release/teamtrim \
+  target/x86_64-apple-darwin/release/teamtrim \
+  -output target/release/teamtrim
 ```
 
 `.app` bundle layout:
 
 ```text
-Squads.app/
+TeamTrim.app/
 └── Contents/
     ├── Info.plist
     ├── MacOS/
-    │   └── squads                 # the lipo'd binary, chmod +x
+    │   └── teamtrim                 # the lipo'd binary, chmod +x
     └── Resources/
-        └── dev.squads.squads.icns # generate from the SVG (e.g. `iconutil`)
+        └── dev.teamtrim.teamtrim.icns # generate from the SVG (e.g. `iconutil`)
 ```
 
 `Info.plist` notes (minimum keys):
 
 | Key | Value |
 |---|---|
-| `CFBundleName` / `CFBundleDisplayName` | `Squads` |
-| `CFBundleIdentifier` | `dev.squads.squads` (matches the app id) |
-| `CFBundleExecutable` | `squads` |
+| `CFBundleName` / `CFBundleDisplayName` | `TeamTrim` |
+| `CFBundleIdentifier` | `dev.teamtrim.teamtrim` (matches the app id) |
+| `CFBundleExecutable` | `teamtrim` |
 | `CFBundlePackageType` | `APPL` |
 | `CFBundleShortVersionString` / `CFBundleVersion` | `0.1.0` / build number |
 | `LSMinimumSystemVersion` | `11.0` |
@@ -148,16 +148,16 @@ Add `NSMicrophoneUsageDescription` and `NSCameraUsageDescription` **only** when
 building with the `audio`/`video-capture` features, and a notifications usage
 string once the desktop notifier is enabled. Unsigned local runs are blocked by
 Gatekeeper; for local testing use an ad-hoc signature
-(`codesign --force --deep -s - Squads.app`). For distribution: sign with a
+(`codesign --force --deep -s - TeamTrim.app`). For distribution: sign with a
 Developer ID, enable the hardened runtime, then notarize with `notarytool`.
 
 ## 4. Windows
 
 ```powershell
-cargo build --release            # -> target\release\squads.exe
+cargo build --release            # -> target\release\teamtrim.exe
 ```
 
-- **Zip** — the simplest honest artifact: `squads.exe`, `LICENSE`, `NOTICE`, and
+- **Zip** — the simplest honest artifact: `teamtrim.exe`, `LICENSE`, `NOTICE`, and
   `vcruntime140.dll` (or build with `RUSTFLAGS=-C target-feature=+crt-static` to
   avoid the redistributable). No installer scripts are committed.
 - **MSI** — [`cargo-wix`](https://github.com/volks73/cargo-wix) can scaffold and
@@ -168,14 +168,14 @@ cargo build --release            # -> target\release\squads.exe
 
 ## 5. Where config, data and cache live
 
-Resolved by `squads_core::AppDirs` (the `directories` crate, project id
-`dev.squads.squads`):
+Resolved by `teamtrim_core::AppDirs` (the `directories` crate, project id
+`dev.teamtrim.teamtrim`):
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
-| Config | `~/.config/squads` | `~/Library/Application Support/dev.squads.squads` | `%APPDATA%\squads\squads\config` |
-| Data | `~/.local/share/squads` | `~/Library/Application Support/dev.squads.squads` | `%APPDATA%\squads\squads\data` |
-| Cache | `~/.cache/squads` | `~/Library/Caches/dev.squads.squads` | `%LOCALAPPDATA%\squads\squads\cache` |
+| Config | `~/.config/teamtrim` | `~/Library/Application Support/dev.teamtrim.teamtrim` | `%APPDATA%\teamtrim\teamtrim\config` |
+| Data | `~/.local/share/teamtrim` | `~/Library/Application Support/dev.teamtrim.teamtrim` | `%APPDATA%\teamtrim\teamtrim\data` |
+| Cache | `~/.cache/teamtrim` | `~/Library/Caches/dev.teamtrim.teamtrim` | `%LOCALAPPDATA%\teamtrim\teamtrim\cache` |
 
 Files:
 
@@ -197,10 +197,10 @@ downloadable archive per platform on **native runners** (no cross-compilation):
 
 | Runner | Target | Artifact (Actions) | Contents |
 |---|---|---|---|
-| `ubuntu-latest` | `x86_64-unknown-linux-gnu` | `squads-linux-x86_64` | `squads-<version>-linux-x86_64.tar.gz` — `squads`, `squads-cli`, `LICENSE`, `NOTICE`, `README.md`, `packaging/` (`.desktop` + icon) |
-| `macos-14` | `aarch64-apple-darwin` | `squads-macos-arm64` | `squads-macos-arm64.zip` (`Squads.app`, ad-hoc signed) + `squads-macos-arm64-cli.zip` (`squads-cli` + docs) |
-| `macos-14` | `x86_64-apple-darwin` | `squads-macos-x86_64` | same layout as `arm64` (the Intel slice is cross-built on the arm64 runner, since the `macos-13` image is retired) |
-| `windows-latest` | `x86_64-pc-windows-msvc` | `squads-windows-x86_64` | `squads-windows-x86_64.zip` — `squads.exe`, `squads-cli.exe`, `LICENSE`, `NOTICE`, `README.md` |
+| `ubuntu-latest` | `x86_64-unknown-linux-gnu` | `teamtrim-linux-x86_64` | `teamtrim-<version>-linux-x86_64.tar.gz` — `teamtrim`, `teamtrim-cli`, `LICENSE`, `NOTICE`, `README.md`, `packaging/` (`.desktop` + icon) |
+| `macos-14` | `aarch64-apple-darwin` | `teamtrim-macos-arm64` | `teamtrim-macos-arm64.zip` (`TeamTrim.app`, ad-hoc signed) + `teamtrim-macos-arm64-cli.zip` (`teamtrim-cli` + docs) |
+| `macos-14` | `x86_64-apple-darwin` | `teamtrim-macos-x86_64` | same layout as `arm64` (the Intel slice is cross-built on the arm64 runner, since the `macos-13` image is retired) |
+| `windows-latest` | `x86_64-pc-windows-msvc` | `teamtrim-windows-x86_64` | `teamtrim-windows-x86_64.zip` — `teamtrim.exe`, `teamtrim-cli.exe`, `LICENSE`, `NOTICE`, `README.md` |
 
 **Triggers**
 

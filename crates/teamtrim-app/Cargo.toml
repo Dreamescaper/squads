@@ -1,0 +1,28 @@
+[package]
+name = "teamtrim-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "TeamTrim — an alternative Microsoft Teams client built with Rust + egui"
+publish = false
+
+[[bin]]
+name = "teamtrim"
+path = "src/main.rs"
+
+[dependencies]
+teamtrim-core.workspace = true
+egui.workspace = true
+eframe.workspace = true
+egui_extras.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# Headless UI testing (works without a display server). The `eframe` feature
+# enables `eframe/accesskit` so the harness can drive an `eframe::App` through
+# AccessKit. It is also what makes `Harness::new_eframe` available.
+egui_kittest = { version = "0.37", features = ["eframe"] }

@@ -1,24 +1,24 @@
-Squads
-Copyright (c) 2026 Squads contributors
+TeamTrim
+Copyright (c) 2026 TeamTrim contributors
 
-Squads is licensed under the MIT License (see LICENSE). That license covers only
-the original Squads code. Third-party components are listed below and remain
-under their own licenses, which are not modified or restricted by Squads.
+TeamTrim is licensed under the MIT License (see LICENSE). That license covers only
+the original TeamTrim code. Third-party components are listed below and remain
+under their own licenses, which are not modified or restricted by TeamTrim.
 
 Vendored source
 ---------------
 
-crates/squads-protocol (library name `ost`)
+crates/teamtrim-protocol (library name `ost`)
   Upstream:  https://github.com/eisbaw/ost
   Via:       https://github.com/mrowlinson/better-teams (rust/ost fork)
   License:   MIT
   Notes:     `eisbaw/ost` is MIT-licensed; its original license text is kept at
-             crates/squads-protocol/LICENSE.
+             crates/teamtrim-protocol/LICENSE.
 
              The better-teams fork's modifications are distributed under the
              "Better Teams License (MIT with Microsoft exclusion)", which is
              preserved verbatim below. The exclusion restricts the Microsoft
-             Corporation and its affiliates only; it does not restrict Squads.
+             Corporation and its affiliates only; it does not restrict TeamTrim.
              Any redistribution of this code must include the exclusion unchanged.
 
 Better Teams License (MIT with Microsoft exclusion)
@@ -57,6 +57,6 @@ Better Teams License (MIT with Microsoft exclusion)
 Trademarks
 ----------
 
-"Microsoft Teams" and "Microsoft" are trademarks of Microsoft Corporation. Squads
+"Microsoft Teams" and "Microsoft" are trademarks of Microsoft Corporation. TeamTrim
 is an independent, unofficial client and is not affiliated with or endorsed by
 Microsoft.

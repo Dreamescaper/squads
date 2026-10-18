@@ -4,18 +4,18 @@
 
 ```
                  ┌───────────────────────┐
-                 │      squads-app        │  egui binary (`squads`)
+                 │      teamtrim-app        │  egui binary (`teamtrim`)
                  │  views, app state,     │
                  │  request_repaint       │
                  └───────────┬───────────┘
                              │  commands / events (channels)
                  ┌───────────▼───────────┐
-                 │      squads-core       │  session, event bus, store, config
+                 │      teamtrim-core       │  session, event bus, store, config
                  │  (no UI, no egui)      │
                  └───────────┬───────────┘
                              │  in-process async API
                  ┌───────────▼───────────┐
-                 │   squads-protocol      │  vendored `ost` (lib name `ost`)
+                 │   teamtrim-protocol      │  vendored `ost` (lib name `ost`)
                  │  auth/api/trouter/     │  auth, chat, files, presence,
                  │  calling/models        │  teams, trouter, calling
                  └───────────────────────┘
@@ -23,7 +23,7 @@
 
 ## Responsibilities
 
-### `squads-protocol` (vendored, lib `ost`)
+### `teamtrim-protocol` (vendored, lib `ost`)
 
 Pure protocol knowledge, no UI. Key modules:
 
@@ -39,9 +39,9 @@ Pure protocol knowledge, no UI. Key modules:
 | `calling` | epconv signalling, SDP, ICE/TURN, SRTP, RTP/RTCP, codecs. |
 | `config`, `models`, `event_hub` | Settings, shared data models, push event fan-out. |
 
-The `squads-cli` binary wraps the library for headless login/testing.
+The `teamtrim-cli` binary wraps the library for headless login/testing.
 
-### `squads-core` (ours)
+### `teamtrim-core` (ours)
 
 Everything the UI needs that is not drawing:
 
@@ -52,9 +52,9 @@ Everything the UI needs that is not drawing:
 - *(M3)* SQLite store + repositories.
 - *(M4)* event bus fed by Trouter.
 
-### `squads-app` (ours, egui)
+### `teamtrim-app` (ours, egui)
 
-- Application state that mirrors `squads-core` and local widget state.
+- Application state that mirrors `teamtrim-core` and local widget state.
 - Views: shell layout (nav rail, chat list, timeline, composer, info panel), login.
 - Theming, keyboard handling, and the async bridge: the core emits events over a channel;
   the UI drains them at the top of each frame and calls `ctx.request_repaint()` only when
@@ -63,11 +63,11 @@ Everything the UI needs that is not drawing:
 ## Data flow (target, M2+)
 
 ```
-user action ─▶ squads-app view ─▶ Command { … } ─▶ squads-core backend (tokio)
+user action ─▶ teamtrim-app view ─▶ Command { … } ─▶ teamtrim-core backend (tokio)
                                                         │
                               ost::api::* / trouter ────┤
                                                         ▼
-                              store write-through ─▶ Event { … } ─▶ squads-app (request_repaint)
+                              store write-through ─▶ Event { … } ─▶ teamtrim-app (request_repaint)
 ```
 
 Views never talk to the network directly; all mutation flows through the core and comes

@@ -14,8 +14,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # One binary is the app; squads-cli is the headless protocol client.
-  BIN_CRATES: "-p squads-app -p squads-protocol"
+  # One binary is the app; teamtrim-cli is the headless protocol client.
+  BIN_CRATES: "-p teamtrim-app -p teamtrim-protocol"
 
 jobs:
   build:
@@ -28,22 +28,22 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             label: linux-x86_64
-            artifact: squads-linux-x86_64
+            artifact: teamtrim-linux-x86_64
           - os: macos-14
             target: aarch64-apple-darwin
             label: macos-arm64
-            artifact: squads-macos-arm64
+            artifact: teamtrim-macos-arm64
           # The Intel slice is cross-built on an Apple-Silicon runner: the
           # `macos-13` (x86_64) image is retired, and the macOS SDK/toolchain on
           # arm64 links x86_64 fine, so no Intel runner is needed.
           - os: macos-14
             target: x86_64-apple-darwin
             label: macos-x86_64
-            artifact: squads-macos-x86_64
+            artifact: teamtrim-macos-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             label: windows-x86_64
-            artifact: squads-windows-x86_64
+            artifact: teamtrim-windows-x86_64
 
     steps:
       - uses: actions/checkout@v4
@@ -103,13 +103,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          STAGE="dist/squads-${{ steps.ver.outputs.version }}-${{ matrix.label }}"
+          STAGE="dist/teamtrim-${{ steps.ver.outputs.version }}-${{ matrix.label }}"
           mkdir -p "$STAGE"
-          cp "target/${{ matrix.target }}/release/squads"        "$STAGE/"
-          cp "target/${{ matrix.target }}/release/squads-cli"    "$STAGE/"
+          cp "target/${{ matrix.target }}/release/teamtrim"        "$STAGE/"
+          cp "target/${{ matrix.target }}/release/teamtrim-cli"    "$STAGE/"
           cp LICENSE NOTICE README.md                            "$STAGE/"
           mkdir -p "$STAGE/packaging"
-          cp packaging/dev.squads.squads.desktop packaging/dev.squads.squads.svg "$STAGE/packaging/"
+          cp packaging/dev.teamtrim.teamtrim.desktop packaging/dev.teamtrim.teamtrim.svg "$STAGE/packaging/"
           tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "$(basename "$STAGE")"
 
       # ---------------------------------------------------------------- macOS
@@ -120,21 +120,21 @@ jobs:
           set -euo pipefail
           VERSION="${{ steps.ver.outputs.version }}"
           REL="target/${{ matrix.target }}/release"
-          APP="dist/Squads.app"
+          APP="dist/TeamTrim.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp "$REL/squads" "$APP/Contents/MacOS/squads"
-          chmod +x "$APP/Contents/MacOS/squads"
-          cp packaging/dev.squads.squads.svg "$APP/Contents/Resources/"
+          cp "$REL/teamtrim" "$APP/Contents/MacOS/teamtrim"
+          chmod +x "$APP/Contents/MacOS/teamtrim"
+          cp packaging/dev.teamtrim.teamtrim.svg "$APP/Contents/Resources/"
 
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-            <key>CFBundleName</key><string>Squads</string>
-            <key>CFBundleDisplayName</key><string>Squads</string>
-            <key>CFBundleIdentifier</key><string>dev.squads.squads</string>
-            <key>CFBundleExecutable</key><string>squads</string>
+            <key>CFBundleName</key><string>TeamTrim</string>
+            <key>CFBundleDisplayName</key><string>TeamTrim</string>
+            <key>CFBundleIdentifier</key><string>dev.teamtrim.teamtrim</string>
+            <key>CFBundleExecutable</key><string>teamtrim</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>${VERSION}</string>
             <key>CFBundleVersion</key><string>${VERSION}</string>
@@ -148,11 +148,11 @@ jobs:
           # needs a Developer ID + notarization (see docs/PACKAGING.md).
           codesign --force --deep --sign - "$APP" || echo "ad-hoc codesign skipped"
 
-          mkdir -p "dist/squads-${VERSION}-${{ matrix.label }}"
-          cp "$REL/squads-cli" LICENSE NOTICE README.md "dist/squads-${VERSION}-${{ matrix.label }}/"
+          mkdir -p "dist/teamtrim-${VERSION}-${{ matrix.label }}"
+          cp "$REL/teamtrim-cli" LICENSE NOTICE README.md "dist/teamtrim-${VERSION}-${{ matrix.label }}/"
           # ditto preserves the bundle structure and resource forks.
           ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/${{ matrix.artifact }}.zip"
-          ( cd "dist/squads-${VERSION}-${{ matrix.label }}" && zip -q -r "../${{ matrix.artifact }}-cli.zip" . )
+          ( cd "dist/teamtrim-${VERSION}-${{ matrix.label }}" && zip -q -r "../${{ matrix.artifact }}-cli.zip" . )
 
       # -------------------------------------------------------------- Windows
       - name: Package (Windows)
@@ -160,10 +160,10 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.ver.outputs.version }}"
-          $stage = "dist/squads-$version-${{ matrix.label }}"
+          $stage = "dist/teamtrim-$version-${{ matrix.label }}"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/squads.exe"     "$stage/"
-          Copy-Item "target/${{ matrix.target }}/release/squads-cli.exe" "$stage/"
+          Copy-Item "target/${{ matrix.target }}/release/teamtrim.exe"     "$stage/"
+          Copy-Item "target/${{ matrix.target }}/release/teamtrim-cli.exe" "$stage/"
           Copy-Item LICENSE, NOTICE, README.md                            "$stage/"
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/${{ matrix.artifact }}.zip" -Force
 

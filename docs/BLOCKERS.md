@@ -15,7 +15,7 @@ tests only; screenshots/manual QA are impossible in this environment.
 
 **Mitigation:** keep UI logic separated from rendering so it can be unit-tested; use
 `egui_kittest` (AccessKit-driven, no display needed) for view/interaction tests; lean on
-`squads-cli` for end-to-end protocol verification; document how a developer runs the GUI
+`teamtrim-cli` for end-to-end protocol verification; document how a developer runs the GUI
 locally.
 
 ### B-002 — No live Microsoft tenant / credentials
@@ -37,7 +37,7 @@ Teams endpoints are undocumented and change without notice. Region routing
 **Impact:** features can break on Microsoft's side independent of our code.
 
 **Mitigation:** reuse the protocol core's existing fallbacks; keep protocol-touching code
-behind `squads-core`; record any known-fragile areas in this file.
+behind `teamtrim-core`; record any known-fragile areas in this file.
 
 ### B-004 — Browser PKCE flow has no loopback listener yet (M1)
 
@@ -59,7 +59,7 @@ PROGRESS "M1 — Authentication").
 The vendored `ost::auth::skype::exchange_skype_token` always uses the protocol
 crate's private shared HTTP client and hard-coded `authsvc` URLs (work + personal
 hosts), so it cannot be redirected to a local stub without modifying
-`crates/squads-protocol` (which is off-limits).
+`crates/teamtrim-protocol` (which is off-limits).
 
 **Impact:** the Skype-ish exchange step is covered only by the fake transport in
 tests; the real HTTP call is exercised only against a live tenant.
@@ -74,7 +74,7 @@ client, add a local stub test.
 `ost::api::list_chats_data` names 1:1 chats without a topic through a second
 pass: a `whoami` call, a per-thread roster read and a history read, memoised in
 a process-global cache keyed by `ost::config::active_profile()` (which defaults
-to `"default"`). `squads-core`'s `ApiClient` does not (yet) set that vendored
+to `"default"`). `teamtrim-core`'s `ApiClient` does not (yet) set that vendored
 active profile, and the extra requests would need several stub endpoints.
 
 **Impact:** the offline `list_chats` tests give every chat a topic, so this
@@ -82,13 +82,13 @@ branch is skipped; only the topic/last-sender/system-label naming is covered
 here. The mate-name path is exercised only against a live tenant.
 
 **Mitigation:** the code path otherwise passes through untouched; M3/M5 should
-decide whether `squads-core` owns mate-name resolution (using its own store)
+decide whether `teamtrim-core` owns mate-name resolution (using its own store)
 rather than relying on the vendored global profile. Once that lands, extend the
 stub to serve `whoami` + roster + history and cover the branch offline.
 
 ### B-007 — Local store keeps chat content unencrypted at rest (M3)
 
-`crates/squads-core`'s SQLite store (`data/store.sqlite`) is **plain
+`crates/teamtrim-core`'s SQLite store (`data/store.sqlite`) is **plain
 `rusqlite`/`bundled`** — no encryption (ADR-011). Accounts, chats and messages
 are written in the clear, including display names, sender MRIs, raw message HTML
 and reaction reactor names. The file is protected only by filesystem/OS-account
@@ -100,7 +100,7 @@ writes fetched image bytes in the clear too.
 Teams content. This is not acceptable for a general release and must be
 revisited (encryption at rest, e.g. SQLCipher, or an encrypted blob column).
 
-**Mitigation:** the storage layer is behind `squads_core::store::Store`, so an
+**Mitigation:** the storage layer is behind `teamtrim_core::store::Store`, so an
 encrypted engine can replace it without touching callers. A future ADR must also
 settle the key source and plaintext→encrypted migration; see ADR-011.
 
@@ -112,26 +112,26 @@ explicit about:
 1. **Call notifications cannot be surfaced from `event_hub`.** The vendored
    `trouter::data_frame_event` *deliberately* filters call frames
    (`NGCallManagerWin` / `SkypeSpacesWeb`) out of the hub, so our
-   `RealtimeEvent` has no call variant and `squads-core` never sees ringing/
+   `RealtimeEvent` has no call variant and `teamtrim-core` never sees ringing/
    invitation events. Calls still take the vendored path (auto-answer unless
    `TEAMS_MANUAL_CALLS` is set).
 
    **Impact:** incoming/ongoing call UI is impossible through the M4 bus.
 
    **Mitigation/deferred (M9 status):** real call signalling landed in **M9**
-   (`squads-core::calls`): the incoming-call parser (`calls::incoming::parse_incoming`)
+   (`teamtrim-core::calls`): the incoming-call parser (`calls::incoming::parse_incoming`)
    and the `CallService::on_notification` seam exist and are tested, and calls
    can be placed/accepted/ended via the vendored epconv path. **The producer is
    still missing**: no `RealtimeEvent` variant can carry a call frame, so
    `on_notification` has nothing feeding it. The recommended fix is a small
-   `squads-protocol` change — stop filtering call frames in
+   `teamtrim-protocol` change — stop filtering call frames in
    `trouter::data_frame_event`, add a call event (or a dedicated call hub), and
    have the M4 collector hand the raw JSON to `on_notification` — plus a
    `TEAMS_MANUAL_CALLS`-style opt-out so the M4 feed and M9 handling do not fight
    over the same frames. Tracked as a follow-up for M10/UI wiring.
 
 2. **`ost::event_hub` is process-global and bounded (1024, oldest dropped).**
-   Every squads-core account (and any other embedder in-process) shares one FIFO.
+   Every teamtrim-core account (and any other embedder in-process) shares one FIFO.
    A full queue silently drops the oldest events, and two collectors would steal
    each other's events.
 
@@ -151,7 +151,7 @@ explicit about:
    **Impact:** without intervention the socket can spin on auth failures during
    backoff (1s…64s).
 
-   **Mitigation:** `squads-core` stops the feed whenever its own token set
+   **Mitigation:** `teamtrim-core` stops the feed whenever its own token set
    changes (`restore`, sign-in completion, `ensure_fresh_tokens`, `sign_out`) and
    the caller must call `Session::start_realtime()` again; the vendored loop
    itself is not restarted with fresh tokens mid-flight. A future M5/M10 wiring
@@ -413,7 +413,7 @@ this environment (no tenant, no devices, no live recorder service):
 
 1. **The real `trouter_surl` is not in `region_gtms`.** It is the callback path
    prefix the negotiated Trouter session returns (`SessionResponse::surl`), which
-   `squads-core` does not own. `CallEndpoints::from_region_gtms` therefore reads
+   `teamtrim-core` does not own. `CallEndpoints::from_region_gtms` therefore reads
    `region_gtms.trouterSurl` (our convention) and falls back to the empty string;
    a caller that needs the real value must `CallSignaller::set_endpoints` after
    negotiating the session. The signalling request shapes are pinned by stub
@@ -499,7 +499,7 @@ Two UI paths are also deliberately incomplete:
 media are not.
 
 **Mitigation:** a developer on a machine with a display should run
-`cargo run -p squads-app` and walk the checklist in `docs/PROGRESS.md` ("M10 —
+`cargo run -p teamtrim-app` and walk the checklist in `docs/PROGRESS.md` ("M10 —
 egui UI → How to run the GUI locally"); wire the picker and real media as
 follow-ups beyond the planned milestones (see B-013).
 
@@ -515,13 +515,13 @@ but three things are deliberately bounded:
    B-011/B-012.
 2. **The notification settings gate *routing*, not *delivery*.** The
    `notifications_enabled` / `notify_only_mentions` switches feed the pure
-   [`route`](../crates/squads-core/src/notifications.rs) and are honoured by the
+   [`route`](../crates/teamtrim-core/src/notifications.rs) and are honoured by the
    app's realtime path, but the default notifier is still a `LogNotifier`: real
    desktop toasts need the default-off `desktop-notifications` feature and a
    session bus (B-010). Quiet hours remain unimplemented.
 3. **Archives are built by CI; installers and signing are not.**
    `.github/workflows/release.yml` now builds a per-platform archive on native
-   runners (Linux `.tar.gz`, macOS `.zip` with an ad-hoc-signed `Squads.app`,
+   runners (Linux `.tar.gz`, macOS `.zip` with an ad-hoc-signed `TeamTrim.app`,
    Windows `.zip`) and attaches them to a GitHub Release on `v*` tags. What is
    still *not* produced or verified: AppImage/Flatpak/MSI, and any real
    signing/notarization (needs Developer ID / Authenticode secrets). The macOS

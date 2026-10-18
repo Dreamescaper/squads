@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=TeamTrim
+GenericName=Microsoft Teams client
+Comment=An alternative, cross-platform Microsoft Teams client built with Rust + egui
+Exec=teamtrim
+Icon=dev.teamtrim.teamtrim
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=teams;chat;messaging;teamtrim;
+StartupNotify=true
+# Must match `ViewportBuilder::with_app_id("dev.teamtrim.teamtrim")` in
+# crates/teamtrim-app/src/main.rs so the compositor associates the window with
+# this entry (and shows the icon / groups the taskbar item).
+StartupWMClass=dev.teamtrim.teamtrim

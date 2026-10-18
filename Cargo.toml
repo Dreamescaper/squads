@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/squads-protocol",
-    "crates/squads-core",
-    "crates/squads-app",
+    "crates/teamtrim-protocol",
+    "crates/teamtrim-core",
+    "crates/teamtrim-app",
 ]
 
 [workspace.package]
@@ -11,11 +11,11 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Dreamescaper/squads"
-authors = ["Squads contributors"]
+authors = ["TeamTrim contributors"]
 
 [workspace.dependencies]
 # Internal crates
-squads-core = { path = "crates/squads-core" }
+teamtrim-core = { path = "crates/teamtrim-core" }
 
 # egui / eframe (immediate-mode, event-driven; glow/OpenGL backend).
 # `accesskit` is enabled so the accessibility tree is built even in the normal
@@ -31,7 +31,7 @@ anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util"] }
 futures = "0.3"
-# HTTP client, pinned to the same version/features as `squads-protocol`
+# HTTP client, pinned to the same version/features as `teamtrim-protocol`
 # (0.11 + native-tls) so the workspace compiles reqwest only once.
 reqwest = { version = "0.11", default-features = false, features = ["json", "native-tls"] }
 

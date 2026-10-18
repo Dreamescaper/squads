@@ -1,4 +1,4 @@
-# Squads — High-Level Plan of Work
+# TeamTrim — High-Level Plan of Work
 
 > An alternative, cross-platform Microsoft Teams client written in **Rust + egui**.
 
@@ -35,12 +35,12 @@ We vendor the `ost` protocol core (MIT, from the better-teams fork, which has fi
 teams patches) as an in-workspace crate, and build two new crates on top. See `docs/DECISIONS.md`.
 
 ```
-squads/
+teamtrim/
 ├── Cargo.toml                # workspace
 ├── crates/
-│   ├── squads-protocol/      # vendored `ost` core (auth, api, trouter, calling, models)
-│   ├── squads-core/          # our session layer: client lifecycle, event bus, store, settings
-│   └── squads-app/           # egui application binary
+│   ├── teamtrim-protocol/      # vendored `ost` core (auth, api, trouter, calling, models)
+│   ├── teamtrim-core/          # our session layer: client lifecycle, event bus, store, settings
+│   └── teamtrim-app/           # egui application binary
 └── docs/                     # this plan + decisions/progress/blockers
 ```
 
@@ -49,7 +49,7 @@ squads/
 Each milestone is an independent work item for the implementation loop: **implement → review → commit → push**.
 
 ### M0 — Workspace & scaffolding
-- Convert repo to a Cargo workspace; add `squads-core` and `squads-app` crates; vendor `squads-protocol`.
+- Convert repo to a Cargo workspace; add `teamtrim-core` and `teamtrim-app` crates; vendor `teamtrim-protocol`.
 - Error types, logging/tracing, config paths, `docs/` skeleton.
 - CI task list (fmt, clippy, test, build) documented; `cargo check` green on Linux.
 - **Exit:** workspace builds; egui window stub launches (headless CI cannot display it).
@@ -63,7 +63,7 @@ Each milestone is an independent work item for the implementation loop: **implem
 ### M2 — Protocol clients & session core
 - Wrap chat service, Graph, presence, CSA and middle-tier clients from the protocol crate.
 - `Session`/`Client` lifecycle, region routing from `regionGtms`, request instrumentation.
-- **Exit:** a `squads-core::Session` can list chats against a fake transport in tests.
+- **Exit:** a `teamtrim-core::Session` can list chats against a fake transport in tests.
 
 ### M3 — Local persistence & offline cache
 - SQLite (rusqlite) schema for accounts, chats, messages, files, settings; migrations.
@@ -72,7 +72,7 @@ Each milestone is an independent work item for the implementation loop: **implem
 
 ### M4 — Realtime (Trouter)
 - Trouter socket.io v1 client (negotiate → session → WSS → registrar), `3:::` ack contract, `message_loss` resync.
-- `EventBus` fan-out into `squads-core` domain events (message, edit, typing, read-state, thread-update, call).
+- `EventBus` fan-out into `teamtrim-core` domain events (message, edit, typing, read-state, thread-update, call).
 - **Exit:** frame decoder unit-tested; reconnect/backoff implemented.
 
 ### M5 — Messaging

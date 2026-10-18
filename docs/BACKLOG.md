@@ -2,7 +2,7 @@
 
 Work items beyond the planned milestones (M0–M13). Derived from the
 protocol-coverage audit in the M13 session: these are the `ost` surfaces that
-`squads-core`/`squads-app` still do not use and that correspond to real,
+`teamtrim-core`/`teamtrim-app` still do not use and that correspond to real,
 user-visible gaps.
 
 Process: **one item at a time** — implement → review → `fmt`/`test`/`build` →
@@ -119,7 +119,7 @@ tabs.
 single-window, clamped to Graph's 25), `Files::search_files` + a `People` service
 returning the new `model::Person`, a global search box on the Files page, and a
 reusable **people picker** overlay (query + async results + multi-select) that
-**B2a** reads via `SquadsApp::selected_people()`. See ADR-037 and PROGRESS (B3).
+**B2a** reads via `TeamTrimApp::selected_people()`. See ADR-037 and PROGRESS (B3).
 
 **Gap.** `api::filesearch` is unused.
 

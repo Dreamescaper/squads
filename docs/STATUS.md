@@ -19,15 +19,15 @@ offline:
 
 | Crate | Role | Tests |
 |---|---|---|
-| `squads-protocol` (vendored `ost`, lib `ost`) | protocol core (auth, api, trouter, calling) | 377 (unchanged) |
-| `squads-core` | session, store, settings, realtime, services | 442 |
-| `squads-app` (`squads` binary) | egui UI | 40 |
+| `teamtrim-protocol` (vendored `ost`, lib `ost`) | protocol core (auth, api, trouter, calling) | 377 (unchanged) |
+| `teamtrim-core` | session, store, settings, realtime, services | 442 |
+| `teamtrim-app` (`teamtrim` binary) | egui UI | 40 |
 
 `cargo build --workspace` and `cargo build --workspace --release` both succeed.
 
 **Release artifacts:** [`.github/workflows/release.yml`](../.github/workflows/release.yml)
 builds a per-platform archive on native runners — Linux `.tar.gz`, macOS `.zip`
-(`Squads.app`, ad-hoc signed, Intel + Apple Silicon) and Windows `.zip` — and
+(`TeamTrim.app`, ad-hoc signed, Intel + Apple Silicon) and Windows `.zip` — and
 attaches them to a GitHub Release on `v*` tags. Installers (AppImage/Flatpak/MSI)
 and real signing/notarization are still manual (B-013, `PACKAGING.md` §6).
 
@@ -150,17 +150,17 @@ channel match).
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --workspace                 # default features, no device/network
-cargo test -p squads-core               # 442
-cargo test -p squads-app                # 40 (headless egui_kittest)
-cargo test -p squads-protocol           # 377
-cargo fmt -p squads-core -p squads-app -- --check
-cargo clippy -p squads-core -p squads-app --all-targets
+cargo test -p teamtrim-core               # 442
+cargo test -p teamtrim-app                # 40 (headless egui_kittest)
+cargo test -p teamtrim-protocol           # 377
+cargo fmt -p teamtrim-core -p teamtrim-app -- --check
+cargo clippy -p teamtrim-core -p teamtrim-app --all-targets
 cargo build --workspace --release
 ```
 
 ### With a display (manual UI QA)
 
-1. `cargo run -p squads-app` (binary `squads`); the login screen appears.
+1. `cargo run -p teamtrim-app` (binary `teamtrim`); the login screen appears.
 2. Sign in (device code) and confirm the shell, chat list and timeline render.
 3. Exercise the M11 shortcuts: `Ctrl/Cmd+K` (quick switcher), `Ctrl/Cmd+F`
    (in-conversation search), `Ctrl/Cmd+Shift+F` (search all messages — B1),
@@ -170,7 +170,7 @@ cargo build --workspace --release
    `Ctrl/Cmd+Enter` (send).
 4. In **Settings**, switch the theme to Light and pick an accent; toggle compact
    mode and the notification switches; set a download folder. Restart and confirm
-   the choices persist (`~/.config/squads/settings.json`).
+   the choices persist (`~/.config/teamtrim/settings.json`).
 5. On **Files**, type a filename into the search box and confirm the global
    OneDrive results render and download; clear it to return to the chat's files.
    On **Search**, press **Find people**, search a colleague's name and select one

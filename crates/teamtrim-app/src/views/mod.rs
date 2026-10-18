@@ -1,0 +1,21 @@
+//! The egui screens (milestone **M10**).
+//!
+//! One module per screen. Every view is a function taking `&mut TeamTrimApp` and
+//! `&mut egui::Ui`; it reads state through the app's accessors and records user
+//! intent with [`TeamTrimApp::push_action`]. Nothing here talks to the network or
+//! mutates the core directly — [`crate::app::TeamTrimApp::apply_actions`] runs
+//! after the frame is drawn.
+
+pub mod calendar;
+pub mod call;
+pub mod chat_list;
+pub mod composer;
+pub mod conversation;
+pub mod files;
+pub mod login;
+pub mod people_picker;
+pub mod quick_switcher;
+pub mod search;
+pub mod settings;
+pub mod shell;
+pub mod teams;

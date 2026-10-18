@@ -24,8 +24,8 @@ Two Rust implementations exist and are MIT-licensed:
   middle-tier routing, plus `lib.rs` exposing the modules as a reusable library.
 
 **Decision.** Vendor the `better-teams` fork of `ost` into this repository as
-`crates/squads-protocol` (package `squads-protocol`, library name `ost`, MIT). Build our
-own cross-platform UI (`squads-app`) and session/orchestration layer (`squads-core`) on
+`crates/teamtrim-protocol` (package `teamtrim-protocol`, library name `ost`, MIT). Build our
+own cross-platform UI (`teamtrim-app`) and session/orchestration layer (`teamtrim-core`) on
 top of it.
 
 **Consequences.**
@@ -38,7 +38,7 @@ top of it.
   macOS-only).
 - Licensing: `ost` is MIT. The better-teams-derived patches carry an
   "MIT with Microsoft exclusion" notice, preserved verbatim in
-  `crates/squads-protocol/LICENSE` and `NOTICE`. We are not Microsoft, so the exclusion
+  `crates/teamtrim-protocol/LICENSE` and `NOTICE`. We are not Microsoft, so the exclusion
   does not restrict us; it must be redistributed unchanged.
 
 ---
@@ -52,13 +52,13 @@ making it hard to test the non-UI half and to keep compile times sane.
 
 **Decision.** A workspace with:
 
-- `crates/squads-protocol` — vendored protocol core (lib `ost`) + `squads-cli` binary.
-- `crates/squads-core` — session lifecycle, config paths, event bus, local store.
-- `crates/squads-app` — the egui application (`squads` binary).
+- `crates/teamtrim-protocol` — vendored protocol core (lib `ost`) + `teamtrim-cli` binary.
+- `crates/teamtrim-core` — session lifecycle, config paths, event bus, local store.
+- `crates/teamtrim-app` — the egui application (`teamtrim` binary).
 
 **Consequences.**
 
-- `squads-core` is unit-testable without a display or UI framework.
+- `teamtrim-core` is unit-testable without a display or UI framework.
 - The protocol crate's CLI binary is deliberately kept: in a headless environment it is
   the only way to exercise real authentication and API calls from the terminal.
 - Shared dependency versions live in `[workspace.dependencies]`.
@@ -96,7 +96,7 @@ model: `Application::new().run`, `cx.new`, `Entity<T>`, `Render`/`RenderOnce`, `
 egui/eframe has no async executor at all — the update loop is synchronous — so background
 work must live elsewhere regardless.
 
-**Decision.** `squads-core` owns a multi-threaded tokio runtime on its own thread (the
+**Decision.** `teamtrim-core` owns a multi-threaded tokio runtime on its own thread (the
 "backend"), like `zapfast`. UI→core commands and core→UI events travel over channels; the
 UI drains incoming events at the top of each frame and requests a repaint when the event
 stream produced anything. Tokio `mpsc` receivers are executor-agnostic, so a small bridge
@@ -124,7 +124,7 @@ write-through; the UI reads from the store.
 
 **Consequences.**
 
-- Requires a schema/migration discipline and a repository abstraction in `squads-core`.
+- Requires a schema/migration discipline and a repository abstraction in `teamtrim-core`.
 - Enables offline browsing, fast startup and cross-account search.
 
 ---
@@ -159,8 +159,8 @@ GPU-only baseline.
 - Trade-off: immediate-mode layout is less "declarative"; complex virtualized lists need
   hand-rolled height caching (as `zapfast` does).
 
-**Note.** Crate graph, the UI-free `squads-core`, and all protocol work are unaffected —
-only `squads-app` and this document change.
+**Note.** Crate graph, the UI-free `teamtrim-core`, and all protocol work are unaffected —
+only `teamtrim-app` and this document change.
 
 ---
 
@@ -244,16 +244,16 @@ because it cannot be verified in this environment.
 
 ## ADR-010 — Vendored `ost` embedding patch: `TeamsClient::from_config` and runtime base URLs
 
-**Status:** accepted (M2) — a small, already-applied patch to `crates/squads-protocol`
+**Status:** accepted (M2) — a small, already-applied patch to `crates/teamtrim-protocol`
 
 **Context.** ADR-001 says we **wrap** the vendored `ost` core instead of
 reimplementing it. M2 needs to drive its chat client from *our* token store and
-against a local fake, but upstream's `TeamsClient` was built for the `squads-cli`
+against a local fake, but upstream's `TeamsClient` was built for the `teamtrim-cli`
 binary:
 
 - `new()` / `new_for_profile()` load `config.toml` from disk and may kick off an
   AAD refresh via `ost::auth::oauth::refresh_for` — neither of which we want in
-  `squads-core` (we own tokens and refresh in M1/M2).
+  `teamtrim-core` (we own tokens and refresh in M1/M2).
 - The regional base URLs (`graphBase`, `csaBase`, `middleTier`, `chatService`,
   `chatServiceAggregator`) were read from `region_gtms` only under `#[cfg(test)]`,
   so an embedder could not route through a stub or honour `authsvc`'s regional
@@ -266,7 +266,7 @@ unpatchable would make M2's exit criterion (offline `list_chats` against a fake)
 impossible.
 
 **Decision.** Apply a minimal embedding patch to the vendored crate (three
-changes, no behaviour change for `squads-cli`):
+changes, no behaviour change for `teamtrim-cli`):
 
 1. `TeamsClient::from_config(config: ost::config::Config) -> TeamsClient` — a
    **public** constructor that builds a client from an in-memory config, with no
@@ -280,14 +280,14 @@ changes, no behaviour change for `squads-cli`):
 
 **Consequences.**
 
-- `squads-core` can own the client lifecycle: `tokens_to_config` maps our
+- `teamtrim-core` can own the client lifecycle: `tokens_to_config` maps our
   `TokenSet` into `ost::config::Config`, and `ApiClient` wraps the client built
   with `from_config`. Token refresh stays in our M1 `AuthDriver`.
 - Region routing becomes a first-class, testable feature: the M2 exit-criterion
   test points `region_gtms.csaBase` at a local TCP stub and asserts parsed
   chats, with no live tenant.
 - The patch is intentionally tiny and upstream-compatible: `new()` /
-  `new_for_profile()` still behave exactly as before, so `squads-cli` is
+  `new_for_profile()` still behave exactly as before, so `teamtrim-cli` is
   unaffected. `docs/PROGRESS.md` records it as a vendored divergence to
   re-apply if the crate is ever re-vendored.
 - Caveat: `graph_base()` / `csa_base()` remain private / `pub(crate)`, so our
@@ -319,7 +319,7 @@ database key has the same problem *plus* a bootstrapping problem: where does the
 key come from on first run, and how is it recovered if the keyring is absent?
 
 **Decision.** Use **plain `rusqlite` with `bundled`** for M3. Do **not** add
-SQLCipher yet. Keep the storage layer behind `squads_core::store::Store` so the
+SQLCipher yet. Keep the storage layer behind `teamtrim_core::store::Store` so the
 engine is an implementation detail that can change without touching callers.
 
 **Consequences.**
@@ -380,13 +380,13 @@ module docs.
 **Status:** accepted (M4)
 
 **Context.** M4 needs live Teams events (new message, edit, delete, typing,
-read-state, thread updates) in `squads-core`. The vendored protocol crate already
+read-state, thread updates) in `teamtrim-core`. The vendored protocol crate already
 implements Trouter end to end — socket.io v1 over WSS negotiate → session →
 WebSocket → registrar, the `3:::` ack contract, gzip/base64 payload unwrapping,
 and reconnect with exponential backoff (1s…64s). It exposes:
 
 - `ost::trouter::connect_and_run_with_config(config: Option<Config>)`, a new
-  SQUADS PATCH entry point that runs forever and reuses an injected in-memory
+  TEAMTRIM PATCH entry point that runs forever and reuses an injected in-memory
   `Config` (built by our M2 `tokens_to_config`) across reconnects;
 - `ost::trouter::data_frame_event(payload) -> Option<String>`, which decodes one
   `3:::` data frame into the pushed chat-service event JSON and **deliberately
@@ -395,9 +395,9 @@ and reconnect with exponential backoff (1s…64s). It exposes:
   `drain` / `drain_wait` that the frame handler feeds.
 
 The question was whether to (a) wrap that loop, (b) fork the socket layer into
-`squads-core`, or (c) reconnect through a different embedding API.
+`teamtrim-core`, or (c) reconnect through a different embedding API.
 
-**Decision.** **Wrap it (a).** `squads-core` does not touch the socket layer:
+**Decision.** **Wrap it (a).** `teamtrim-core` does not touch the socket layer:
 
 1. `RealtimeService::start` spawns `connect_and_run_with_config(Some(cfg))` on a
    caller-provided tokio runtime, with `cfg = tokens_to_config(current TokenSet)`.
@@ -412,7 +412,7 @@ The question was whether to (a) wrap that loop, (b) fork the socket layer into
 
 We chose the `event_hub` **polling** bridge (rather than, say, having the
 vendored loop call a callback) because `event_hub` is the crate's existing
-embedder boundary, it needs no further patch to `squads-protocol`, and it lets
+embedder boundary, it needs no further patch to `teamtrim-protocol`, and it lets
 the collector live on the core's runtime independent of the connection task.
 `decode` is pure and total, so unknown wire shapes never panic and never silently
 vanish: they become `RealtimeEvent::Unknown { resource_type, raw }`, which keeps
@@ -436,7 +436,7 @@ the raw JSON.
   handling stays in the vendored path (auto-answer unless `TEAMS_MANUAL_CALLS`)
   and is deferred to M9 — recorded as B-008.
 - The vendored loop reuses one `Config` across reconnects, so a reconnect after
-  the access tokens expire carries stale credentials; `squads-core` stops the
+  the access tokens expire carries stale credentials; `teamtrim-core` stops the
   feed whenever its own token set changes (restore/sign-in/refresh/sign-out) and
   the caller restarts it — the residual gap is recorded as B-008.
 
@@ -500,7 +500,7 @@ risk is drift: two slightly different strip implementations, or a hand-rolled
 outgoing-HTML builder that disagrees with the wire.
 
 **Decision.** Move the HTML⇄text helpers into one documented module,
-`crates/squads-core/src/text.rs` (`strip_html`, `html_escape`), and reuse it
+`crates/teamtrim-core/src/text.rs` (`strip_html`, `html_escape`), and reuse it
 from `realtime::event` and `messaging`. `strip_html` keeps the vendored
 spacing-aware rules (block-tag boundaries become one space, inline tags vanish,
 common entities decoded) and is unit-tested for entities, nested tags, `<pre>`,
@@ -607,10 +607,10 @@ not uniformly accept channel-shaped calls:
   exception: the vendored `create_channel_data` still posts to Graph
   (`POST /teams/{id}/channels`).
 
-Reimplementing any of these in `squads-core` would violate ADR-001 and duplicate
+Reimplementing any of these in `teamtrim-core` would violate ADR-001 and duplicate
 fragile, reverse-engineered shapes.
 
-**Decision.** `squads-core` **wraps** the vendored calls and makes the routing
+**Decision.** `teamtrim-core` **wraps** the vendored calls and makes the routing
 explicit at the `ApiClient` / `Teams` boundary:
 
 1. **Chat service** — `ApiClient::{send_message, read_messages_page,
@@ -722,7 +722,7 @@ posts the uploaded item into the chat as a `reference` attachment message
 vendored `download_file_data` **buffers the whole response body** into memory
 and only then writes the file.
 
-**Decision.** `squads-core` **wraps** the vendored transport unchanged and makes
+**Decision.** `teamtrim-core` **wraps** the vendored transport unchanged and makes
 the split explicit:
 
 1. `ApiClient::upload_file(chat_id, local_path, progress)` and
@@ -950,9 +950,9 @@ round-trip, with no network, auth or hardware.
 2. Ship `LoopbackMedia` as the **default, always-compiled** implementation: it
    wraps `macav::call_dry_run()` (backing the exit-criterion test) and
    loop-backs PCMU frames for the send/receive contract.
-3. Put real capture/playback behind **default-off** `squads-core` features that
-   forward to the vendored ones: `audio` → `squads-protocol/audio` (`AudioMedia`)
-   and `video-capture` → `squads-protocol/video-capture` (`VideoMedia`). The
+3. Put real capture/playback behind **default-off** `teamtrim-core` features that
+   forward to the vendored ones: `audio` → `teamtrim-protocol/audio` (`AudioMedia`)
+   and `video-capture` → `teamtrim-protocol/video-capture` (`VideoMedia`). The
    default build and default tests need no ALSA or SDL2, exactly as with the OS
    keyring (ADR-008) and desktop notifications (ADR-022).
 4. `VideoMedia` is a **documented placeholder**: it compiles under the feature but
@@ -1023,7 +1023,7 @@ mutating shared state mid-layout.
 
 **Decision.**
 
-1. `squads-app::runtime::AppRuntime` owns a multi-threaded `tokio::runtime::Runtime`
+1. `teamtrim-app::runtime::AppRuntime` owns a multi-threaded `tokio::runtime::Runtime`
    and an unbounded `tokio::sync::mpsc` channel of `AppEvent`s. `spawn(future)`
    runs a future that resolves to one `AppEvent` and sends it back;
    `spawn_task(future)` runs a fire-and-forget task that publishes through a
@@ -1035,8 +1035,8 @@ mutating shared state mid-layout.
    the borrow checker is never fought: `dispatch` clones the `Arc`, moves the
    owned arguments into the `async move` block, and returns.
 3. **UI → Action → apply** (the pattern `zapfast` documents): a view only reads
-   state through `SquadsApp` accessors and records intent with
-   `SquadsApp::push_action(Action::…)`. After the frame is drawn,
+   state through `TeamTrimApp` accessors and records intent with
+   `TeamTrimApp::push_action(Action::…)`. After the frame is drawn,
    `apply_actions()` drains the queue, logs each action and calls `dispatch`,
    which either mutates local view state or spawns the backend call. Views never
    call the network and never mutate shared state beyond local widget state.
@@ -1046,7 +1046,7 @@ mutating shared state mid-layout.
 - One runtime per app (multi-account ready, ADR-004); the UI thread never blocks
   and never awaits.
 - Actions are inspectable: the applied log
-  (`SquadsApp::applied_actions`) is what the headless tests assert against, so a
+  (`TeamTrimApp::applied_actions`) is what the headless tests assert against, so a
   widget's contract is testable without a backend.
 - The bridge is executor-agnostic in both directions: the UI drains a channel it
   does not block on, and background tasks only send.
@@ -1111,7 +1111,7 @@ and deterministic (B-002: no tenant).
    for text fields, plain text for buttons/checkboxes), so
    `harness.get_by_label("…")` finds it and the harness's accessibility check
    passes.
-3. Construct the app for tests with `SquadsApp::headless(..)`: an in-memory
+3. Construct the app for tests with `TeamTrimApp::headless(..)`: an in-memory
    `Store` seeded directly, a `Session` on a `MemoryTokenStore`, and **no
    services, no network tasks and no realtime**. The shell is shown whenever the
    injected session reports `Ready`; everything rendered comes from the store.
@@ -1148,13 +1148,13 @@ means what* and *what the app does about it* — and mixing them (e.g. reading
 
 **Decision.**
 
-1. `crates/squads-app/src/shortcuts.rs` owns the mapping:
+1. `crates/teamtrim-app/src/shortcuts.rs` owns the mapping:
    `resolve(key: egui::Key, modifiers: egui::Modifiers) -> Option<Shortcut>`.
    It is **pure and total** — it looks only at the key and modifiers, never at
    app state — and is unit-tested directly with hand-built `Modifiers`.
 2. Cross-platform `Ctrl`/`Cmd` is expressed with `Modifiers::command` alone
    (egui sets it to `ctrl` off macOS and to ⌘ on it).
-3. `SquadsApp` owns the **dispatch**: `handle_shortcuts` reads the raw
+3. `TeamTrimApp` owns the **dispatch**: `handle_shortcuts` reads the raw
    `egui::Event::Key { pressed: true, .. }` events from the input state and
    calls `apply_shortcut`, which turns each `Shortcut` into a queued `Action`
    (reusing the M10 action pipeline). Plain `j`/`k`/arrows are ignored while a
@@ -1216,7 +1216,7 @@ clamped by `Settings::effective_font_scale` rather than trusted.
 **Status:** accepted (M11)
 
 **Context.** M11 adds CI. The workspace contains the vendored
-`squads-protocol` crate, which carries **pre-existing warnings and its own
+`teamtrim-protocol` crate, which carries **pre-existing warnings and its own
 formatting** that we must not fail on (and must not "fix", per ADR-001 — the
 vendored source is kept close to upstream). Our own crates also carry a few
 **intentional** lints (the `manual_async_fn` warnings on the ADR-007
@@ -1225,9 +1225,9 @@ wrong.
 
 **Decision.** `.github/workflows/ci.yml` runs on push/PR:
 
-1. `cargo fmt -p squads-core -p squads-app -- --check` — formatting for **our
+1. `cargo fmt -p teamtrim-core -p teamtrim-app -- --check` — formatting for **our
    crates only**.
-2. `cargo clippy -p squads-core -p squads-app --all-targets` — lint our crates,
+2. `cargo clippy -p teamtrim-core -p teamtrim-app --all-targets` — lint our crates,
    **without** `-D warnings` (pre-existing/intentional lints are reported, not
    fatal).
 3. `cargo test --workspace` — the whole suite (including the vendored 377).
@@ -1262,8 +1262,8 @@ is fragile and would still not validate the platform's own linker/signing story.
 **native runners**:
 
 - `ubuntu-latest` → `x86_64-unknown-linux-gnu` → `.tar.gz`
-- `macos-14` → `aarch64-apple-darwin` → `.zip` (`Squads.app`)
-- `macos-14` → `x86_64-apple-darwin` → `.zip` (`Squads.app`); the Intel slice
+- `macos-14` → `aarch64-apple-darwin` → `.zip` (`TeamTrim.app`)
+- `macos-14` → `x86_64-apple-darwin` → `.zip` (`TeamTrim.app`); the Intel slice
   is cross-built on the arm64 runner because GitHub retired the `macos-13`
   (x86_64) image
 - `windows-latest` → `x86_64-pc-windows-msvc` → `.zip`
@@ -1370,7 +1370,7 @@ is off-limits.
 
 **Status:** accepted (M13)
 
-**Context.** M3 gave [`Message`](../crates/squads-core/src/model.rs) a
+**Context.** M3 gave [`Message`](../crates/teamtrim-core/src/model.rs) a
 `mark_own(self_mri)` helper precisely because `MessageInfo` cannot know who the
 signed-in user is, and M5's optimistic paths set `is_own = true` directly. But
 **nothing ever obtained the MRI**: `ost::api::me::whoami_data` and
@@ -1417,7 +1417,7 @@ had to be settled: how the identity is obtained and cached, and *where* the
   (additive; the store's key and every other table are unchanged). B-007 still
   applies: the MRI/OID join chat content in the plaintext store.
 - The self MRI is captured when the realtime feed starts; a whoami that resolves
-  afterwards restarts the feed (`SquadsApp::restart_realtime`) rather than
+  afterwards restarts the feed (`TeamTrimApp::restart_realtime`) rather than
   mutating a running collector, mirroring the existing token-change behaviour
   (B-008).
 - The real whoami response and the live own-side rendering remain unverified
@@ -1434,7 +1434,7 @@ timeline rendered only `Message::content` (HTML-stripped text), so images and
 GIFs never appeared. `ost::api::media` (`fetch_media_data` / `needs_auth` /
 `auth_headers`) already knows how to fetch them — Microsoft media hosts
 (`*.msg.teams.microsoft.com`, `*.asm.skype.com`, …) authenticate with the Skype
-token; public hosts must fetch **without** it — but nothing in `squads-core`
+token; public hosts must fetch **without** it — but nothing in `teamtrim-core`
 used it, and the vendored `fetch_media_data` refuses non-`https` URLs, which
 makes it untestable against a local stub. Two questions: how URLs are extracted
 from the raw body, and how bytes are fetched/cached and rendered.
@@ -1458,7 +1458,7 @@ from the raw body, and how bytes are fetched/cached and rendered.
    client is injectable (`with_client`), which is what makes the auth-header
    rule and the cache-hit property testable against a local stub. Writes are
    atomic and capped at `MAX_BYTES`.
-3. **Rendering rides the existing bridge.** `squads-app` adds `egui_extras`
+3. **Rendering rides the existing bridge.** `teamtrim-app` adds `egui_extras`
    (feature `image`) and installs its loaders in `theme::install`; the
    conversation view renders each extracted URL as an `egui::Image` from the
    cached `file://` path (bounded to 320×320) or a labelled placeholder, and
@@ -1514,7 +1514,7 @@ the better default.
    used** even though bundled SQLite ships it: `LIKE` gives the substring and
    literal-wildcard semantics the UI wants with no tokenizer, no external-content
    table and no write-path triggers to keep in sync, and the store is small.
-3. **`Search` service** (`squads_core::search`) holds the shared `Arc<Store>`
+3. **`Search` service** (`teamtrim_core::search`) holds the shared `Arc<Store>`
    and an **optional** `Arc<ApiClient>`. `Search::local` is synchronous and
    offline (resolves each hit's chat name and builds a snippet); `Search::server`
    is the async Graph path; `Search::search` is local-first and only falls back
@@ -1551,7 +1551,7 @@ the better default.
 - The jump-to-message highlight pulls one older page per event; a match older
   than the fetched chain is reported (a toast), not missed silently.
 - No encryption change: a search exposes cached content in-process only (B-007).
-- `crates/squads-protocol` is untouched; the search surface was already
+- `crates/teamtrim-protocol` is untouched; the search surface was already
   re-exported by `ost::api`.
 
 ---
@@ -1600,7 +1600,7 @@ store and the UI must not touch (the M3 model rule).
    `chat_id = None`), so a searched file can be downloaded, without ever
    stealing a chat association (`COALESCE` protects it).
 4. **The people-picker contract (for B2a).** The picker is a self-contained
-   component whose *state* lives on `SquadsApp`, whose *intents* are `Action`s,
+   component whose *state* lives on `TeamTrimApp`, whose *intents* are `Action`s,
    and whose *result* is one accessor:
    - state: `people_query`, `people_results`, `people_selected`,
      `people_loading`, `people_picker_open`;
@@ -1608,7 +1608,7 @@ store and the UI must not touch (the M3 model rule).
      (add/remove one), `ClearPeopleSelection`, `TogglePeoplePicker` (open/close);
    - async delivery: `AppEvent::PeopleResults { query, people }` (stale responses
      for a changed query are dropped);
-   - **result:** `SquadsApp::selected_people() -> &[Person]`.
+   - **result:** `TeamTrimApp::selected_people() -> &[Person]`.
    B2a therefore opens the picker, lets the user pick, reads
    `selected_people()` (one person → a 1:1, several → a group chat), then clears
    with `ClearPeopleSelection`. `Esc` (through `CloseOverlays`) closes the picker
@@ -1631,7 +1631,7 @@ store and the UI must not touch (the M3 model rule).
 - No schema change and no encryption change: directory people are never
   persisted; a search hit is in-process only (B-007 still covers the files cache).
 - B2a's dependency is a **one-accessor contract**, so the picker can be reused
-  (e.g. an "add member" flow) without touching `squads-core`.
+  (e.g. an "add member" flow) without touching `teamtrim-core`.
 
 ---
 
@@ -1663,7 +1663,7 @@ ones:
   `historyHiddenTime` pair, with unhide writing a `null` `unpinnedTime`. Graph
   `hideForUser`/`unhideForUser` need `Chat.ReadWrite`, which the token lacks.
 - **Local mute already exists.** M8 persists `chats.muted` and
-  [`route`](../crates/squads-core/src/notifications.rs) honours it — it is the
+  [`route`](../crates/teamtrim-core/src/notifications.rs) honours it — it is the
   **notification-routing source of truth** (ADR-021), and B2a must not break it.
 
 **Decision.**
@@ -2000,7 +2000,7 @@ The vendored surfaces:
    re-entrant, a newer `user_version` still a hard error.
 5. **Download reuses the M7 path.** `Recordings::download` /
    `download_transcript` project the entry onto a `FileEntry` and call
-   [`Files::download`](../crates/squads-core/src/files.rs), so the buffered
+   [`Files::download`](../crates/teamtrim-core/src/files.rs), so the buffered
    transfer and the coarse `(0, size)`/`(written, size)` progress reporting are
    exactly the M7 ones (ADR-020); a drive-less item is rejected before any
    network with the same guard.

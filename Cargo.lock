@@ -4306,83 +4306,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "squads-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "eframe",
- "egui",
- "egui_extras",
- "egui_kittest",
- "squads-core",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "squads-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "chrono",
- "directories 6.0.0",
- "futures",
- "getrandom 0.2.17",
- "notify-rust",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "squads-protocol",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "squads-protocol"
-version = "0.1.0"
-dependencies = [
- "aes",
- "anyhow",
- "base64 0.22.1",
- "chrono",
- "clap",
- "cpal",
- "ctr",
- "directories 5.0.1",
- "flate2",
- "futures",
- "getrandom 0.2.17",
- "hmac",
- "home",
- "md5",
- "oauth2",
- "openh264",
- "reqwest",
- "sdl2",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "thiserror 1.0.69",
- "tokio",
- "tokio-test",
- "tokio-tungstenite",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "v4l",
-]
-
-[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4475,6 +4398,83 @@ dependencies = [
  "thiserror 2.0.21",
  "windows 0.62.2",
  "windows-version",
+]
+
+[[package]]
+name = "teamtrim-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "egui_kittest",
+ "teamtrim-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "teamtrim-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "directories 6.0.0",
+ "futures",
+ "getrandom 0.2.17",
+ "notify-rust",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "teamtrim-protocol",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "teamtrim-protocol"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "cpal",
+ "ctr",
+ "directories 5.0.1",
+ "flate2",
+ "futures",
+ "getrandom 0.2.17",
+ "hmac",
+ "home",
+ "md5",
+ "oauth2",
+ "openh264",
+ "reqwest",
+ "sdl2",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tokio-tungstenite",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "v4l",
 ]
 
 [[package]]

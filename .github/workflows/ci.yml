@@ -41,15 +41,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Lint and format only our crates. The vendored `squads-protocol` crate
+      # Lint and format only our crates. The vendored `teamtrim-protocol` crate
       # has pre-existing warnings (and its own formatting); we neither fix nor
       # fail on those here. Clippy runs without `-D warnings` on purpose: our
       # crates also carry a few intentional `manual_async_fn` lints (ADR-007).
       - name: Format (our crates)
-        run: cargo fmt -p squads-core -p squads-app -- --check
+        run: cargo fmt -p teamtrim-core -p teamtrim-app -- --check
 
       - name: Clippy (our crates)
-        run: cargo clippy -p squads-core -p squads-app --all-targets
+        run: cargo clippy -p teamtrim-core -p teamtrim-app --all-targets
 
       - name: Test (workspace)
         run: cargo test --workspace

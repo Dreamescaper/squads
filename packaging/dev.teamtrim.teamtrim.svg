@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TeamTrim app icon (placeholder, SVG). A rounded blue tile with a chat bubble and
+  an "S". Installed as `dev.teamtrim.teamtrim` so the .desktop entry finds it (see
+  docs/PACKAGING.md). Replace with real artwork before a public release.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="TeamTrim">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5b8def"/>
+      <stop offset="1" stop-color="#3b5bdb"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="48" fill="url(#tile)"/>
+  <path d="M64 84h128a16 16 0 0 1 16 16v72a16 16 0 0 1-16 16H116l-36 28v-28H64a16 16 0 0 1-16-16v-72a16 16 0 0 1 16-16z"
+        fill="#ffffff" opacity="0.95"/>
+  <text x="128" y="164" font-family="Helvetica, Arial, sans-serif" font-size="88"
+        font-weight="700" fill="#3b5bdb" text-anchor="middle">S</text>
+</svg>
