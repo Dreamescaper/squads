@@ -15,6 +15,10 @@ B5.
 
 Legend: ⬜ not started · 🟡 in progress · ✅ done · 🚫 won't do (documented)
 
+**Backlog complete.** Every item (B1–B5) has landed; the only remaining entry,
+**B6**, is an explicit *not planned* list. See [`PROGRESS.md`](PROGRESS.md) for
+the per-item history.
+
 ---
 
 ## B1 — Message search ✅
@@ -159,7 +163,22 @@ management.
 
 ---
 
-## B5 — Recordings & transcripts ⬜
+## B5 — Recordings & transcripts ✅
+
+**Landed.** `api` wrappers for `list_recordings_data` / `search_recordings_data`
+and `list_transcripts_data` / `search_transcripts_data` (+ the pure helpers
+re-exported: `recordings_children_path`/`recordings_search_path`/
+`is_recording_video`/`sort_recordings_newest`/`recordings_clamp_limit`/
+`RECORDINGS_MAX_LIMIT`/`parse_recordings_response` and the transcript
+equivalents); owned `model::{Recording, Transcript, RecordingSource}` with
+`is_video`, duration and the OneDrive-vs-channel source; a `Recordings` service
+(the vendored lane is **global** — `recordings_for_chat` keeps the OneDrive rows,
+`recordings_for_channel` the channel rows matched by cached display name, plus
+the search variants and `download` reusing the M7 `Files` path); **schema v12**
+(`recordings`, `transcripts`, keyed `(id, profile)` with an optional owning
+`scope`); `Session::recordings()`; and the app's **Recordings & transcripts**
+panel in the conversation info pane (name/source/date/size/duration + Download,
+empty/loading states). See ADR-041 and PROGRESS (B5).
 
 **Gap.** `api::recordings` and `api::transcripts` are unused, so meeting
 recordings/transcripts cannot be listed or opened even though the call layer can

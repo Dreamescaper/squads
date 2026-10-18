@@ -17,7 +17,7 @@ use egui_kittest::kittest::Queryable;
 use squads_core::auth::MemoryTokenStore;
 use squads_core::model::{
     Channel, ChatFolder, FileEntry, Identity, Meeting, Message, Person, PinnedMessage, PublicTeam,
-    SendState, TeamMember,
+    Recording, RecordingSource, SendState, TeamMember, Transcript,
 };
 use squads_core::{AppDirs, Chat, Session, SessionState, Settings, Store, Team};
 
@@ -1330,6 +1330,124 @@ fn channel_message_reactions_queue_the_channel_lane() {
                 if conversation_id == channel && message_id == "m1" && emoji == "👍" && !remove && !is_reply
         )),
         "expected a ReactInChannel action; got {:?}",
+        harness.state().applied_actions()
+    );
+}
+
+// ----- B5: recordings & transcripts ------------------------------------------
+
+fn recording(id: &str, name: &str) -> Recording {
+    Recording {
+        id: id.into(),
+        name: name.into(),
+        size: 48211,
+        mime: Some("video/mp4".into()),
+        web_url: None,
+        download_url: None,
+        drive_id: Some("D1".into()),
+        created: None,
+        modified: Some("2026-09-24T10:00:00Z".into()),
+        duration_ms: Some(3723000),
+        is_video: true,
+        source: RecordingSource::OneDrive,
+    }
+}
+
+fn transcript(id: &str, name: &str) -> Transcript {
+    Transcript {
+        id: id.into(),
+        name: name.into(),
+        size: 4211,
+        mime: Some("text/vtt".into()),
+        web_url: None,
+        drive_id: Some("D1".into()),
+        created: None,
+        modified: Some("2026-09-24T10:00:00Z".into()),
+        source: RecordingSource::OneDrive,
+    }
+}
+
+#[test]
+fn recordings_panel_renders_entries_and_download_queues() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+        store
+            .upsert_recordings("default", Some("c1"), &[recording("r1", "Weekly Sync.mp4")])
+            .expect("recordings");
+        store
+            .upsert_transcripts(
+                "default",
+                Some("c1"),
+                &[transcript("t1", "Weekly Sync.vtt")],
+            )
+            .expect("transcripts");
+    });
+    harness.run();
+
+    // Open the chat and its info pane.
+    harness.get_by_label("Alice").click();
+    harness.run();
+    harness.get_by_label("Info").click();
+    harness.run();
+
+    // The seeded recording and transcript render with their names.
+    harness.get_by_label("Recordings & transcripts");
+    harness.get_by_label("Weekly Sync.mp4");
+    harness.get_by_label("Weekly Sync.vtt");
+
+    // Downloading each queues the matching action (headless has no service, but
+    // the intent is recorded through the action pipeline).
+    harness.get_by_label("Download recording").click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .applied_actions()
+            .iter()
+            .any(|action| matches!(action, Action::DownloadRecording { id } if id == "r1")),
+        "expected a DownloadRecording action; got {:?}",
+        harness.state().applied_actions()
+    );
+
+    harness.get_by_label("Download transcript").click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .applied_actions()
+            .iter()
+            .any(|action| matches!(action, Action::DownloadTranscript { id } if id == "t1")),
+        "expected a DownloadTranscript action; got {:?}",
+        harness.state().applied_actions()
+    );
+}
+
+#[test]
+fn recordings_panel_refresh_queues_an_action() {
+    let (mut harness, _store) = app_harness(|store| {
+        store
+            .upsert_chats("default", &[chat("c1", "Alice")])
+            .expect("chats");
+    });
+    harness.run();
+    harness.get_by_label("Alice").click();
+    harness.run();
+    harness.get_by_label("Info").click();
+    harness.run();
+
+    // The empty state renders, and Refresh queues the fetch action.
+    harness.get_by_label("No recordings or transcripts.");
+    harness.get_by_label("Refresh recordings").click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .applied_actions()
+            .iter()
+            .any(|action| matches!(action, Action::RefreshRecordings)),
+        "expected a RefreshRecordings action; got {:?}",
         harness.state().applied_actions()
     );
 }

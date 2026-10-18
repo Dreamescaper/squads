@@ -50,6 +50,9 @@
 //! * **v11** (B2b) — `chat_folders`, `pinned_messages` and `chats.folder_id`,
 //!   the chat-folder list, the pinned-message membership and the folder a chat
 //!   is filed under. See ADR-039.
+//! * **v12** (B5) — `recordings` and `transcripts`, the driveItem caches for
+//!   meeting recordings/transcripts (keyed `(id, profile)` with an optional
+//!   owning `scope`). See ADR-041.
 //!
 //! ## Who writes what
 //!
@@ -73,8 +76,12 @@
 //! [`Store::remove_pin`]. B4's `Teams` administration uses the existing
 //! `teams`/`channels`/`team_members` tables: [`Store::team_for_channel`] (a
 //! read-only reverse lookup the channel-reaction lane needs for the team id)
-//! and [`Store::delete_team_member`] (the roster removal); **no schema change**
-//! was needed, so there is no v12. Nothing in this module talks to the network.
+//! and [`Store::delete_team_member`] (the roster removal); B4 needed **no schema
+//! change**. B5's `Recordings` service caches meeting recordings/transcripts
+//! with [`Store::upsert_recordings`] / [`Store::upsert_transcripts`] and reads
+//! them per conversation with [`Store::recordings_for_scope`] /
+//! [`Store::transcripts_for_scope`] (schema **v12**). Nothing in this module
+//! talks to the network.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -87,7 +94,8 @@ use crate::auth::tokens::now_unix;
 use crate::error::{CoreError, Result};
 use crate::model::{
     CallDirection, CallLogEntry, CallOutcome, Channel, Chat, ChatFolder, FileEntry, Meeting,
-    Message, PinnedMessage, Reaction, SendState, Team, TeamMember,
+    Message, PinnedMessage, Reaction, Recording, RecordingSource, SendState, Team, TeamMember,
+    Transcript,
 };
 
 /// Newest schema version this build knows how to create/migrate to.
@@ -106,7 +114,9 @@ use crate::model::{
 /// * **v10** (B2a) — `chats.hidden` and `chats.server_muted`, the server-side
 ///   hide/mute state (the local `chats.muted` remains the routing flag).
 /// * **v11** (B2b) — `chat_folders`, `pinned_messages` and `chats.folder_id`.
-pub const SCHEMA_VERSION: i32 = 11;
+/// * **v12** (B5) — `recordings` and `transcripts`, the driveItem caches for
+///   meeting recordings/transcripts.
+pub const SCHEMA_VERSION: i32 = 12;
 
 /// Timeout for a busy database before `SQLITE_BUSY` is surfaced.
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -363,6 +373,65 @@ CREATE TABLE IF NOT EXISTS pinned_messages (
 
 CREATE INDEX IF NOT EXISTS idx_pinned_messages_chat
     ON pinned_messages (profile, chat_id);
+"#;
+
+/// v12 schema: the meeting recording/transcript driveItem caches (backlog item
+/// **B5**). Plain `CREATE TABLE/INDEX IF NOT EXISTS`, so the migration is
+/// re-entrant.
+///
+/// Both tables are keyed **`(id, profile)`** — the driveItem id matches the
+/// store's convention (and the M7 `files` table's ADR-019 rationale): `drive_id`
+/// is **optional** on the wire (an unresolved item lists from metadata alone),
+/// and SQLite treats `NULL` keys as distinct, so keying on it would break the
+/// `Option` round-trip. `scope` is the owning chat/channel id the listing was
+/// requested for (nullable; a global list leaves it `NULL`) and is a non-key
+/// column, mirroring `files.chat_id`. `source_kind` is `onedrive`/`channel`
+/// with the channel's display names in `source_team`/`source_channel`; the
+/// vendored projection carries names, not ids.
+const MIGRATION_V12_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS recordings (
+    id             TEXT NOT NULL,
+    profile        TEXT NOT NULL,
+    drive_id       TEXT,
+    scope          TEXT,
+    name           TEXT NOT NULL DEFAULT '[unnamed]',
+    size           INTEGER NOT NULL DEFAULT 0,
+    mime           TEXT,
+    web_url        TEXT,
+    download_url   TEXT,
+    duration_ms    INTEGER,
+    source_kind    TEXT NOT NULL DEFAULT 'onedrive',
+    source_team    TEXT,
+    source_channel TEXT,
+    created        TEXT,
+    modified       TEXT,
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (id, profile)
+);
+
+CREATE INDEX IF NOT EXISTS idx_recordings_scope
+    ON recordings (profile, scope);
+
+CREATE TABLE IF NOT EXISTS transcripts (
+    id             TEXT NOT NULL,
+    profile        TEXT NOT NULL,
+    drive_id       TEXT,
+    scope          TEXT,
+    name           TEXT NOT NULL DEFAULT '[unnamed]',
+    size           INTEGER NOT NULL DEFAULT 0,
+    mime           TEXT,
+    web_url        TEXT,
+    source_kind    TEXT NOT NULL DEFAULT 'onedrive',
+    source_team    TEXT,
+    source_channel TEXT,
+    created        TEXT,
+    modified       TEXT,
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (id, profile)
+);
+
+CREATE INDEX IF NOT EXISTS idx_transcripts_scope
+    ON transcripts (profile, scope);
 "#;
 
 /// One local account record.
@@ -1734,6 +1803,250 @@ impl Store {
         Ok(removed > 0)
     }
 
+    // ----- recordings & transcripts (B5) ----------------------------------
+
+    /// Insert or update meeting **recordings** for `profile`, keyed
+    /// `(id, profile)`.
+    ///
+    /// Idempotent and **additive** (the M7 `files` rule, ADR-019): `drive_id`,
+    /// `scope`, `mime`, `web_url`, `download_url`, `duration_ms`, the source
+    /// columns, `created` and `modified` only overwrite when the incoming value
+    /// is non-`NULL` (`COALESCE`), so a later global listing (no `scope`) cannot
+    /// wipe a chat/channel association, and a sparse search hit cannot wipe a
+    /// cached drive id. `name`/`size` take the incoming value; `updated_at` only
+    /// advances. Returns the number of rows written.
+    pub fn upsert_recordings(
+        &self,
+        profile: &str,
+        scope: Option<&str>,
+        recordings: &[Recording],
+    ) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now_unix() as i64;
+        let mut written = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO recordings
+                    (id, profile, drive_id, scope, name, size, mime, web_url,
+                     download_url, duration_ms, source_kind, source_team,
+                     source_channel, created, modified, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, ?14, ?15, ?16)
+                 ON CONFLICT(id, profile) DO UPDATE SET
+                    drive_id = COALESCE(excluded.drive_id, recordings.drive_id),
+                    scope = COALESCE(excluded.scope, recordings.scope),
+                    name = excluded.name,
+                    size = excluded.size,
+                    mime = COALESCE(excluded.mime, recordings.mime),
+                    web_url = COALESCE(excluded.web_url, recordings.web_url),
+                    download_url = COALESCE(excluded.download_url, recordings.download_url),
+                    duration_ms = COALESCE(excluded.duration_ms, recordings.duration_ms),
+                    source_kind = excluded.source_kind,
+                    source_team = COALESCE(excluded.source_team, recordings.source_team),
+                    source_channel = COALESCE(excluded.source_channel, recordings.source_channel),
+                    created = COALESCE(excluded.created, recordings.created),
+                    modified = COALESCE(excluded.modified, recordings.modified),
+                    updated_at = MAX(recordings.updated_at, excluded.updated_at)",
+            )?;
+            for recording in recordings {
+                let (kind, team, channel) = source_columns(&recording.source);
+                stmt.execute(params![
+                    recording.id,
+                    profile,
+                    recording.drive_id,
+                    scope,
+                    recording.name,
+                    recording.size as i64,
+                    recording.mime,
+                    recording.web_url,
+                    recording.download_url,
+                    recording.duration_ms.map(|ms| ms as i64),
+                    kind,
+                    team,
+                    channel,
+                    recording.created,
+                    recording.modified,
+                    now
+                ])?;
+                written += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// The cached recordings listed under one `scope` (a chat or channel id),
+    /// newest-modified first (then name, id). A global listing (no scope) is
+    /// read with [`Store::all_recordings`].
+    pub fn recordings_for_scope(&self, profile: &str, scope: &str) -> Result<Vec<Recording>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, drive_id, name, size, mime, web_url, download_url,
+                    duration_ms, source_kind, source_team, source_channel,
+                    created, modified
+             FROM recordings
+             WHERE profile = ?1 AND scope = ?2
+             ORDER BY modified DESC, name COLLATE NOCASE ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![profile, scope], row_to_recording)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every cached recording for `profile` (a global listing), newest first.
+    pub fn all_recordings(&self, profile: &str) -> Result<Vec<Recording>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, drive_id, name, size, mime, web_url, download_url,
+                    duration_ms, source_kind, source_team, source_channel,
+                    created, modified
+             FROM recordings
+             WHERE profile = ?1
+             ORDER BY modified DESC, name COLLATE NOCASE ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![profile], row_to_recording)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Fetch one cached recording by id within `profile`, or `None`.
+    pub fn recording(&self, profile: &str, id: &str) -> Result<Option<Recording>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT id, drive_id, name, size, mime, web_url, download_url,
+                        duration_ms, source_kind, source_team, source_channel,
+                        created, modified
+                 FROM recordings
+                 WHERE profile = ?1 AND id = ?2",
+                params![profile, id],
+                row_to_recording,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Insert or update meeting **transcripts** for `profile`, keyed
+    /// `(id, profile)`.
+    ///
+    /// The same idempotent, additive rule as [`Store::upsert_recordings`];
+    /// transcripts have no download URL or duration on the wire.
+    pub fn upsert_transcripts(
+        &self,
+        profile: &str,
+        scope: Option<&str>,
+        transcripts: &[Transcript],
+    ) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now_unix() as i64;
+        let mut written = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO transcripts
+                    (id, profile, drive_id, scope, name, size, mime, web_url,
+                     source_kind, source_team, source_channel, created, modified,
+                     updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, ?14)
+                 ON CONFLICT(id, profile) DO UPDATE SET
+                    drive_id = COALESCE(excluded.drive_id, transcripts.drive_id),
+                    scope = COALESCE(excluded.scope, transcripts.scope),
+                    name = excluded.name,
+                    size = excluded.size,
+                    mime = COALESCE(excluded.mime, transcripts.mime),
+                    web_url = COALESCE(excluded.web_url, transcripts.web_url),
+                    source_kind = excluded.source_kind,
+                    source_team = COALESCE(excluded.source_team, transcripts.source_team),
+                    source_channel = COALESCE(excluded.source_channel, transcripts.source_channel),
+                    created = COALESCE(excluded.created, transcripts.created),
+                    modified = COALESCE(excluded.modified, transcripts.modified),
+                    updated_at = MAX(transcripts.updated_at, excluded.updated_at)",
+            )?;
+            for transcript in transcripts {
+                let (kind, team, channel) = source_columns(&transcript.source);
+                stmt.execute(params![
+                    transcript.id,
+                    profile,
+                    transcript.drive_id,
+                    scope,
+                    transcript.name,
+                    transcript.size as i64,
+                    transcript.mime,
+                    transcript.web_url,
+                    kind,
+                    team,
+                    channel,
+                    transcript.created,
+                    transcript.modified,
+                    now
+                ])?;
+                written += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// The cached transcripts listed under one `scope`, newest-modified first.
+    pub fn transcripts_for_scope(&self, profile: &str, scope: &str) -> Result<Vec<Transcript>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, drive_id, name, size, mime, web_url, source_kind,
+                    source_team, source_channel, created, modified
+             FROM transcripts
+             WHERE profile = ?1 AND scope = ?2
+             ORDER BY modified DESC, name COLLATE NOCASE ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![profile, scope], row_to_transcript)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every cached transcript for `profile` (a global listing), newest first.
+    pub fn all_transcripts(&self, profile: &str) -> Result<Vec<Transcript>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, drive_id, name, size, mime, web_url, source_kind,
+                    source_team, source_channel, created, modified
+             FROM transcripts
+             WHERE profile = ?1
+             ORDER BY modified DESC, name COLLATE NOCASE ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![profile], row_to_transcript)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Fetch one cached transcript by id within `profile`, or `None`.
+    pub fn transcript(&self, profile: &str, id: &str) -> Result<Option<Transcript>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT id, drive_id, name, size, mime, web_url, source_kind,
+                        source_team, source_channel, created, modified
+                 FROM transcripts
+                 WHERE profile = ?1 AND id = ?2",
+                params![profile, id],
+                row_to_transcript,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     // ----- call log (M9) --------------------------------------------------
 
     /// Insert or update local call-history rows for `profile`, keyed
@@ -2058,6 +2371,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if current < 11 {
         migrate_v11(&tx)?;
     }
+    if current < 12 {
+        migrate_v12(&tx)?;
+    }
     // Record the version *after* the DDL inside the same transaction, so a
     // crash can never leave a version marker ahead of the schema.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -2184,6 +2500,16 @@ fn migrate_v11(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Apply the v12 additions: the `recordings` and `transcripts` driveItem caches
+/// (B5).
+///
+/// Every statement is `CREATE TABLE/INDEX IF NOT EXISTS`, so the migration is
+/// re-entrant even if the version marker was reset.
+fn migrate_v12(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(MIGRATION_V12_TABLES)?;
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column` (case-insensitive).
 fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -2288,6 +2614,72 @@ fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
         sender: row.get(10)?,
         share_url: row.get(11)?,
         attachment_id: row.get(12)?,
+    })
+}
+
+/// The `(source_kind, source_team, source_channel)` columns for a recording /
+/// transcript source. The vendored projection names a channel's team/channel by
+/// **display name**, so those are what is stored.
+fn source_columns(source: &RecordingSource) -> (&'static str, Option<&str>, Option<&str>) {
+    match source {
+        RecordingSource::OneDrive => ("onedrive", None, None),
+        RecordingSource::Channel { team, channel } => {
+            ("channel", Some(team.as_str()), Some(channel.as_str()))
+        }
+    }
+}
+
+/// Rebuild a [`RecordingSource`] from the stored columns. A `channel` row
+/// without both names degrades to [`RecordingSource::OneDrive`] (a corrupt/
+/// foreign row reads as the safe default rather than failing the read).
+fn source_from_columns(
+    kind: &str,
+    team: Option<String>,
+    channel: Option<String>,
+) -> RecordingSource {
+    match (kind, team, channel) {
+        ("channel", Some(team), Some(channel)) => RecordingSource::Channel { team, channel },
+        _ => RecordingSource::OneDrive,
+    }
+}
+
+fn row_to_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<Recording> {
+    let source_kind: String = row.get(8)?;
+    let source_team: Option<String> = row.get(9)?;
+    let source_channel: Option<String> = row.get(10)?;
+    let name: String = row.get(2)?;
+    let mime: Option<String> = row.get(4)?;
+    let is_video = ost::api::is_recording_video(&name, mime.as_deref());
+    Ok(Recording {
+        id: row.get(0)?,
+        drive_id: row.get(1)?,
+        name,
+        size: row.get::<_, i64>(3)? as u64,
+        mime,
+        web_url: row.get(5)?,
+        download_url: row.get(6)?,
+        duration_ms: row.get::<_, Option<i64>>(7)?.map(|ms| ms as u64),
+        is_video,
+        source: source_from_columns(&source_kind, source_team, source_channel),
+        created: row.get(11)?,
+        modified: row.get(12)?,
+    })
+}
+
+fn row_to_transcript(row: &rusqlite::Row<'_>) -> rusqlite::Result<Transcript> {
+    let source_kind: String = row.get(6)?;
+    let source_team: Option<String> = row.get(7)?;
+    let source_channel: Option<String> = row.get(8)?;
+    Ok(Transcript {
+        id: row.get(0)?,
+        drive_id: row.get(1)?,
+        name: row.get(2)?,
+        size: row.get::<_, i64>(3)? as u64,
+        mime: row.get(4)?,
+        web_url: row.get(5)?,
+        source: source_from_columns(&source_kind, source_team, source_channel),
+        created: row.get(9)?,
+        modified: row.get(10)?,
     })
 }
 
@@ -4440,6 +4832,226 @@ mod tests {
             vec!["c1"]
         );
         assert_eq!(store.pinned_messages("default", "c1").unwrap().len(), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    // ----- B5: recordings & transcripts -----------------------------------
+
+    fn recording(id: &str, scope_modified: &str) -> Recording {
+        Recording {
+            id: id.into(),
+            name: format!("{id}.mp4"),
+            size: 11,
+            mime: Some("video/mp4".into()),
+            web_url: Some(format!("https://x/{id}")),
+            download_url: Some(format!("https://dl/{id}")),
+            drive_id: Some("D1".into()),
+            created: Some("2026-01-01T00:00:00Z".into()),
+            modified: Some(scope_modified.into()),
+            duration_ms: Some(1000),
+            is_video: true,
+            source: RecordingSource::OneDrive,
+        }
+    }
+
+    fn channel_recording(id: &str, team: &str, channel: &str) -> Recording {
+        let mut rec = recording(id, "2026-02-01T00:00:00Z");
+        rec.source = RecordingSource::Channel {
+            team: team.into(),
+            channel: channel.into(),
+        };
+        rec
+    }
+
+    fn transcript(id: &str, modified: &str) -> Transcript {
+        Transcript {
+            id: id.into(),
+            name: format!("{id}.vtt"),
+            size: 6,
+            mime: Some("text/vtt".into()),
+            web_url: Some(format!("https://x/{id}")),
+            drive_id: Some("D1".into()),
+            created: None,
+            modified: Some(modified.into()),
+            source: RecordingSource::OneDrive,
+        }
+    }
+
+    #[test]
+    fn recordings_and_transcripts_round_trip_and_scope() {
+        let store = Store::open_in_memory().unwrap();
+        // A chat listing (scope = c1) and a channel listing (scope = ch1) plus
+        // a global search hit (no scope).
+        store
+            .upsert_recordings(
+                "default",
+                Some("c1"),
+                &[recording("r1", "2026-01-02T00:00:00Z")],
+            )
+            .unwrap();
+        store
+            .upsert_recordings(
+                "default",
+                Some("ch1"),
+                &[channel_recording("r2", "Engineering", "general")],
+            )
+            .unwrap();
+        store
+            .upsert_recordings("default", None, &[recording("r3", "2026-01-03T00:00:00Z")])
+            .unwrap();
+
+        let chat = store.recordings_for_scope("default", "c1").unwrap();
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0].id, "r1");
+        assert_eq!(chat[0].source, RecordingSource::OneDrive);
+        assert!(chat[0].is_video);
+        assert_eq!(chat[0].duration_ms, Some(1000));
+
+        let channel = store.recordings_for_scope("default", "ch1").unwrap();
+        assert_eq!(channel.len(), 1);
+        assert_eq!(channel[0].id, "r2");
+        assert_eq!(
+            channel[0].source,
+            RecordingSource::Channel {
+                team: "Engineering".into(),
+                channel: "general".into()
+            }
+        );
+        assert_eq!(channel[0].source.label(), "Engineering > #general");
+
+        // The global listing (scope NULL) is separate and reads all scopes.
+        assert_eq!(store.all_recordings("default").unwrap().len(), 3);
+        // A direct lookup is by id, and profile isolation holds.
+        assert_eq!(
+            store.recording("default", "r1").unwrap().unwrap().name,
+            "r1.mp4"
+        );
+        assert!(store.recording("other", "r1").unwrap().is_none());
+
+        // Transcripts round-trip the same way.
+        store
+            .upsert_transcripts(
+                "default",
+                Some("c1"),
+                &[transcript("t1", "2026-01-02T00:00:00Z")],
+            )
+            .unwrap();
+        let ts = store.transcripts_for_scope("default", "c1").unwrap();
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts[0].id, "t1");
+        assert_eq!(ts[0].mime.as_deref(), Some("text/vtt"));
+        assert_eq!(store.all_transcripts("default").unwrap().len(), 1);
+        assert_eq!(store.transcript("default", "t1").unwrap().unwrap().id, "t1");
+    }
+
+    #[test]
+    fn upsert_recordings_is_additive_and_keeps_the_scope() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_recordings(
+                "default",
+                Some("c1"),
+                &[recording("r1", "2026-01-02T00:00:00Z")],
+            )
+            .unwrap();
+        // A later chatless (global) listing for the same id must not wipe the
+        // scope, the drive id or the download URL, and `updated_at` only
+        // advances.
+        let mut sparse = recording("r1", "2026-01-05T00:00:00Z");
+        sparse.drive_id = None;
+        sparse.download_url = None;
+        sparse.mime = None;
+        store.upsert_recordings("default", None, &[sparse]).unwrap();
+        let row = store.recording("default", "r1").unwrap().unwrap();
+        assert_eq!(row.drive_id.as_deref(), Some("D1"), "drive id survives");
+        assert_eq!(
+            row.download_url.as_deref(),
+            Some("https://dl/r1"),
+            "download url survives"
+        );
+        assert_eq!(row.mime.as_deref(), Some("video/mp4"));
+        assert_eq!(row.modified.as_deref(), Some("2026-01-05T00:00:00Z"));
+        // Still scoped under the chat.
+        assert_eq!(
+            store.recordings_for_scope("default", "c1").unwrap().len(),
+            1
+        );
+        assert!(store.all_recordings("default").unwrap().len() == 1);
+    }
+
+    #[test]
+    fn v11_database_upgrades_to_v12_adding_recordings_and_transcripts() {
+        let path = temp_path("v11-to-v12");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            // Build a genuine v11 database: everything through the v11 tables +
+            // columns, version marker 11, and one chat.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN send_state TEXT NOT NULL DEFAULT 'sent';",
+            )
+            .unwrap();
+            conn.execute_batch(MIGRATION_V2_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V3_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V4_TABLES).unwrap();
+            conn.execute_batch("ALTER TABLE chats ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;")
+                .unwrap();
+            conn.execute_batch(MIGRATION_V6_TABLES).unwrap();
+            conn.execute_batch(MIGRATION_V7_TABLES).unwrap();
+            conn.execute_batch("ALTER TABLE accounts ADD COLUMN self_mri TEXT;")
+                .unwrap();
+            conn.execute_batch("ALTER TABLE accounts ADD COLUMN oid TEXT;")
+                .unwrap();
+            conn.execute_batch(MIGRATION_V9_INDEX).unwrap();
+            conn.execute_batch("ALTER TABLE chats ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;")
+                .unwrap();
+            conn.execute_batch("ALTER TABLE chats ADD COLUMN server_muted INTEGER;")
+                .unwrap();
+            conn.execute_batch(MIGRATION_V11_TABLES).unwrap();
+            conn.execute_batch("ALTER TABLE chats ADD COLUMN folder_id TEXT;")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO chats (id, profile, name, is_group, updated_at)
+                 VALUES ('c1','default','One',0,1)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 11).unwrap();
+        }
+
+        let store = Store::open(&path).expect("open the v11 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        // The new tables start empty and are writable.
+        assert!(store.all_recordings("default").unwrap().is_empty());
+        assert!(store.all_transcripts("default").unwrap().is_empty());
+        store
+            .upsert_recordings(
+                "default",
+                Some("c1"),
+                &[recording("r1", "2026-01-02T00:00:00Z")],
+            )
+            .unwrap();
+        store
+            .upsert_transcripts(
+                "default",
+                Some("c1"),
+                &[transcript("t1", "2026-01-02T00:00:00Z")],
+            )
+            .unwrap();
+
+        // Reopening again is a clean no-op and the state survives.
+        drop(store);
+        let store = Store::open(&path).expect("reopen v12 database");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            store.recordings_for_scope("default", "c1").unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store.transcripts_for_scope("default", "c1").unwrap().len(),
+            1
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

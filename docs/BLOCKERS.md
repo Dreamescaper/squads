@@ -749,3 +749,45 @@ is **local-first** so the tabs and moves work offline regardless of the server;
 if the vendored crate ever exposes an injectable client/base for the folder lane
 (or the app routes it through `TeamsClient`), the stub tests can be added with no
 caller change.
+
+### U-013 — B5 recordings & transcripts not exercised offline (live acceptance unverified)
+
+B5's recording/transcript lanes are thin wrappers over the vendored global
+`list_recordings_data`/`list_transcripts_data`/`search_*_data`, tested offline
+against local TCP stubs (the OneDrive `Recordings` children path, the
+`joinedTeams` scan, the channel `filesFolder` and folder-children paths, the
+drive-search, the source split, the store round-trip and the v11→v12 migration),
+and the download reuses the M7 path. The following cannot be exercised here
+(B-002 — no live tenant):
+
+- **Live Graph acceptance.** Whether the Teams first-party Graph token carries
+  the delegated `Files.Read` scope for the OneDrive `Recordings`/`filesFolder`/
+  drive-search reads, and whether a real `Recordings` folder (or its absence,
+  a 404 → empty) and a real `.mp4`/`.vtt` driveItem match the projection
+  (`video.duration`, `@microsoft.graph.downloadUrl`, `parentReference.driveId`)
+  are unproven. A 403 surfaces as the vendored error unchanged.
+- **The global fan-out.** The vendored list scans **every** channel drive
+  (`list_teams_data` + a `filesFolder` lookup per channel), so a chat listing is
+  not a single request and the real cost on a channel-heavy tenant is
+  unmeasured. There is no OneDrive-only vendored function, so B5 cannot avoid
+  it.
+- **Channel scoping by display name.** The wire names a channel's team/channel by
+  **display name**, not id, so `recordings_for_channel` matches the requested
+  channel against its cached name and, when the name is unknown, keeps every
+  channel row. Whether real display names are stable/unique enough is
+  unverified.
+- **Transcript reachability.** A non-channel meeting stores the transcript in the
+  **organizer's** OneDrive `Recordings` folder; the signed-in user's drive search
+  cannot see another user's drive and the Graph transcript API needs tenant-admin
+  consent, so transcripts of meetings organized by someone else are unreachable
+  from this lane **by design** (the vendored module documents the same gap).
+- **Rendered pixels.** The headless `egui_kittest` test asserts the panel's rows
+  and the queued Download/Refresh actions, not the drawn layout (B-001/B-012).
+
+**Impact:** recording/transcript listing and download are assumed from the
+vendored crate + stubs, not proven; the channel slice is a best-effort name
+match and the fan-out cost is unmeasured.
+
+**Mitigation:** keep the calls behind `ApiClient`/`Recordings` so a live fix is
+contained; the deterministic stub tests pin the exact paths/headers so a
+regression is caught; the store cache keeps the info pane instant offline.

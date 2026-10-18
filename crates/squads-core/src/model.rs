@@ -17,7 +17,8 @@
 //! [`FileVersion::from_wire`]; M13 adds [`Identity::from_whoami`]; B3 adds
 //! [`Person::from_member`]; B2a adds [`ChatMember::from_info`]; B2b adds
 //! [`ChatFolder::from_wire`] / [`PinnedMessage::from_wire`]; B4 adds
-//! [`PublicTeam::from_info`] / [`TeamSettings::from_wire`].
+//! [`PublicTeam::from_info`] / [`TeamSettings::from_wire`]; B5 adds
+//! [`Recording::from_info`] / [`Transcript::from_info`].
 //!
 //! ## Two facts you must orient on
 //!
@@ -38,8 +39,10 @@ use serde::{Deserialize, Serialize};
 use ost::api::{
     ChannelInfo, ChatInfo, ChatMemberInfo, ConversationFolder as WireConversationFolder,
     FileVersion as WireFileVersion, MeetingInfo as WireMeetingInfo, MessageInfo, PinnedRef,
-    PublicTeamInfo, ReactionCount, Reactor as WireReactor, SharedFile as WireSharedFile, TeamInfo,
-    TeamMemberInfo, TeamMemberSettings, UserInfo,
+    PublicTeamInfo, ReactionCount, Reactor as WireReactor, RecordingInfo as WireRecordingInfo,
+    RecordingSource as WireRecordingSource, SharedFile as WireSharedFile, TeamInfo, TeamMemberInfo,
+    TeamMemberSettings, TranscriptInfo as WireTranscriptInfo,
+    TranscriptSource as WireTranscriptSource, UserInfo,
 };
 
 /// Delivery state of a message we authored (milestone **M5**).
@@ -1305,6 +1308,248 @@ pub struct SearchHit {
     pub is_own: bool,
 }
 
+// ----- recordings & transcripts (B5) --------------------------------------
+
+/// Where one recording or transcript lives (backlog item **B5**).
+///
+/// An owned mirror of the vendored `ost::api::RecordingSource` /
+/// `TranscriptSource` (both share this shape): the signed-in user's own
+/// OneDrive `Recordings` folder, or one channel's SharePoint `Recordings`
+/// folder. The channel variant carries the **display names** the vendored scan
+/// resolved (`list_teams_data`), not ids — the wire projection names no
+/// team/channel id. The owning chat/meeting is likewise **not** on the wire
+/// (Teams exposes no per-chat recording association), which is why the service
+/// filters the global lane by this source rather than by a chat id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingSource {
+    /// The signed-in user's own OneDrive `Recordings` folder.
+    OneDrive,
+    /// One channel's SharePoint `filesFolder/Recordings`.
+    Channel {
+        /// Team display name.
+        team: String,
+        /// Channel display name.
+        channel: String,
+    },
+}
+
+impl RecordingSource {
+    /// Whether this row came from a channel's SharePoint drive.
+    pub fn is_channel(&self) -> bool {
+        matches!(self, RecordingSource::Channel { .. })
+    }
+
+    /// Short provenance label for list rows (`OneDrive`,
+    /// `Engineering > #general`).
+    pub fn label(&self) -> String {
+        match self {
+            RecordingSource::OneDrive => "OneDrive".to_string(),
+            RecordingSource::Channel { team, channel } => format!("{team} > #{channel}"),
+        }
+    }
+
+    /// The channel display name, when this is a channel row.
+    pub fn channel_name(&self) -> Option<&str> {
+        match self {
+            RecordingSource::OneDrive => None,
+            RecordingSource::Channel { channel, .. } => Some(channel),
+        }
+    }
+
+    /// The team display name, when this is a channel row.
+    pub fn team_name(&self) -> Option<&str> {
+        match self {
+            RecordingSource::OneDrive => None,
+            RecordingSource::Channel { team, .. } => Some(team),
+        }
+    }
+}
+
+impl From<&WireRecordingSource> for RecordingSource {
+    fn from(source: &WireRecordingSource) -> Self {
+        match source {
+            WireRecordingSource::OneDrive => RecordingSource::OneDrive,
+            WireRecordingSource::Channel { team, channel } => RecordingSource::Channel {
+                team: team.clone(),
+                channel: channel.clone(),
+            },
+        }
+    }
+}
+
+/// One meeting recording (backlog item **B5**).
+///
+/// An owned mirror of the vendored `ost::api::RecordingInfo`: a `.mp4`
+/// driveItem. `drive_id` is optional (like [`FileEntry::drive_id`]) and is the
+/// key [`Recordings::download`](crate::Recordings::download) needs;
+/// [`Recording::download_url`] is the pre-authenticated short-lived Graph URL
+/// (when present) a player can stream. `is_video` is always `true` from the
+/// wire — the vendored parser drops non-video items — but is exposed (and
+/// computed with the vendored predicate) for direct construction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recording {
+    /// DriveItem id.
+    pub id: String,
+    /// Display name (never empty; the wire falls back to `[unnamed]`).
+    pub name: String,
+    /// Size in bytes (`0` when unknown).
+    pub size: u64,
+    /// MIME type, when Graph named one.
+    pub mime: Option<String>,
+    /// Open-in-browser URL.
+    pub web_url: Option<String>,
+    /// Pre-authenticated download/stream URL (`@microsoft.graph.downloadUrl`),
+    /// when present.
+    pub download_url: Option<String>,
+    /// Owning drive id, when known (the `/drives/{d}/items/{i}/content` key).
+    pub drive_id: Option<String>,
+    /// ISO-8601 creation time, when known.
+    pub created: Option<String>,
+    /// ISO-8601 last-modified time, when known.
+    pub modified: Option<String>,
+    /// Playback length from the driveItem `video` facet (ms), when Graph named
+    /// one.
+    pub duration_ms: Option<u64>,
+    /// Whether this item is a video (always `true` from the wire).
+    pub is_video: bool,
+    /// Where the recording lives (OneDrive vs. a channel's SharePoint drive).
+    pub source: RecordingSource,
+}
+
+impl Recording {
+    /// Build a domain [`Recording`] from a protocol `RecordingInfo`.
+    pub fn from_info(info: &WireRecordingInfo) -> Self {
+        Recording {
+            id: info.id.clone(),
+            name: info.name.clone(),
+            size: info.size,
+            mime: info.mime.clone(),
+            web_url: info.web_url.clone(),
+            download_url: info.download_url.clone(),
+            drive_id: info.drive_id.clone(),
+            created: info.created.clone(),
+            modified: info.modified.clone(),
+            duration_ms: info.duration_ms,
+            is_video: ost::api::is_recording_video(&info.name, info.mime.as_deref()),
+            source: RecordingSource::from(&info.source),
+        }
+    }
+
+    /// A [`FileEntry`] view of this recording, so the M7 download path
+    /// ([`Files::download`](crate::Files::download)) can transfer it unchanged.
+    pub fn as_file_entry(&self) -> FileEntry {
+        FileEntry {
+            id: self.id.clone(),
+            drive_id: self.drive_id.clone(),
+            name: self.name.clone(),
+            size: self.size,
+            mime: self.mime.clone(),
+            web_url: self.web_url.clone(),
+            download_url: self.download_url.clone(),
+            is_folder: false,
+            created: self.created.clone(),
+            modified: self.modified.clone(),
+            sender: None,
+            share_url: None,
+            attachment_id: None,
+        }
+    }
+}
+
+impl From<&WireRecordingInfo> for Recording {
+    fn from(info: &WireRecordingInfo) -> Self {
+        Recording::from_info(info)
+    }
+}
+
+/// One meeting transcript (backlog item **B5**).
+///
+/// An owned mirror of the vendored `ost::api::TranscriptInfo`: a `.vtt` (or a
+/// `transcript`-named `.docx`) driveItem next to the recording. There is **no**
+/// `download_url` on the wire projection, so the bytes always ride the M7
+/// `/drives/{d}/items/{i}/content` download via `drive_id` + `id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transcript {
+    /// DriveItem id.
+    pub id: String,
+    /// Display name (never empty; the wire falls back to `[unnamed]`).
+    pub name: String,
+    /// Size in bytes (`0` when unknown).
+    pub size: u64,
+    /// MIME type, when Graph named one.
+    pub mime: Option<String>,
+    /// Open-in-browser URL.
+    pub web_url: Option<String>,
+    /// Owning drive id, when known.
+    pub drive_id: Option<String>,
+    /// ISO-8601 creation time, when known.
+    pub created: Option<String>,
+    /// ISO-8601 last-modified time, when known.
+    pub modified: Option<String>,
+    /// Where the transcript lives (OneDrive vs. a channel's SharePoint drive).
+    pub source: TranscriptSource,
+}
+
+impl Transcript {
+    /// Build a domain [`Transcript`] from a protocol `TranscriptInfo`.
+    pub fn from_info(info: &WireTranscriptInfo) -> Self {
+        Transcript {
+            id: info.id.clone(),
+            name: info.name.clone(),
+            size: info.size,
+            mime: info.mime.clone(),
+            web_url: info.web_url.clone(),
+            drive_id: info.drive_id.clone(),
+            created: info.created.clone(),
+            modified: info.modified.clone(),
+            source: TranscriptSource::from(&info.source),
+        }
+    }
+
+    /// A [`FileEntry`] view of this transcript, so the M7 download path can
+    /// transfer it unchanged.
+    pub fn as_file_entry(&self) -> FileEntry {
+        FileEntry {
+            id: self.id.clone(),
+            drive_id: self.drive_id.clone(),
+            name: self.name.clone(),
+            size: self.size,
+            mime: self.mime.clone(),
+            web_url: self.web_url.clone(),
+            download_url: None,
+            is_folder: false,
+            created: self.created.clone(),
+            modified: self.modified.clone(),
+            sender: None,
+            share_url: None,
+            attachment_id: None,
+        }
+    }
+}
+
+impl From<&WireTranscriptInfo> for Transcript {
+    fn from(info: &WireTranscriptInfo) -> Self {
+        Transcript::from_info(info)
+    }
+}
+
+/// Where one transcript lives. A separate name from [`RecordingSource`] for
+/// symmetry with the two vendored enums, with the same shape and helpers.
+pub type TranscriptSource = RecordingSource;
+
+impl From<&WireTranscriptSource> for TranscriptSource {
+    fn from(source: &WireTranscriptSource) -> Self {
+        match source {
+            WireTranscriptSource::OneDrive => RecordingSource::OneDrive,
+            WireTranscriptSource::Channel { team, channel } => RecordingSource::Channel {
+                team: team.clone(),
+                channel: channel.clone(),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2057,5 +2302,106 @@ mod tests {
         let back: PinnedMessage =
             serde_json::from_str(&serde_json::to_string(&pin).unwrap()).unwrap();
         assert_eq!(back, pin);
+    }
+
+    // ----- B5: recordings & transcripts ----------------------------------
+
+    fn wire_recording(source: WireRecordingSource) -> WireRecordingInfo {
+        WireRecordingInfo {
+            id: "r1".into(),
+            name: "Weekly Sync.mp4".into(),
+            size: 48211,
+            mime: Some("video/mp4".into()),
+            web_url: Some("https://x/r1".into()),
+            download_url: Some("https://dl/r1".into()),
+            drive_id: Some("D1".into()),
+            created: Some("2026-09-24T09:00:00Z".into()),
+            modified: Some("2026-09-24T10:00:00Z".into()),
+            duration_ms: Some(3723000),
+            source,
+        }
+    }
+
+    #[test]
+    fn recording_converts_carries_source_and_builds_a_file_entry() {
+        let rec = Recording::from_info(&wire_recording(WireRecordingSource::OneDrive));
+        assert_eq!(rec.id, "r1");
+        assert_eq!(rec.name, "Weekly Sync.mp4");
+        assert_eq!(rec.size, 48211);
+        assert_eq!(rec.drive_id.as_deref(), Some("D1"));
+        assert_eq!(rec.duration_ms, Some(3723000));
+        assert!(rec.is_video, "the wire predicate marks an .mp4 a video");
+        assert_eq!(rec.source, RecordingSource::OneDrive);
+        assert_eq!(rec.source.label(), "OneDrive");
+        assert!(!rec.source.is_channel());
+
+        // The `From` impl matches `from_info`, and the source mirror keeps the
+        // channel names (the wire carries names, not ids).
+        let channel = Recording::from(&wire_recording(WireRecordingSource::Channel {
+            team: "Engineering".into(),
+            channel: "general".into(),
+        }));
+        assert_eq!(
+            channel,
+            Recording::from_info(&wire_recording(WireRecordingSource::Channel {
+                team: "Engineering".into(),
+                channel: "general".into(),
+            }))
+        );
+        assert!(channel.source.is_channel());
+        assert_eq!(channel.source.label(), "Engineering > #general");
+        assert_eq!(channel.source.channel_name(), Some("general"));
+        assert_eq!(channel.source.team_name(), Some("Engineering"));
+
+        // The file-entry view reuses the M7 download path unchanged.
+        let file = rec.as_file_entry();
+        assert_eq!(file.id, "r1");
+        assert_eq!(file.drive_id.as_deref(), Some("D1"));
+        assert_eq!(file.download_url.as_deref(), Some("https://dl/r1"));
+        assert!(!file.is_folder);
+
+        // JSON round-trip (the store persists plain columns).
+        let back: Recording = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(back, rec);
+    }
+
+    fn wire_transcript(source: WireTranscriptSource) -> WireTranscriptInfo {
+        WireTranscriptInfo {
+            id: "t1".into(),
+            name: "Weekly Sync.vtt".into(),
+            size: 4211,
+            mime: Some("text/vtt".into()),
+            web_url: Some("https://x/t1".into()),
+            drive_id: Some("D1".into()),
+            created: Some("2026-09-24T09:00:00Z".into()),
+            modified: Some("2026-09-24T10:00:00Z".into()),
+            source,
+        }
+    }
+
+    #[test]
+    fn transcript_converts_and_has_no_download_url() {
+        let t = Transcript::from_info(&wire_transcript(WireTranscriptSource::OneDrive));
+        assert_eq!(t.id, "t1");
+        assert_eq!(t.name, "Weekly Sync.vtt");
+        assert_eq!(t.mime.as_deref(), Some("text/vtt"));
+        assert_eq!(t.source, RecordingSource::OneDrive);
+        assert_eq!(
+            t,
+            Transcript::from(&wire_transcript(WireTranscriptSource::OneDrive))
+        );
+
+        let channel = Transcript::from_info(&wire_transcript(WireTranscriptSource::Channel {
+            team: "Engineering".into(),
+            channel: "general".into(),
+        }));
+        assert_eq!(channel.source.label(), "Engineering > #general");
+
+        // A transcript has no pre-authenticated download URL: bytes always ride
+        // the drive content path.
+        let file = t.as_file_entry();
+        assert_eq!(file.id, "t1");
+        assert_eq!(file.drive_id.as_deref(), Some("D1"));
+        assert!(file.download_url.is_none());
     }
 }

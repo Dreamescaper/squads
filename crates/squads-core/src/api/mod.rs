@@ -92,6 +92,15 @@
 //! use the dedicated **Graph** `…/messages/{id}/(set|unset)Reaction` lane
 //! (including the `replies/{reply}` variant), because the chat-service reaction
 //! endpoint 404s on channel threads. See [`crate::Teams`].
+//!
+//! **Recordings & transcripts (B5)** are Graph **driveItems** too: a non-channel
+//! meeting's recording/transcript lives in the signed-in user's OneDrive
+//! `Recordings` folder and a channel meeting's in the channel's SharePoint
+//! `filesFolder`. [`ApiClient::list_recordings`] / [`ApiClient::search_recordings`]
+//! and [`ApiClient::list_transcripts`] / [`ApiClient::search_transcripts`] wrap
+//! the vendored **global** lanes (one call fans out over OneDrive and every
+//! channel drive; there is no per-chat/per-channel variant). See
+//! [`crate::Recordings`].
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -216,6 +225,34 @@ pub use ost::api::{
     join_team_data, member_path, members_path, parse_public_teams, public_teams_groups_path,
     public_teams_list_path, remove_team_member_data, search_public_teams_data,
     set_channel_reaction_data, team_settings_data, unset_channel_reaction_data,
+};
+
+/// Protocol types and pure helpers surfaced by the **B5** recordings &
+/// transcripts lanes. Both are Graph **driveItems**: a non-channel meeting's
+/// recording/transcript lives in the signed-in user's OneDrive `Recordings`
+/// folder and a channel meeting's in the channel's SharePoint `filesFolder`
+/// `Recordings` folder, so list/search reuse the M7 files-stack shapes.
+///
+/// The vendored list/search functions are **global** — one call fans out over
+/// OneDrive **and** every channel drive (a bounded `list_teams_data` scan plus
+/// per-channel `filesFolder` lookups) and returns one merged, newest-first list.
+/// There is no per-chat/per-channel variant and no paging cursor; a limit is
+/// clamped by the vendored path builder ([`RECORDINGS_MAX_LIMIT`] /
+/// [`TRANSCRIPTS_MAX_LIMIT`]). The pure helpers
+/// ([`recordings_children_path`], [`recordings_search_path`],
+/// [`is_recording_video`], [`sort_recordings_newest`],
+/// [`recordings_clamp_limit`], [`parse_recordings_response`] and the
+/// transcript equivalents) are re-exported so their shapes are pinned without a
+/// network.
+pub use ost::api::{
+    RECORDINGS_MAX_LIMIT, RecordingInfo, RecordingSource, is_recording_video,
+    parse_recordings_response, recordings_children_path, recordings_clamp_limit,
+    recordings_search_path, sort_recordings_newest,
+};
+pub use ost::api::{
+    TRANSCRIPTS_MAX_LIMIT, TranscriptInfo, TranscriptSource, is_transcript,
+    parse_transcripts_response, sort_transcripts_newest, transcripts_children_path,
+    transcripts_clamp_limit, transcripts_search_path,
 };
 
 use crate::auth::tokens::{StoredToken, TokenSet};
@@ -1710,6 +1747,103 @@ impl ApiClient {
         tracing::debug!(call, "unset channel reaction");
         Ok(())
     }
+
+    // ----- B5: recordings & transcripts (Graph drives) --------------------
+
+    /// List every meeting **recording** the signed-in user can access, newest
+    /// first (the vendored global lane: OneDrive `Recordings` + every channel's
+    /// SharePoint `Recordings`, merged and clamped to
+    /// [`RECORDINGS_MAX_LIMIT`]).
+    ///
+    /// Wraps the vendored `list_recordings_data`: the OneDrive leg is one
+    /// request; each channel contributes a bounded `list_teams_data` scan plus
+    /// `filesFolder`/children lookups. A missing `Recordings` folder (404) and a
+    /// per-channel failure read as empty; only a total failure (no drive
+    /// answered) errors. There is **no** per-chat/per-channel variant in the
+    /// vendored crate — [`crate::Recordings`] filters the merged list by source.
+    pub async fn list_recordings(&self, limit: usize) -> Result<Vec<RecordingInfo>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.list_recordings",
+            limit,
+            call
+        );
+        let rows = ost::api::list_recordings_data(&self.client, limit)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = rows.len(), call, "listed recordings");
+        Ok(rows)
+    }
+
+    /// Search every meeting **recording** by name (the vendored global lane:
+    /// the OneDrive drive-search plus one drive-search per channel drive,
+    /// merged, newest first, clamped to [`RECORDINGS_MAX_LIMIT`]). An empty
+    /// query is rejected by the vendored call before any network.
+    pub async fn search_recordings(&self, query: &str, limit: usize) -> Result<Vec<RecordingInfo>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.search_recordings",
+            limit,
+            call
+        );
+        let rows = ost::api::search_recordings_data(&self.client, query, limit)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = rows.len(), call, "searched recordings");
+        Ok(rows)
+    }
+
+    /// List every meeting **transcript** the signed-in user can access, newest
+    /// first (the vendored global lane: the OneDrive + channel `Recordings`
+    /// folders, plus a bounded full-drive search fallback when the folder scan
+    /// finds zero rows; clamped to [`TRANSCRIPTS_MAX_LIMIT`]).
+    ///
+    /// Wraps the vendored `list_transcripts_data`. Transcripts are `.vtt` (or a
+    /// `transcript`-named `.docx`) driveItems next to the recording. See
+    /// [`crate::Recordings`] for the source split.
+    pub async fn list_transcripts(&self, limit: usize) -> Result<Vec<TranscriptInfo>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.list_transcripts",
+            limit,
+            call
+        );
+        let rows = ost::api::list_transcripts_data(&self.client, limit)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = rows.len(), call, "listed transcripts");
+        Ok(rows)
+    }
+
+    /// Search every meeting **transcript** by name (the vendored global lane:
+    /// the OneDrive drive-search plus one per channel drive, `.vtt`/transcript
+    /// filtered, merged and clamped to [`TRANSCRIPTS_MAX_LIMIT`]). An empty
+    /// query is rejected by the vendored call before any network.
+    pub async fn search_transcripts(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TranscriptInfo>> {
+        use tracing::Instrument as _;
+        let call = self.counted();
+        let span = tracing::debug_span!(
+            target: "squads_core::api",
+            "api.search_transcripts",
+            limit,
+            call
+        );
+        let rows = ost::api::search_transcripts_data(&self.client, query, limit)
+            .instrument(span)
+            .await?;
+        tracing::debug!(count = rows.len(), call, "searched transcripts");
+        Ok(rows)
+    }
 }
 
 impl fmt::Debug for ApiClient {
@@ -3172,5 +3306,120 @@ mod tests {
             serde_json::json!({ "reactionType": "❤️" })
         );
         assert_eq!(PUBLIC_TEAMS_MAX, 25);
+    }
+
+    // ----- B5: recordings & transcripts -----------------------------------
+
+    #[tokio::test]
+    async fn list_recordings_reads_the_onedrive_folder_through_graph() {
+        let body = serde_json::json!({ "value": [{
+            "id": "r1", "name": "Weekly Sync.mp4", "size": 48211,
+            "webUrl": "https://x/r1",
+            "@microsoft.graph.downloadUrl": "https://dl/r1",
+            "lastModifiedDateTime": "2026-09-24T10:00:00Z",
+            "file": {"mimeType": "video/mp4"},
+            "video": {"duration": 3723000},
+            "parentReference": {"driveId": "D1"}
+        }]})
+        .to_string();
+        // OneDrive answers, then the teams scan finds no teams (no channels).
+        let (base, seen, task) = http_stub(vec![
+            StubResponse::ok(body),
+            StubResponse::ok(serde_json::json!({ "value": [] }).to_string()),
+        ])
+        .await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let rows = client.list_recordings(99).await.expect("list recordings");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "r1");
+        assert_eq!(rows[0].duration_ms, Some(3723000));
+        assert_eq!(rows[0].source, RecordingSource::OneDrive);
+        assert_eq!(client.request_count(), 1, "one high-level call");
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 2, "the OneDrive list + the teams scan");
+        assert!(
+            reqs[0].starts_with("GET /me/drive/root:/Recordings:/children?$top=50 "),
+            "unexpected request: {}",
+            reqs[0]
+        );
+        assert!(
+            reqs[0].contains("authorization: Bearer graph-token"),
+            "{}",
+            reqs[0]
+        );
+        assert!(reqs[1].starts_with("GET /me/joinedTeams "), "{}", reqs[1]);
+    }
+
+    #[tokio::test]
+    async fn search_transcripts_uses_the_drive_search_and_rejects_blank() {
+        let body = serde_json::json!({ "value": [{
+            "id": "t1", "name": "Weekly Sync.vtt", "size": 4211,
+            "file": {"mimeType": "text/vtt"},
+            "parentReference": {"driveId": "D1"}
+        }]})
+        .to_string();
+        let (base, seen, task) = http_stub(vec![
+            StubResponse::ok(body),
+            StubResponse::ok(serde_json::json!({ "value": [] }).to_string()),
+        ])
+        .await;
+        let client = ApiClient::from_tokens(&b2a_tokens(&base));
+
+        let rows = client
+            .search_transcripts("weekly", 99)
+            .await
+            .expect("search");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "t1");
+
+        // A blank query is refused before any further network.
+        let err = client
+            .search_transcripts("  ", 50)
+            .await
+            .err()
+            .expect("blank query refused");
+        assert!(format!("{err:#}").contains("empty query"), "{err:#}");
+
+        task.await.expect("stub drains");
+        let reqs = b2a_requests(&seen);
+        assert_eq!(reqs.len(), 2);
+        assert!(
+            reqs[0].starts_with("GET /me/drive/search(q='weekly')?$top=99 "),
+            "unexpected request: {}",
+            reqs[0]
+        );
+    }
+
+    #[test]
+    fn b5_pure_helpers_are_reexported() {
+        // The re-exported shapes/predicates are pinned here too (the service
+        // tests exercise them against a stub).
+        assert_eq!(RECORDINGS_MAX_LIMIT, 50);
+        assert_eq!(TRANSCRIPTS_MAX_LIMIT, 100);
+        assert_eq!(
+            recordings_children_path(1),
+            "/me/drive/root:/Recordings:/children?$top=1"
+        );
+        assert_eq!(recordings_clamp_limit(999), 50);
+        assert!(is_recording_video("a.mp4", None));
+        assert_eq!(
+            transcripts_search_path(None, ".vtt", 999),
+            "/me/drive/search(q='.vtt')?$top=100"
+        );
+        assert!(is_transcript("a.vtt", None));
+        assert!(!is_transcript("notes.docx", None));
+        // The source enum mirrors the two stores.
+        assert_eq!(RecordingSource::OneDrive.label(), "OneDrive");
+        assert_eq!(
+            RecordingSource::Channel {
+                team: "Eng".into(),
+                channel: "general".into()
+            }
+            .label(),
+            "Eng > #general"
+        );
     }
 }

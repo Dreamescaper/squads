@@ -2,8 +2,8 @@
 
 > Snapshot for the **M13 (Self identity + inline media)** milestone plus backlog
 > items **B1 (Message search)**, **B3 (File & people search)**, **B2a (New
-> chat, leave, mute/hide)**, **B2b (Folders and pinned messages)** and **B4
-> (Team administration)**. The
+> chat, leave, mute/hide)**, **B2b (Folders and pinned messages)**, **B4
+> (Team administration)** and **B5 (Recordings & transcripts)**. The
 > detailed per-milestone history is in [`PROGRESS.md`](PROGRESS.md); constraints
 > are in [`BLOCKERS.md`](BLOCKERS.md).
 
@@ -11,16 +11,17 @@
 
 All fourteen planned milestones (**M0–M13**) are implemented, plus backlog items
 **B1 (message search)**, **B3 (file & people search)**, **B2a (new chat, leave,
-mute/hide)**, **B2b (folders and pinned messages)** and **B4 (team
-administration)**. The workspace builds
+mute/hide)**, **B2b (folders and pinned messages)**, **B4 (team
+administration)** and **B5 (recordings & transcripts)** — the backlog is
+complete apart from **B6**, an explicit *not planned* list. The workspace builds
 device- and network-free with default features, and the test suite passes
 offline:
 
 | Crate | Role | Tests |
 |---|---|---|
 | `squads-protocol` (vendored `ost`, lib `ost`) | protocol core (auth, api, trouter, calling) | 377 (unchanged) |
-| `squads-core` | session, store, settings, realtime, services | 417 |
-| `squads-app` (`squads` binary) | egui UI | 38 |
+| `squads-core` | session, store, settings, realtime, services | 442 |
+| `squads-app` (`squads` binary) | egui UI | 40 |
 
 `cargo build --workspace` and `cargo build --workspace --release` both succeed.
 
@@ -32,7 +33,7 @@ and real signing/notarization are still manual (B-013, `PACKAGING.md` §6).
 
 **What works (verified here, offline):** workspace + CI config; the full auth
 token model and device-code flow; the session/client facade and region routing;
-the SQLite store with migrations v1→v11; realtime decode/fan-out/write-through;
+the SQLite store with migrations v1→v12; realtime decode/fan-out/write-through;
 messaging (optimistic sends, paging, edit/delete/react/receipts); teams &
 channels; files (Graph list/upload/download/links/versions); presence and
 notification routing; call signalling/media primitives/loopback/call log; the
@@ -49,9 +50,12 @@ with counts filtering the chat list, a move-to-folder action, and a
 pinned-messages panel with jump-to-message and unpin, schema v11 — B2b); **team
 administration** (a public-team search + join, an owner-gated member roster with
 add-via-picker and remove-with-confirmation, team settings, and a channel
-reaction affordance routed through the dedicated Graph lane — B4); the egui
-shell and every screen; M11 keyboard shortcuts, expanded settings, light theme +
-accents, and headless UI tests.
+reaction affordance routed through the dedicated Graph lane — B4); **recordings
+& transcripts** (a global OneDrive/SharePoint recording/transcript list + search
+with a chat-vs-channel source split, a `Recordings` service that reuses the M7
+download path, and a **Recordings & transcripts** info-pane panel, schema v12 —
+B5); the egui shell and every screen; M11 keyboard shortcuts, expanded settings,
+light theme + accents, and headless UI tests.
 
 **What is unverified (needs a live tenant / devices / a display):** every
 network write shape (U-002…U-006), the calendar's live Graph acceptance and the
@@ -61,7 +65,9 @@ acceptance (U-008), the optional Graph message-search fallback (expected to 403
 create/leave/mute/hide/roster acceptance (U-011), the live folder read/move and
 pin read (the folder lane cannot be stubbed offline; server unpin is
 unavailable — U-012), the live public-team search/join, member admin,
-team-settings and channel-reaction acceptance (U-003), the unified presence token
+team-settings and channel-reaction acceptance (U-003), the live
+recordings/transcripts Graph acceptance, the global channel fan-out and the
+name-only channel match (U-013), the unified presence token
 audience (B-009), desktop notifications and quiet hours (B-010), real call media
 (B-011), and the UI's actual pixels (B-012). See [`BLOCKERS.md`](BLOCKERS.md).
 
@@ -113,6 +119,7 @@ Newest last; full text in [`DECISIONS.md`](DECISIONS.md).
 - **ADR-038** — Chat creation/leave via the chat service, the server-vs-local mute reconciliation, and schema v10.
 - **ADR-039** — Folders & pins: `chats.folder_id` + a pin-membership table (schema v11), and the Graph-vs-thread pin sources.
 - **ADR-040** — Public-team join + member admin (Graph), and the dedicated Graph channel-reaction lanes.
+- **ADR-041** — Recordings & transcripts service, a schema-v12 `(id, profile)` cache, and reuse of the M7 download path.
 
 ## Open blockers (summary)
 
@@ -125,14 +132,16 @@ media cache unencrypted), **B-008** (call frames filtered from the hub; global
 hub; reconnect token staleness), **B-009** (unified presence token unverified),
 **B-010** (desktop notifications / quiet hours), **B-011** (live calls + real
 media), **B-012** (UI verified by wiring, not pixels; attachment picker stub),
-and unverified aspects **U-001…U-012** (U-003: live public-team search/join,
+and unverified aspects **U-001…U-013** (U-003: live public-team search/join,
 member admin, team-settings and channel-reaction acceptance; U-007: live calendar
 acceptance and the browser-only join-by-id fallback; U-008: live whoami and
 media-host acceptance; U-009: the optional Graph message-search fallback,
 expected to 403; U-010: live Graph drive/people search acceptance and the
 delegated scopes; U-011: live chat-service create/leave/mute/hide/roster
 acceptance; U-012: the live folder read/move and pin read, with the folder lane
-unstubbable offline and server unpin unavailable).
+unstubbable offline and server unpin unavailable; U-013: live
+recordings/transcripts acceptance, the global channel fan-out and the name-only
+channel match).
 
 ## How to verify by hand
 
@@ -141,8 +150,8 @@ unstubbable offline and server unpin unavailable).
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --workspace                 # default features, no device/network
-cargo test -p squads-core               # 417
-cargo test -p squads-app                # 38 (headless egui_kittest)
+cargo test -p squads-core               # 442
+cargo test -p squads-app                # 40 (headless egui_kittest)
 cargo test -p squads-protocol           # 377
 cargo fmt -p squads-core -p squads-app -- --check
 cargo clippy -p squads-core -p squads-app --all-targets
@@ -179,8 +188,12 @@ cargo build --workspace --release
    on a result; expand a team you own to see its **Members** and add/remove a
    member (add opens the people picker). Open a channel and react to a message
    (and a thread reply) — B4.
-9. Follow the per-milestone "How to verify manually" steps in
-   [`PROGRESS.md`](PROGRESS.md) for the network features (needs a real tenant).
+9. Open a chat you recorded a meeting in, open its **Info** pane and confirm the
+   **Recordings & transcripts** list (name/source/date/size/duration); press
+   **Download** on a row and confirm the file lands in the download directory.
+   On a channel, press **Refresh recordings** — B5.
+10. Follow the per-milestone "How to verify manually" steps in
+    [`PROGRESS.md`](PROGRESS.md) for the network features (needs a real tenant).
 
 ### Release/packaging
 

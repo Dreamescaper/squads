@@ -1682,3 +1682,127 @@ search/join, member admin and team-settings shapes are likewise unproven live;
 `create_channel` still rides Graph). B-007 (public-team names/descriptions,
 member names/emails and channel reaction state join chat content in the
 unencrypted store).
+
+---
+
+## B5 — Recordings & transcripts
+
+**Goal.** Let the user **list and open** meeting recordings and transcripts —
+the `api::recordings`/`api::transcripts` lanes M9's call layer left unused — by
+exposing them as Graph driveItems (OneDrive for chats/meetings, SharePoint for
+channels), reusing the M7 files download path, with a panel in the conversation
+info pane and offline tests throughout.
+
+**Landed.**
+
+- `api` (M2 module, extended) — typed, instrumented Graph wrappers in the
+  existing `ApiClient` style (redacting `Debug`, request counter, `tracing`
+  spans): `list_recordings` (`list_recordings_data`), `search_recordings`
+  (`search_recordings_data`), `list_transcripts` (`list_transcripts_data`) and
+  `search_transcripts` (`search_transcripts_data`). The B5 pure helpers/types
+  are re-exported (`recordings_children_path`, `recordings_search_path`,
+  `is_recording_video`, `sort_recordings_newest`, `recordings_clamp_limit`,
+  `RECORDINGS_MAX_LIMIT`, `parse_recordings_response`, `RecordingInfo`,
+  `RecordingSource`; and `transcripts_children_path`, `transcripts_search_path`,
+  `is_transcript`, `sort_transcripts_newest`, `transcripts_clamp_limit`,
+  `TRANSCRIPTS_MAX_LIMIT`, `parse_transcripts_response`, `TranscriptInfo`,
+  `TranscriptSource`). The vendored lanes are **global** — one call fans out
+  over OneDrive **and** every channel drive (a bounded `list_teams_data` scan
+  plus per-channel `filesFolder` lookups) and returns one merged, newest-first
+  list; there is no per-chat/per-channel variant and no paging cursor, so a limit
+  is clamped by the vendored path builder (`1..=50` recordings, `1..=100`
+  transcripts).
+- `model` — [`Recording`](../crates/squads-core/src/model.rs) and
+  [`Transcript`](../crates/squads-core/src/model.rs) (owned mirrors of the
+  vendored `RecordingInfo`/`TranscriptInfo`), plus an owned
+  [`RecordingSource`](../crates/squads-core/src/model.rs) (`OneDrive` /
+  `Channel { team, channel }`, with `is_channel`/`label`/`team_name`/
+  `channel_name`; `TranscriptSource` is the same shape under its own name). A
+  recording carries `is_video` (computed with the vendored predicate; always
+  `true` from the wire — the parser already drops non-videos), `duration_ms` and
+  a pre-authenticated `download_url`; a transcript has **no** `download_url` on
+  the wire, so its bytes always ride the drive content path. The wire carries
+  **no** chat/meeting association and names a channel's team/channel by
+  **display name**, so the model documents that and the service filters by
+  source. Each type has `as_file_entry()` so download reuses the M7 path.
+- `store` — **schema v12**. `recordings` and `transcripts`, each keyed
+  **`(id, profile)`** (the driveItem id matches the store's convention and the
+  M7 ADR-019 rationale: `drive_id` is optional and SQLite treats `NULL` keys as
+  distinct, so keying on it would break the `Option` round-trip), with a
+  nullable non-key `scope` (the owning chat/channel id), the source columns
+  (`source_kind`/`source_team`/`source_channel`) and the driveItem fields.
+  Methods `upsert_recordings`/`upsert_transcripts` (idempotent and **additive**:
+  a later global listing cannot wipe a conversation's scope or a cached drive
+  id/URL), `recordings_for_scope`/`transcripts_for_scope`, `all_recordings`/
+  `all_transcripts` and `recording`/`transcript`. `SCHEMA_VERSION = 12`; the
+  v11→v12 migration is `CREATE TABLE/INDEX IF NOT EXISTS` (re-entrant) and the
+  "newer version is a hard error" behaviour is unchanged.
+- `recordings` (new) — the `Recordings { profile, Arc<Store>, Arc<ApiClient>,
+  Files }` service: `recordings_for_chat` (keeps the **OneDrive** rows — a
+  chat/meeting recording lives in the organizer's OneDrive — caches them under
+  the chat), `recordings_for_channel` (keeps the **channel** rows, matched to the
+  requested channel by its cached display name, cached under the channel),
+  `search_recordings` (the global drive-search, cached chatlessly),
+  `transcripts_for_chat`/`transcripts_for_channel`/`search_transcripts`, the
+  local reads `cached_recordings`/`cached_transcripts`, and `download` /
+  `download_transcript` — which project the entry onto a
+  [`FileEntry`](../crates/squads-core/src/model.rs) and call the M7
+  [`Files::download`](../crates/squads-core/src/files.rs), so the buffered
+  transfer and coarse `(0,size)`/`(written,size)` progress are exactly the M7
+  ones. Redacting `Debug`.
+- `session` — `Session::recordings()` mirrors the other services (shares the
+  store and the cached `Arc<ApiClient>`; offline to build; `NotSignedIn` without
+  tokens).
+- `crates/squads-app` — a **Recordings & transcripts** section in the
+  conversation info pane: each recording/transcript row shows its name, source
+  label, size, modified date and (recordings) duration, with a **Download**
+  action (disabled when the wire named no drive) reusing the M7 download; a
+  **Refresh recordings** affordance resolves the chat-vs-channel slice (a
+  channel resolves its team from the cached channel) and runs on the existing
+  `AppRuntime`/`AppEvent` bridge (`AppEvent::RecordingsLoaded`), with
+  empty/loading states. The panel paints from the store when the conversation is
+  selected (offline); repaints happen only when something changed (ADR-027).
+
+**Decisions.** **ADR-041** (the recordings/transcripts service, the schema-v12
+`(id, profile)` + `scope` key, the global-lane source split, and the reuse of the
+M7 download path).
+
+**Tests.** `cargo test -p squads-core` — **442** (B4's 417 + **25** new: 2
+`model` (the `Recording`/`Transcript` conversions + the file-entry projection),
+3 `store` (the recordings/transcripts round-trip + scope, the additive upsert,
+the **v11→v12** migration), 3 `api` (the OneDrive list request line + the Graph
+bearer, the transcripts drive-search + blank-query refusal, the re-exported pure
+helpers), 16 `recordings` and 1 `session`). `cargo test -p squads-app` — **40**
+(B4's 38 + **2** new: the info-pane panel renders seeded recordings/transcripts
+and queues the Download actions; the empty state renders and Refresh queues the
+action). `cargo test -p squads-protocol` still passes **377**. `cargo build
+--workspace` (default features) succeeds and `cargo fmt -p squads-core -p
+squads-app -- --check` is clean. New coverage includes: the `Recording`/
+`Transcript` conversions (source mirror + labels + `is_video` + the transcript's
+absent download URL + JSON round-trip); the **full global lane request shapes**
+against a stub (the OneDrive `Recordings` children path, the `joinedTeams` scan,
+the channel `filesFolder`, the folder children and the `Recordings` folder
+children, all with the Graph bearer) for both recordings and transcripts; the
+`search_recordings`/`search_transcripts` drive-search path (and a blank query
+rejected before any network); the source split (`recordings_for_chat` keeps only
+OneDrive, `recordings_for_channel` only the name-matched channel, an unknown name
+keeps every channel row); the store round-trip/scope/additive-upsert and the
+**v11→v12 upgrade** (a hand-built v11 database gains the tables, is writable and
+survives a reopen); the download reusing `/drives/{d}/items/{i}/content` (with
+the M7 progress points and a drive-less rejection before any network); and the
+headless panel rendering + Download/Refresh actions.
+
+**How to verify manually** (real tenant; not runnable here): sign in, open a
+chat you recorded a meeting in, open **Info** and confirm the **Recordings &
+transcripts** list (name, source, date, size, duration); press **Download** and
+confirm the file lands in the configured download directory. Open a channel
+meeting's channel, press **Refresh recordings** and confirm the channel's
+SharePoint recordings appear. The live acceptance is unverified — see **U-013**.
+
+**Blockers.** **U-013** (live Graph acceptance of the recordings/transcripts
+lanes — whether the Teams first-party Graph token carries the delegated
+`Files.Read` scope for the OneDrive/`filesFolder`/drive-search reads, whether a
+real `Recordings` folder/`video` facet/`.vtt` item matches the projection, and
+the global lane's channel fan-out cost — is unverified; the request shapes are
+pinned offline). B-007 (recording/transcript names and URLs join chat content in
+the unencrypted store).

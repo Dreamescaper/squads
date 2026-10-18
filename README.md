@@ -3,10 +3,12 @@
 An alternative, cross-platform **Microsoft Teams** client built with **Rust** and
 [**egui**](https://github.com/emilk/egui) (immediate-mode, event-driven, glow/OpenGL).
 
-> Status: the planned milestones (**M0–M13**) are implemented. The workspace
-> builds and tests **offline, with default features**; the network paths need a
-> live tenant and the UI needs a display, neither of which exist in the build
-> environment. See [`docs/STATUS.md`](docs/STATUS.md) for the one-screen state and
+> Status: the planned milestones (**M0–M13**) and the backlog items (**B1–B5**)
+> are implemented (the only remaining backlog entry, **B6**, is an explicit
+> *not planned* list). The workspace builds and tests **offline, with default
+> features**; the network paths need a live tenant and the UI needs a display,
+> neither of which exist in the build environment. See
+> [`docs/STATUS.md`](docs/STATUS.md) for the one-screen state and
 > [`docs/PLAN.md`](docs/PLAN.md) for the roadmap.
 
 ## Why
@@ -56,6 +58,7 @@ crates/
 | Team administration | **Browse public teams** (search + join), an owner-gated **member roster** (add via the people picker, remove with confirmation), team settings, and a **channel reaction** affordance (existing chips remove, the six picker emojis add, thread replies included) | Live Graph acceptance of public-team search/join, member admin, team settings and the Graph channel-reaction lane (U-003) | Paging the public-team search (single window, 25) |
 | Calendar | Graph `calendarView` agenda + week view, schedule/cancel, offline `meetings` cache, join hand-off to calls | Live Graph calendar acceptance; join-by-id is a browser fallback (U-007) | — |
 | Files | Graph list/upload/download/links/versions, coarse progress | Real SharePoint/OneDrive acceptance (U-004) | Streaming I/O |
+| Recordings & transcripts | Global OneDrive/SharePoint recording + transcript list/search (source split by chat vs channel), a **Recordings & transcripts** info-pane panel (name/source/date/size/duration + Download), schema v12 | Live Graph acceptance, the global channel fan-out and the name-only channel match (U-013) | Organizer-owned transcripts (unreachable by design) |
 | Presence | Two backends, unified by default; pure mapping | Unified token audience/shapes (B-009/U-005) | Quiet hours (B-010) |
 | Notifications | Pure routing, unread/activity, settings switches | Desktop toasts (need DBus, B-010) | Quiet hours |
 | Calls | State machine, epconv signalling, SDP/SRTP/RTP, loopback, call log | Live calls + real media devices (B-011/U-006) | Hardware video (D-002) |

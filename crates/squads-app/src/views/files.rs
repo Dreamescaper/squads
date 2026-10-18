@@ -139,7 +139,7 @@ fn file_row(app: &mut SquadsApp, ui: &mut Ui, file: &FileEntry, chat_id: &str) {
 }
 
 /// Format a byte count for humans (`1.5 MiB`).
-fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut size = bytes as f64;
     let mut unit = 0;

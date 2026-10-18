@@ -16,16 +16,22 @@
 //! are clickable to remove and the six picker emojis add one, all queued as
 //! [`Action::ReactInChannel`] and routed to the dedicated Graph channel-reaction
 //! lane (thread replies included). Chat reactions keep the read-only chips.
+//!
+//! **B5** adds the **recordings & transcripts** panel to the info pane: the
+//! selected conversation's cached recordings/transcripts (name, source, date,
+//! size, duration) with a **Download** action reusing the M7 files path, plus a
+//! **Refresh recordings** affordance and empty/loading states.
 
 use std::path::Path;
 
 use egui::{RichText, Ui};
 use squads_core::SendState;
-use squads_core::model::Message;
+use squads_core::model::{Message, Recording, Transcript};
 use squads_core::text::image_urls;
 
-use crate::app::{Action, MediaState, SquadsApp, short_time};
+use crate::app::{Action, MediaState, SquadsApp, short_date, short_time};
 use crate::views::composer;
+use crate::views::files::human_size;
 
 /// The largest an inline image is drawn, regardless of its natural size.
 const MAX_IMAGE_WIDTH: f32 = 320.0;
@@ -103,6 +109,8 @@ pub fn show(app: &mut SquadsApp, ui: &mut Ui) {
                     }
                     ui.label(format!("Chat id: {chat_id}"));
                     ui.label(format!("Unread: {}", app.unread_count(&chat_id)));
+                    ui.separator();
+                    recordings_panel(app, ui, &chat_id);
                     ui.separator();
                     pinned_panel(app, ui, &chat_id);
                 });
@@ -197,6 +205,117 @@ fn pinned_panel(app: &mut SquadsApp, ui: &mut Ui, chat_id: &str) {
             }
         });
         ui.separator();
+    }
+}
+
+/// The recordings & transcripts panel (B5): the selected conversation's cached
+/// recordings/transcripts (name, source, date, size, duration) with a
+/// **Download** action.
+///
+/// The rows are painted from the store when the conversation is selected
+/// (offline); **Refresh recordings** re-fetches the relevant slice (the OneDrive
+/// set for a chat, the channel's SharePoint set for a channel). Both actions go
+/// through the normal Action pipeline — nothing here touches the network.
+fn recordings_panel(app: &mut SquadsApp, ui: &mut Ui, _chat_id: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Recordings & transcripts").strong());
+        if ui.small_button("Refresh recordings").clicked() {
+            app.push_action(Action::RefreshRecordings);
+        }
+    });
+    if app.recordings_loading() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(RichText::new("Loading…").weak().small());
+        });
+    }
+    let recordings = app.recordings().to_vec();
+    let transcripts = app.transcripts().to_vec();
+    if recordings.is_empty() && transcripts.is_empty() {
+        if !app.recordings_loading() {
+            ui.label(
+                RichText::new("No recordings or transcripts.")
+                    .weak()
+                    .small(),
+            );
+        }
+        return;
+    }
+    for recording in &recordings {
+        recording_row(app, ui, recording);
+    }
+    for transcript in &transcripts {
+        transcript_row(app, ui, transcript);
+    }
+}
+
+/// One recording row: `[rec]` name, source, size, modified date and duration,
+/// with a Download action (disabled when the wire named no drive).
+fn recording_row(app: &mut SquadsApp, ui: &mut Ui, recording: &Recording) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("[rec]").weak().monospace());
+        ui.label(recording.name.as_str());
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(recording.source.label()).weak().small());
+        ui.label(RichText::new(human_size(recording.size)).weak().small());
+        if let Some(modified) = &recording.modified {
+            ui.label(RichText::new(short_date(modified)).weak().small());
+        }
+        if let Some(ms) = recording.duration_ms {
+            ui.label(RichText::new(duration_label(ms)).weak().small());
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let can_download = recording.drive_id.is_some();
+            if ui
+                .add_enabled(can_download, egui::Button::new("Download recording"))
+                .clicked()
+            {
+                app.push_action(Action::DownloadRecording {
+                    id: recording.id.clone(),
+                });
+            }
+        });
+    });
+    ui.separator();
+}
+
+/// One transcript row: `[vtt]` name, source, size and modified date, with a
+/// Download action.
+fn transcript_row(app: &mut SquadsApp, ui: &mut Ui, transcript: &Transcript) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("[vtt]").weak().monospace());
+        ui.label(transcript.name.as_str());
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(transcript.source.label()).weak().small());
+        ui.label(RichText::new(human_size(transcript.size)).weak().small());
+        if let Some(modified) = &transcript.modified {
+            ui.label(RichText::new(short_date(modified)).weak().small());
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let can_download = transcript.drive_id.is_some();
+            if ui
+                .add_enabled(can_download, egui::Button::new("Download transcript"))
+                .clicked()
+            {
+                app.push_action(Action::DownloadTranscript {
+                    id: transcript.id.clone(),
+                });
+            }
+        });
+    });
+    ui.separator();
+}
+
+/// Format a millisecond duration as `m:ss` (or `h:mm:ss` past an hour).
+fn duration_label(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let (hours, minutes, seconds) = (total_secs / 3600, (total_secs % 3600) / 60, total_secs % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
     }
 }
 

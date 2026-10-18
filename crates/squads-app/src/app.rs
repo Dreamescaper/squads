@@ -29,13 +29,14 @@ use std::time::Duration;
 
 use squads_core::api::JoinTarget;
 use squads_core::model::{
-    Channel, Identity, Meeting, Message, Person, PublicTeam, SearchHit, SendState, TeamMember,
+    Channel, Identity, Meeting, Message, Person, PublicTeam, Recording, SearchHit, SendState,
+    TeamMember, Transcript,
 };
 use squads_core::{
     Accent, AppDirs, Calendar, CallIdentity, CallLogEntry, CallService, CallState, Chat,
     ChatFolder, Chats, ContactPresence, FileEntry, Files, Folders, IncomingCall, MediaCache,
-    Messaging, NotificationContext, People, PinnedMessage, Pins, RealtimeEvent, Search, Session,
-    Settings, SignInProgress, Store, Team, Teams, Theme,
+    Messaging, NotificationContext, People, PinnedMessage, Pins, RealtimeEvent, Recordings, Search,
+    Session, Settings, SignInProgress, Store, Team, Teams, Theme,
 };
 
 use crate::runtime::{AppEvent, AppRuntime};
@@ -51,6 +52,8 @@ pub const TIMELINE_LIMIT: usize = 300;
 pub const FILE_SEARCH_LIMIT: usize = 25;
 /// How many directory people to request for the picker (Graph caps at 25).
 pub const PEOPLE_LIMIT: usize = 25;
+/// How many recordings/transcripts to request per conversation (B5).
+pub const RECORDINGS_LIMIT: usize = 50;
 
 /// Which top-level section the nav rail selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -291,6 +294,18 @@ pub enum Action {
         chat_id: String,
         /// DriveItem id.
         file_id: String,
+    },
+    /// Refresh the selected conversation's recordings/transcripts (B5).
+    RefreshRecordings,
+    /// Download one recording to the local download directory (B5).
+    DownloadRecording {
+        /// The recording's driveItem id.
+        id: String,
+    },
+    /// Download one transcript to the local download directory (B5).
+    DownloadTranscript {
+        /// The transcript's driveItem id.
+        id: String,
     },
     /// Fetch and cache one inline media URL (M13).
     LoadMedia {
@@ -540,6 +555,13 @@ pub struct SquadsApp {
     join_input: String,
     join_passcode: String,
 
+    /// Recordings & transcripts (B5): the service handle, the selected
+    /// conversation's cached rows, and whether a refresh is in flight.
+    recordings_svc: Option<Arc<Recordings>>,
+    recordings: Vec<Recording>,
+    transcripts: Vec<Transcript>,
+    recordings_loading: bool,
+
     call_state: CallState,
     call_log: Vec<CallLogEntry>,
     incoming: Option<IncomingCall>,
@@ -712,6 +734,10 @@ impl SquadsApp {
             new_meeting_timezone: "UTC".to_string(),
             join_input: String::new(),
             join_passcode: String::new(),
+            recordings_svc: None,
+            recordings: Vec::new(),
+            transcripts: Vec::new(),
+            recordings_loading: false,
             call_state: CallState::Idle,
             call_log: Vec::new(),
             incoming: None,
@@ -930,6 +956,23 @@ impl SquadsApp {
     /// The selected chat's cached pinned messages (B2b).
     pub fn pins(&self) -> &[PinnedMessage] {
         &self.pins
+    }
+
+    // ----- B5: recordings & transcripts -------------------------------------
+
+    /// The selected conversation's cached recordings, newest first (B5).
+    pub fn recordings(&self) -> &[Recording] {
+        &self.recordings
+    }
+
+    /// The selected conversation's cached transcripts, newest first (B5).
+    pub fn transcripts(&self) -> &[Transcript] {
+        &self.transcripts
+    }
+
+    /// Whether a recordings/transcripts refresh is in flight (B5).
+    pub fn recordings_loading(&self) -> bool {
+        self.recordings_loading
     }
 
     // ----- B4: team administration ------------------------------------------
@@ -2101,6 +2144,12 @@ impl SquadsApp {
                 Err(e) => self.push_error(e),
             }
         }
+        if self.recordings_svc.is_none() {
+            match self.session.recordings() {
+                Ok(service) => self.recordings_svc = Some(Arc::new(service)),
+                Err(e) => self.push_error(e),
+            }
+        }
         if self.media_cache.is_none() {
             // The inline-media cache authenticates Microsoft hosts with the
             // skype token (M13); build it once signed in.
@@ -2235,6 +2284,24 @@ impl SquadsApp {
         }
     }
 
+    /// Paint the selected conversation's cached recordings/transcripts from the
+    /// store (offline; B5). No-op when no conversation is selected.
+    fn reload_recordings_from_store(&mut self) {
+        let Some(chat_id) = self.selected_chat.clone() else {
+            self.recordings.clear();
+            self.transcripts.clear();
+            return;
+        };
+        match self.store.recordings_for_scope(&self.profile, &chat_id) {
+            Ok(rows) => self.recordings = rows,
+            Err(e) => self.push_error(e),
+        }
+        match self.store.transcripts_for_scope(&self.profile, &chat_id) {
+            Ok(rows) => self.transcripts = rows,
+            Err(e) => self.push_error(e),
+        }
+    }
+
     fn push_error(&mut self, error: impl std::fmt::Display) {
         let text = error.to_string();
         tracing::warn!(error = %text, "app error");
@@ -2318,6 +2385,8 @@ impl SquadsApp {
             .unwrap_or_default();
         // B2b: paint the selected chat's cached pins immediately (offline).
         self.reload_pins_from_store();
+        // B5: paint the selected conversation's cached recordings (offline).
+        self.reload_recordings_from_store();
 
         let Some(messaging) = self.messaging.clone() else {
             return;
@@ -2461,6 +2530,112 @@ impl SquadsApp {
         let dest_path = dest.to_string_lossy().into_owned();
         self.runtime.spawn(async move {
             match files.download(&entry, &dest_path, |_, _| {}).await {
+                Ok(_) => AppEvent::Error(format!("downloaded {}", dest.display())),
+                Err(e) => AppEvent::Error(format!("download: {e}")),
+            }
+        });
+    }
+
+    // ----- B5: recordings & transcripts ------------------------------------
+
+    /// Refresh the selected conversation's recordings/transcripts: paint the
+    /// cache, then fetch the relevant slice (the OneDrive set for a chat, the
+    /// channel's SharePoint set for a channel).
+    fn refresh_recordings(&mut self) {
+        self.recordings_loading = true;
+        self.reload_recordings_from_store();
+        let Some(svc) = self.recordings_svc.clone() else {
+            self.recordings_loading = false;
+            return;
+        };
+        let Some(chat_id) = self.selected_chat.clone() else {
+            self.recordings_loading = false;
+            return;
+        };
+        // A channel conversation resolves its team from the cached channel so
+        // the channel slice can be matched by name (B5); an unknown team still
+        // takes the channel path (the service then keeps every channel row).
+        let is_channel = squads_core::is_channel_conversation_id(&chat_id);
+        let team_id = if is_channel {
+            self.store
+                .team_for_channel(&self.profile, &chat_id)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        self.runtime.spawn(async move {
+            let outcome = async {
+                if is_channel {
+                    let team = team_id.as_deref().unwrap_or("");
+                    let recordings = svc
+                        .recordings_for_channel(team, &chat_id, RECORDINGS_LIMIT)
+                        .await?;
+                    let transcripts = svc
+                        .transcripts_for_channel(team, &chat_id, RECORDINGS_LIMIT)
+                        .await?;
+                    Ok::<_, squads_core::CoreError>((recordings, transcripts))
+                } else {
+                    let recordings = svc.recordings_for_chat(&chat_id, RECORDINGS_LIMIT).await?;
+                    let transcripts = svc.transcripts_for_chat(&chat_id, RECORDINGS_LIMIT).await?;
+                    Ok::<_, squads_core::CoreError>((recordings, transcripts))
+                }
+            }
+            .await;
+            match outcome {
+                Ok((recordings, transcripts)) => AppEvent::RecordingsLoaded {
+                    chat_id,
+                    recordings,
+                    transcripts,
+                },
+                Err(e) => AppEvent::Error(format!("recordings: {e}")),
+            }
+        });
+    }
+
+    /// Download one recording (resolved from the in-memory list, then the
+    /// store) to the configured download directory (B5). Reuses the M7 path.
+    fn download_recording(&mut self, id: String) {
+        let Some(svc) = self.recordings_svc.clone() else {
+            return;
+        };
+        let entry = self
+            .recordings
+            .iter()
+            .find(|recording| recording.id == id)
+            .cloned()
+            .or_else(|| self.store.recording(&self.profile, &id).ok().flatten());
+        let Some(entry) = entry else {
+            return;
+        };
+        let dest = self.download_target().join(&entry.name);
+        let dest_path = dest.to_string_lossy().into_owned();
+        self.runtime.spawn(async move {
+            match svc.download(&entry, &dest_path, |_, _| {}).await {
+                Ok(_) => AppEvent::Error(format!("downloaded {}", dest.display())),
+                Err(e) => AppEvent::Error(format!("download: {e}")),
+            }
+        });
+    }
+
+    /// Download one transcript to the configured download directory (B5).
+    fn download_transcript(&mut self, id: String) {
+        let Some(svc) = self.recordings_svc.clone() else {
+            return;
+        };
+        let entry = self
+            .transcripts
+            .iter()
+            .find(|transcript| transcript.id == id)
+            .cloned()
+            .or_else(|| self.store.transcript(&self.profile, &id).ok().flatten());
+        let Some(entry) = entry else {
+            return;
+        };
+        let dest = self.download_target().join(&entry.name);
+        let dest_path = dest.to_string_lossy().into_owned();
+        self.runtime.spawn(async move {
+            match svc.download_transcript(&entry, &dest_path, |_, _| {}).await {
                 Ok(_) => AppEvent::Error(format!("downloaded {}", dest.display())),
                 Err(e) => AppEvent::Error(format!("download: {e}")),
             }
@@ -2834,6 +3009,18 @@ impl SquadsApp {
                     self.reload_timeline();
                 }
             }
+            AppEvent::RecordingsLoaded {
+                chat_id,
+                recordings,
+                transcripts,
+            } => {
+                // Only apply a response for the conversation still selected (B5).
+                if self.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                    self.recordings = recordings;
+                    self.transcripts = transcripts;
+                }
+                self.recordings_loading = false;
+            }
             AppEvent::PresenceUpdated(list) => {
                 for presence in list {
                     self.presence.insert(presence.mri.clone(), presence);
@@ -3089,6 +3276,9 @@ impl SquadsApp {
             } => self.schedule_meeting(subject, start, end, time_zone),
             Action::CancelMeeting { event_id } => self.cancel_meeting(event_id),
             Action::DownloadFile { chat_id, file_id } => self.download_file(chat_id, file_id),
+            Action::RefreshRecordings => self.refresh_recordings(),
+            Action::DownloadRecording { id } => self.download_recording(id),
+            Action::DownloadTranscript { id } => self.download_transcript(id),
             Action::LoadMedia { url } => self.load_media(url),
             Action::PlaceCall {
                 thread_id,

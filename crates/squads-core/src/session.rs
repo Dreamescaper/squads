@@ -45,6 +45,7 @@ use crate::people::People;
 use crate::pins::Pins;
 use crate::presence::{Presence, presence_base_from_region};
 use crate::realtime::{RealtimeEvent, RealtimeService};
+use crate::recordings::Recordings;
 use crate::search::Search;
 use crate::store::{Account, Store};
 use crate::teams::Teams;
@@ -364,6 +365,23 @@ impl Session {
     pub fn calendar(&mut self) -> Result<Calendar> {
         let client = self.api_arc()?;
         Ok(Calendar::new(
+            self.profile.clone(),
+            Arc::clone(&self.store),
+            client,
+        ))
+    }
+
+    /// The B5 recordings & transcripts service for this session.
+    ///
+    /// Shares the session's [`Store`] and protocol client (the same
+    /// `Arc<ApiClient>` [`Session::messaging`] hands out) and builds an internal
+    /// [`Files`] so download reuses the M7 path. Requires a token set
+    /// ([`CoreError::NotSignedIn`] otherwise); building is offline. The returned
+    /// [`Recordings`] is stateless beyond the shared store/client, so callers
+    /// may build a fresh handle whenever they like.
+    pub fn recordings(&mut self) -> Result<Recordings> {
+        let client = self.api_arc()?;
+        Ok(Recordings::new(
             self.profile.clone(),
             Arc::clone(&self.store),
             client,
@@ -1602,6 +1620,36 @@ mod tests {
         assert!(session.has_api());
         assert_eq!(session.api().unwrap().request_count(), 0);
 
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp2).ok();
+    }
+
+    // ----- B5: recordings & transcripts --------------------------------------
+
+    #[test]
+    fn recordings_requires_tokens_and_shares_the_store_and_client() {
+        let (tmp, dirs_a) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs_a, "default", store).expect("session");
+        // No tokens yet: building the service must fail cleanly, no network.
+        let err = session.recordings().unwrap_err();
+        assert!(matches!(err, CoreError::NotSignedIn), "got {err:?}");
+
+        let (tmp2, dirs2) = dirs();
+        let store2 = Arc::new(MemoryTokenStore::new());
+        store2.save("work", &sample_set()).unwrap();
+        let mut session = Session::with_store(dirs2, "work", store2).expect("session");
+        session.restore().expect("restore");
+
+        let recordings = session.recordings().expect("recordings");
+        assert_eq!(recordings.profile(), "work");
+        assert!(Arc::ptr_eq(recordings.store(), session.store()));
+        assert_eq!(
+            recordings.client().request_count(),
+            0,
+            "building the service is offline"
+        );
+        assert!(session.has_api());
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&tmp2).ok();
     }

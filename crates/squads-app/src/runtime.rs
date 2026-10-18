@@ -29,7 +29,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use squads_core::api::JoinTarget;
 use squads_core::model::{
     CallLogEntry, Chat, ChatFolder, FileEntry, Meeting, Message, Person, PinnedMessage, PublicTeam,
-    SearchHit, Team, TeamMember,
+    Recording, SearchHit, Team, TeamMember, Transcript,
 };
 use squads_core::{CallState, Channel, ContactPresence, Identity, RealtimeEvent, SignInProgress};
 
@@ -166,6 +166,16 @@ pub enum AppEvent {
         /// Owning conversation.
         chat_id: String,
     },
+    /// The recordings/transcripts of one conversation were refreshed (B5); the
+    /// app paints them from the cache.
+    RecordingsLoaded {
+        /// Owning conversation (chat or channel).
+        chat_id: String,
+        /// The cached recordings, newest first.
+        recordings: Vec<Recording>,
+        /// The cached transcripts, newest first.
+        transcripts: Vec<Transcript>,
+    },
     /// Batch presence for a set of contacts. No producer is wired yet (the M11
     /// presence panel will emit it); the variant is part of the event vocabulary.
     #[allow(dead_code)]
@@ -213,6 +223,7 @@ impl AppEvent {
             AppEvent::TeamMembersLoaded { .. } => "team_members_loaded",
             AppEvent::TeamMemberChanged { .. } => "team_member_changed",
             AppEvent::ReactionsChanged { .. } => "reactions_changed",
+            AppEvent::RecordingsLoaded { .. } => "recordings_loaded",
             AppEvent::PresenceUpdated(_) => "presence_updated",
             AppEvent::Realtime(_) => "realtime",
             AppEvent::CallState(_) => "call_state",

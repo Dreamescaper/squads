@@ -1923,3 +1923,110 @@ The vendored surfaces:
   `ApiClient::create_channel`.
 - No encryption change: public-team names/descriptions, member names/emails and
   channel reaction state join chat content in the plaintext store (B-007).
+
+---
+
+## ADR-041 — Recordings & transcripts service, a schema-v12 `(id, profile)` cache, and reuse of the M7 download path
+
+**Status:** accepted (B5)
+
+**Context.** Backlog item **B5** exposes the two lanes M9's call layer left
+unused — `api::recordings` and `api::transcripts` — so meeting recordings and
+transcripts can be **listed and opened**. Both are plain Graph **driveItems**: a
+non-channel meeting's recording/transcript lives in the signed-in user's OneDrive
+`Recordings` folder and a channel meeting's in the channel's SharePoint
+`filesFolder/Recordings`. Three things had to be settled: how the vendored
+(global) lane maps onto a conversation, where the rows are cached, and how the
+bytes are transferred.
+
+The vendored surfaces:
+
+- `list_recordings_data(client, limit)` / `list_transcripts_data(client, limit)`
+  are **global**: one call fans out over OneDrive **and** every channel drive (a
+  bounded `list_teams_data` scan plus per-channel `filesFolder`/children
+  lookups), merges the results and sorts them newest-first. There is **no**
+  per-chat/per-channel variant and **no** paging cursor; a limit is clamped by
+  the pure path builder (`RECORDINGS_MAX_LIMIT = 50`, `TRANSCRIPTS_MAX_LIMIT =
+  100`). The transcripts lane additionally falls back to a bounded full-drive
+  search when the folder scan finds zero rows.
+- The wire projection (`RecordingInfo` / `TranscriptInfo`) carries
+  `id`/`name`/`size`/`mime`/`web_url`/`drive_id`/`created`/`modified` and a
+  **source** (`OneDrive` or `Channel { team, channel }`, named by **display
+  name**). It carries **no** chat/meeting association and **no** team/channel
+  id; a recording carries a `video` facet (duration) and a pre-authenticated
+  `download_url`, a transcript carries neither.
+- Downloads reuse the M7 files stack: `/drives/{d}/items/{i}/content` (a
+  transcript's only path; a recording may instead stream its `download_url`).
+
+**Decision.**
+
+1. **Wrap the vendored calls, global.** `ApiClient` gains `list_recordings`,
+   `search_recordings`, `list_transcripts` and `search_transcripts`, in the
+   existing instrumented (redacting `Debug`, request counter, `tracing` spans)
+   style, and re-exports the B5 pure helpers/types. The wrappers do **not**
+   invent a source parameter the vendored functions do not take.
+2. **Owned models.** `model::Recording` and `model::Transcript` mirror the wire
+   projections (with an owned `RecordingSource` — `TranscriptSource` is the same
+   shape under its own name — carrying `is_channel`/`label`/`team_name`/
+   `channel_name`). `Recording::is_video` is computed with the vendored
+   predicate (always `true` from the wire: the parser drops non-videos).
+   `as_file_entry()` projects either type onto a `FileEntry` so the M7 download
+   path can transfer it unchanged. The absent chat/meeting association and the
+   name-only channel identity are **documented on the types** rather than
+   guessed.
+3. **A `Recordings` service that slices the global lane by source.**
+   `Recordings { profile, Arc<Store>, Arc<ApiClient>, Files }`:
+   - `recordings_for_chat` keeps the **OneDrive** rows (a chat/meeting recording
+     lives in the organizer's OneDrive) and caches them under the chat id;
+   - `recordings_for_channel` keeps the **channel** rows, matched to the
+     requested channel by its **cached display name** (the wire names no id;
+     when the name cannot be resolved every channel row is kept — documented),
+     and caches them under the channel id;
+   - `search_recordings`/`search_transcripts` are the global drive-search (all
+     sources), cached chatlessly;
+   - `transcripts_for_chat`/`transcripts_for_channel` mirror the recording split;
+   - the local reads `cached_recordings`/`cached_transcripts`.
+   `Session::recordings()` mirrors the other services.
+4. **Store (schema v12).** `recordings` and `transcripts` are keyed
+   **`(id, profile)`** — the driveItem id matches the store's convention and the
+   M7 **ADR-019** rationale: `drive_id` is optional and SQLite treats `NULL`
+   keys as distinct, so keying on it would break the `Option` round-trip. A
+   nullable non-key `scope` holds the owning chat/channel id (a global listing
+   leaves it `NULL`), mirroring `files.chat_id`; the source is persisted as
+   `source_kind`/`source_team`/`source_channel`. Upserts are idempotent and
+   **additive** (`COALESCE` on the optional columns), so a later global listing
+   cannot wipe a conversation's scope or a cached drive id/URL. The migration is
+   `CREATE TABLE/INDEX IF NOT EXISTS`; `SCHEMA_VERSION = 12`, forward-only,
+   re-entrant, a newer `user_version` still a hard error.
+5. **Download reuses the M7 path.** `Recordings::download` /
+   `download_transcript` project the entry onto a `FileEntry` and call
+   [`Files::download`](../crates/squads-core/src/files.rs), so the buffered
+   transfer and the coarse `(0, size)`/`(written, size)` progress reporting are
+   exactly the M7 ones (ADR-020); a drive-less item is rejected before any
+   network with the same guard.
+6. **The app.** A **Recordings & transcripts** panel in the conversation info
+   pane: each row shows its name, source label, size, modified date and
+   (recordings) duration, with a **Download** action and a **Refresh
+   recordings** affordance that resolves the chat-vs-channel slice (a channel
+   resolves its team from the cached channel). All of it rides the existing
+   `AppRuntime`/`AppEvent` bridge (`AppEvent::RecordingsLoaded`) and repaints
+   only when something changed (ADR-027).
+
+**Consequences.**
+
+- The lane is fully offline-testable: the OneDrive `Recordings` children path,
+  the `joinedTeams` scan, the channel `filesFolder` and folder-children paths,
+  the drive-search, the source split, the store round-trip and the **v11→v12**
+  migration are all pinned by stubs/tests.
+- **The vendored lane is global and unscopable**, so `recordings_for_channel`
+  matches by cached display name and falls back to every channel row when the
+  name is unknown; a chat listing still performs the full channel fan-out
+  (there is no OneDrive-only vendored function). Both are documented on the
+  service, not hidden.
+- **Live acceptance is unverified** (U-013): whether the Teams first-party Graph
+  token carries the delegated `Files.Read` scope for these reads, whether a real
+  `Recordings` folder/`video` facet/`.vtt` item matches the projection, and the
+  real fan-out cost are assumed from the vendored crate + stubs. A 403 surfaces
+  as the vendored error unchanged.
+- No encryption change: recording/transcript names and URLs join chat content in
+  the plaintext store (B-007).

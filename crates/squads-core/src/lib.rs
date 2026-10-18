@@ -25,6 +25,7 @@ pub mod people;
 pub mod pins;
 pub mod presence;
 pub mod realtime;
+pub mod recordings;
 pub mod search;
 pub mod session;
 pub mod settings;
@@ -49,8 +50,8 @@ pub use messaging::{HistoryPage, Messaging};
 pub use model::{
     CallDirection, CallLogEntry, CallOutcome, Channel, Chat, ChatFolder, ChatMember, FileEntry,
     FileVersion, Identity, Meeting, Message, Person, PinnedMessage, PublicTeam, Reaction, Reactor,
-    SearchHit, SendState, SharedLink, Team, TeamMember, TeamSettings, is_channel_conversation_id,
-    is_system_folder,
+    Recording, RecordingSource, SearchHit, SendState, SharedLink, Team, TeamMember, TeamSettings,
+    Transcript, TranscriptSource, is_channel_conversation_id, is_system_folder,
 };
 pub use notifications::{
     ActivityItem, LogNotifier, Notification, NotificationContext, NotificationKind, Notifications,
@@ -64,6 +65,7 @@ pub use presence::{
     UnifiedBackend,
 };
 pub use realtime::{EventBus, RealtimeEvent, RealtimeService};
+pub use recordings::Recordings;
 pub use search::{Search, escape_like, like_pattern, snippet};
 pub use session::{Session, SessionState};
 pub use settings::{Accent, Settings, Theme, WindowSettings};
