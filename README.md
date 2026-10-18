@@ -46,7 +46,7 @@ crates/
 
 | Area | Works (verified offline) | Unverified (needs a live tenant / device / display) | Deferred |
 |---|---|---|---|
-| Auth | Device-code flow, five-token model, 0600 token store, refresh | Real AAD/`authsvc` exchange | Browser PKCE loopback (B-004) |
+| Auth | Device-code flow, five-token model, 0600 token store, refresh, **browser sign-in in an embedded webview (registered native-client redirect) with a loopback listener for registrations that allow it** | Real AAD/`authsvc` exchange; the live webview page and any Conditional Access policy | — |
 | Chat | Offline-first store + paging, optimistic send, edit/delete/reply/react/receipts; own messages rendered on the own side from the whoami identity | Server acceptance of the write shapes (U-002); live whoami (U-008) | — |
 | Chat management | **New chat** (1:1 + group via the people picker), leave (with confirmation), server mute/hide reconciled with the local routing flag, a chat context menu, muted/hidden rendering; schema v10 | Live chat-service acceptance of create/leave/mute/hide/roster (U-011) | — |
 | Folders & pins | Chat **folder tabs** (All + one per folder, with counts) filtering the list, a **Move to folder** context-menu action, and a **pinned-messages panel** (sender/preview/time) with jump-to-message and unpin; schema v11 | Live CSA folder read/move and chat-service pin read (U-012); server unpin is unavailable with the Teams sign-in | — |
@@ -84,6 +84,10 @@ Linux build prerequisites: a C toolchain, `pkg-config`, `libssl-dev`,
 default-off `audio`/`video-capture` features.) See
 [`docs/PACKAGING.md`](docs/PACKAGING.md) for the full, per-platform instructions
 and for AppImage/Flatpak/macOS/Windows packaging notes.
+
+The browser sign-in lane uses an embedded webview (WKWebView on macOS, WebView2
+on Windows); on Linux that lane is not built and the app says so, leaving device
+code — see ADR-042.
 
 ### Keyboard shortcuts
 

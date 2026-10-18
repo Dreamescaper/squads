@@ -39,20 +39,26 @@ Teams endpoints are undocumented and change without notice. Region routing
 **Mitigation:** reuse the protocol core's existing fallbacks; keep protocol-touching code
 behind `teamtrim-core`; record any known-fragile areas in this file.
 
-### B-004 — Browser PKCE flow has no loopback listener yet (M1)
+### B-004 — Browser PKCE flow has no loopback listener yet (M1) — **resolved (ADR-042)**
 
-M1 landed the PKCE primitives (verifier/challenge/`state`, authorize URL,
-redirect parsing) but not the local loopback HTTP listener that receives the
-browser redirect and completes the authorization-code exchange. A loopback
-listener plus a real browser and tenant cannot be exercised in this headless,
-credential-free environment.
+Resolved. The browser lane exists in two shapes: `auth::browser::LoopbackListener`
+plus `AuthDriver::sign_in_browser(…, BrowserRedirect::Loopback, …)` (the RFC 8252
+loopback redirect), and the UI's `BrowserRedirect::Provided` lane, where the app's
+embedded `wry` webview intercepts the client's **registered** native-client
+redirect and hands the callback URL to `Session::submit_browser_callback`. Both
+validate `state` and redeem the code with the PKCE verifier. The login screen
+offers **Sign in with browser** next to the device-code button. Covered offline
+(listener serve/404/timeout, state mismatch, `access_denied`, provided-callback
+lane, redemption stub).
 
-**Impact:** browser-based sign-in is not available; the supported sign-in path is
-device code (which is fully implemented and tested).
-
-**Mitigation:** the PKCE pieces are unit-tested and ready to wire up; add the
-loopback listener and code redemption as an M10 login-screen follow-up (see
-PROGRESS "M1 — Authentication").
+Two tenant-side limits remain, documented in ADR-042: the Teams first-party client
+is Microsoft's registration and does **not** list `http://localhost`, so the
+loopback lane is refused with `AADSTS50011` (observed live) and the embedded
+webview is the usable lane; and Conditional Access can still refuse the
+interactive flow the same way it refused device code (`AADSTS53003`). The webview
+lane is macOS/Windows only (Linux needs webkit2gtk + a gtk pump), and a step a
+webview cannot finish waits out the five-minute deadline — the page-code
+detection better-teams uses is a follow-up.
 
 ### B-005 — `exchange_skype_token` is not unit-testable (M1)
 

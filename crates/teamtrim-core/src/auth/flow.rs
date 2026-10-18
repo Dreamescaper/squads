@@ -18,10 +18,12 @@ use std::future::Future;
 use serde_json::Value;
 
 use super::OAuthParams;
+use super::browser::{DEFAULT_BROWSER_TIMEOUT, LoopbackListener};
 use super::device_code::{
     DeviceCodeStart, PollResult, SLOW_DOWN_INCREMENT_SECS, TokenResponse, get_u64,
-    parse_poll_response,
+    parse_poll_response, parse_token_success,
 };
+use super::pkce::{PkceChallenge, RedirectOutcome, authorize_url, parse_redirect};
 use super::store::TokenStore;
 use super::tokens::{StoredToken, TokenKind, TokenSet};
 use crate::error::{CoreError, Result};
@@ -70,6 +72,15 @@ pub trait AuthTransport: Send + Sync {
         device_code: &str,
     ) -> impl Future<Output = Result<PollResult>> + Send;
 
+    /// Redeem a browser-flow authorization code for tokens (PKCE, B-004).
+    fn redeem_code(
+        &self,
+        params: &OAuthParams,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+    ) -> impl Future<Output = Result<TokenResponse>> + Send;
+
     /// Exchange an AAD token for a Skype token (+ `regionGtms`).
     fn exchange_skype(
         &self,
@@ -105,6 +116,14 @@ pub enum SignInProgress {
     },
     /// Polling the token endpoint.
     Polling,
+    /// The browser flow is waiting for the user to sign in; carries the
+    /// authorize URL to open (B-004).
+    AwaitingBrowser {
+        /// The AAD authorize URL.
+        url: String,
+    },
+    /// Redeeming the browser-flow authorization code for tokens (B-004).
+    RedeemingCode,
     /// Exchanging the AAD token for a Skype token.
     ExchangingSkype,
     /// Minting one of the derived tokens.
@@ -124,6 +143,8 @@ impl SignInProgress {
             SignInProgress::RequestingDeviceCode => "Requesting device code…".into(),
             SignInProgress::AwaitingUser { user_code, .. } => user_code.clone(),
             SignInProgress::Polling => "Waiting for sign-in…".into(),
+            SignInProgress::AwaitingBrowser { .. } => "Waiting for the browser…".into(),
+            SignInProgress::RedeemingCode => "Redeeming the authorization code…".into(),
             SignInProgress::ExchangingSkype => "Exchanging Skype token…".into(),
             SignInProgress::AcquiringToken(kind) => format!("Acquiring {}…", kind.label()),
             SignInProgress::Persisting => "Saving credentials…".into(),
@@ -233,6 +254,38 @@ impl AuthTransport for HttpTransport {
         }
     }
 
+    fn redeem_code(
+        &self,
+        params: &OAuthParams,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+    ) -> impl Future<Output = Result<TokenResponse>> + Send {
+        let code = code.to_string();
+        let verifier = verifier.to_string();
+        let redirect_uri = redirect_uri.to_string();
+        async move {
+            let url = self.token_url(&params.tenant);
+            // The code and verifier travel in the body, never the URL.
+            let form = vec![
+                ("grant_type".to_string(), "authorization_code".to_string()),
+                ("client_id".to_string(), params.client_id.clone()),
+                ("code".to_string(), code),
+                ("redirect_uri".to_string(), redirect_uri),
+                ("code_verifier".to_string(), verifier),
+            ];
+            let (status, body) = post_form_json(&self.http, &url, &form).await?;
+            if !(200..300).contains(&status) {
+                return Err(auth_http_error(
+                    "authorization code redemption",
+                    status,
+                    &body,
+                ));
+            }
+            parse_token_success(&body)
+        }
+    }
+
     fn exchange_skype(
         &self,
         aad_token: &str,
@@ -330,6 +383,18 @@ fn required_str(body: &Value, field: &str, what: &str) -> Result<String> {
         .ok_or_else(|| CoreError::Auth(format!("{what} response missing '{field}'")))
 }
 
+/// Where the browser flow obtains its redirect (ADR-042).
+pub enum BrowserRedirect {
+    /// Bind an ephemeral loopback listener and wait for the system browser
+    /// (RFC 8252). Requires the client registration to allow
+    /// `http://localhost:<port>`; the Teams first-party client does not.
+    Loopback,
+    /// The caller captures the redirect (embedded webview or paste) and sends
+    /// the full callback URL (or bare query) over this channel. The client's
+    /// registered redirect is used unchanged.
+    Provided(tokio::sync::mpsc::UnboundedReceiver<String>),
+}
+
 /// Orchestrates sign-in and token refresh over an [`AuthTransport`].
 pub struct AuthDriver<T: AuthTransport> {
     transport: T,
@@ -374,6 +439,119 @@ impl<T: AuthTransport> AuthDriver<T> {
         let token = self
             .poll_for_token(&params, &start, &mut on_progress)
             .await?;
+        self.finish_sign_in(
+            &params,
+            use_personal,
+            token,
+            profile,
+            store,
+            &mut on_progress,
+        )
+        .await
+    }
+
+    /// Run the full browser (authorization-code + PKCE) sign-in, persist the
+    /// [`TokenSet`] and return it (B-004).
+    ///
+    /// Order: obtain the redirect URI → build the authorize URL → wait for the
+    /// callback (`redirect`) → validate `state` → redeem the code → Skype
+    /// exchange → Graph/IC3/Recorder refresh grants → save. With
+    /// [`BrowserRedirect::Loopback`] the listener lives only as long as this
+    /// call, so the port closes on completion, failure or cancellation.
+    pub async fn sign_in_browser<F>(
+        &self,
+        use_personal: bool,
+        profile: &str,
+        store: &dyn TokenStore,
+        redirect: BrowserRedirect,
+        mut on_progress: F,
+    ) -> Result<TokenSet>
+    where
+        F: FnMut(SignInProgress) + Send,
+    {
+        let mut params = OAuthParams::for_account(use_personal);
+        let listener = match &redirect {
+            BrowserRedirect::Loopback => {
+                let listener = LoopbackListener::bind().await?;
+                params.redirect_uri = listener.redirect_uri();
+                Some(listener)
+            }
+            // The caller's webview/paste lane uses the registered redirect.
+            BrowserRedirect::Provided(_) => None,
+        };
+        let pkce = PkceChallenge::generate()?;
+        let url = authorize_url(&params, &pkce.challenge, &pkce.state)?;
+
+        on_progress(SignInProgress::AwaitingBrowser { url });
+        let outcome = match redirect {
+            BrowserRedirect::Loopback => {
+                listener
+                    .expect("loopback listener bound above")
+                    .wait_for_redirect(DEFAULT_BROWSER_TIMEOUT)
+                    .await?
+            }
+            BrowserRedirect::Provided(mut callbacks) => {
+                let callback = tokio::time::timeout(DEFAULT_BROWSER_TIMEOUT, callbacks.recv())
+                    .await
+                    .map_err(|_| {
+                        CoreError::Auth(
+                            "timed out waiting for the browser sign-in to complete".into(),
+                        )
+                    })?
+                    .ok_or_else(|| CoreError::Auth("browser sign-in was cancelled".into()))?;
+                parse_redirect(&callback)?
+            }
+        };
+        let code = match outcome {
+            RedirectOutcome::Code { code, state } => {
+                // RFC 6749 §10.12: never redeem a code whose `state` differs.
+                if state.as_deref() != Some(pkce.state.as_str()) {
+                    return Err(CoreError::Auth(
+                        "browser redirect state did not match; sign-in aborted".into(),
+                    ));
+                }
+                code
+            }
+            RedirectOutcome::Error { error, description } => {
+                return Err(CoreError::Auth(match description {
+                    Some(description) => {
+                        format!("browser sign-in failed: {error}: {description}")
+                    }
+                    None => format!("browser sign-in failed: {error}"),
+                }));
+            }
+        };
+
+        on_progress(SignInProgress::RedeemingCode);
+        let token = self
+            .transport
+            .redeem_code(&params, &code, &pkce.verifier, &params.redirect_uri)
+            .await?;
+        self.finish_sign_in(
+            &params,
+            use_personal,
+            token,
+            profile,
+            store,
+            &mut on_progress,
+        )
+        .await
+    }
+
+    /// The tail both sign-in flows share: Skype exchange, the three derived
+    /// refresh grants, the completed set and its persistence.
+    async fn finish_sign_in<F>(
+        &self,
+        params: &OAuthParams,
+        use_personal: bool,
+        token: TokenResponse,
+        profile: &str,
+        store: &dyn TokenStore,
+        on_progress: &mut F,
+    ) -> Result<TokenSet>
+    where
+        F: FnMut(SignInProgress) + Send,
+    {
         let refresh_token = token
             .refresh_token
             .clone()
@@ -390,28 +568,13 @@ impl<T: AuthTransport> AuthDriver<T> {
 
         let mut refresh_token = refresh_token;
         let graph = self
-            .acquire(
-                &params,
-                &mut refresh_token,
-                TokenKind::Graph,
-                &mut on_progress,
-            )
+            .acquire(params, &mut refresh_token, TokenKind::Graph, on_progress)
             .await?;
         let ic3 = self
-            .acquire(
-                &params,
-                &mut refresh_token,
-                TokenKind::Ic3,
-                &mut on_progress,
-            )
+            .acquire(params, &mut refresh_token, TokenKind::Ic3, on_progress)
             .await?;
         let recorder = self
-            .acquire(
-                &params,
-                &mut refresh_token,
-                TokenKind::Recorder,
-                &mut on_progress,
-            )
+            .acquire(params, &mut refresh_token, TokenKind::Recorder, on_progress)
             .await?;
 
         let set = TokenSet {
@@ -569,12 +732,15 @@ mod tests {
         Poll,
         ExchangeSkype,
         Grant(TokenKind),
+        RedeemCode,
     }
 
     /// Deterministic offline transport: succeeds immediately and records calls.
     #[derive(Default)]
     struct FakeTransport {
         calls: Mutex<Vec<Call>>,
+        /// `(code, verifier, redirect_uri)` of the last browser redemption.
+        redeemed: Mutex<Option<(String, String, String)>>,
     }
 
     impl FakeTransport {
@@ -583,6 +749,9 @@ mod tests {
         }
         fn record(&self, c: Call) {
             self.calls.lock().unwrap().push(c);
+        }
+        fn redeemed(&self) -> Option<(String, String, String)> {
+            self.redeemed.lock().unwrap().clone()
         }
     }
 
@@ -630,6 +799,28 @@ mod tests {
                     token: "skype-token".into(),
                     expires_in: Some(3600),
                     region_gtms: Some(serde_json::json!({"region": "emea"})),
+                })
+            }
+        }
+
+        fn redeem_code(
+            &self,
+            _params: &OAuthParams,
+            code: &str,
+            verifier: &str,
+            redirect_uri: &str,
+        ) -> impl Future<Output = Result<TokenResponse>> + Send {
+            self.record(Call::RedeemCode);
+            *self.redeemed.lock().unwrap() = Some((
+                code.to_string(),
+                verifier.to_string(),
+                redirect_uri.to_string(),
+            ));
+            async move {
+                Ok(TokenResponse {
+                    access_token: "aad-access".into(),
+                    refresh_token: Some("refresh-1".into()),
+                    expires_in: Some(3600),
                 })
             }
         }
@@ -856,6 +1047,15 @@ mod tests {
             ) -> impl Future<Output = Result<SkypeExchange>> + Send {
                 async { unreachable!("not reached in this test") }
             }
+            fn redeem_code(
+                &self,
+                _p: &OAuthParams,
+                _code: &str,
+                _v: &str,
+                _r: &str,
+            ) -> impl Future<Output = Result<TokenResponse>> + Send {
+                async { unreachable!("not reached in this test") }
+            }
             fn refresh_grant(
                 &self,
                 _p: &OAuthParams,
@@ -873,6 +1073,167 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("refresh token"));
+        assert!(store.load("default").unwrap().is_none());
+    }
+
+    // ----- B-004: browser (authorization-code + PKCE) sign-in ----------------
+
+    #[tokio::test]
+    async fn browser_sign_in_completes_and_redeems_the_code() {
+        let store = MemoryTokenStore::new();
+        let driver = AuthDriver::new(FakeTransport::default());
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&progress);
+
+        let set = driver
+            .sign_in_browser(false, "default", &store, BrowserRedirect::Loopback, |p| {
+                if let SignInProgress::AwaitingBrowser { url } = &p {
+                    crate::auth::browser::respond_like_a_browser(url, "code=CODE-9&state={state}");
+                }
+                recorded.lock().unwrap().push(p);
+            })
+            .await
+            .expect("browser sign in");
+
+        // The shared tail produced the complete five-token set and persisted it.
+        assert_eq!(set.spaces.token(), "aad-access");
+        assert_eq!(set.skype_token(), "skype-token");
+        assert_eq!(set.graph.token(), "new-graph");
+        assert_eq!(set.ic3.token(), "new-ic3");
+        assert_eq!(set.recorder.token(), "new-recorder");
+        assert!(store.load("default").unwrap().is_some());
+
+        // The code was redeemed with a verifier that matches the challenge the
+        // authorize URL carried.
+        let (code, verifier, redirect) = driver.transport().redeemed().expect("redeemed");
+        assert_eq!(code, "CODE-9");
+        assert!(crate::auth::pkce::is_valid_verifier(&verifier));
+        assert!(redirect.starts_with("http://localhost:"), "{redirect}");
+
+        let awaiting = progress
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|p| match p {
+                SignInProgress::AwaitingBrowser { url } => Some(url.clone()),
+                _ => None,
+            })
+            .expect("awaiting browser");
+        let query: std::collections::HashMap<_, _> = url::Url::parse(&awaiting)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert_eq!(
+            query.get("code_challenge").map(String::as_str),
+            Some(crate::auth::pkce::challenge_s256(&verifier).as_str())
+        );
+        assert_eq!(query.get("redirect_uri").unwrap(), &redirect);
+        assert!(
+            progress
+                .lock()
+                .unwrap()
+                .contains(&SignInProgress::RedeemingCode)
+        );
+
+        // Only the code lane ran; no device code was requested.
+        assert_eq!(
+            driver.transport().calls(),
+            vec![
+                Call::RedeemCode,
+                Call::ExchangeSkype,
+                Call::Grant(TokenKind::Graph),
+                Call::Grant(TokenKind::Ic3),
+                Call::Grant(TokenKind::Recorder),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_sign_in_accepts_a_caller_supplied_callback() {
+        // The webview lane: the app captures the native-client redirect and
+        // hands the URL back over a channel; no loopback is bound.
+        let store = MemoryTokenStore::new();
+        let driver = AuthDriver::new(FakeTransport::default());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let set = driver
+            .sign_in_browser(
+                false,
+                "default",
+                &store,
+                BrowserRedirect::Provided(rx),
+                |p| {
+                    if let SignInProgress::AwaitingBrowser { url } = &p {
+                        let query: std::collections::HashMap<_, _> =
+                            url::Url::parse(url).unwrap().query_pairs().into_owned().collect();
+                        // The registered native-client redirect is kept.
+                        assert_eq!(
+                            query.get("redirect_uri").unwrap(),
+                            "https://login.microsoftonline.com/common/oauth2/nativeclient"
+                        );
+                        let state = query.get("state").unwrap();
+                        tx.send(format!(
+                            "https://login.microsoftonline.com/common/oauth2/nativeclient?code=CODE-7&state={state}"
+                        ))
+                        .unwrap();
+                    }
+                },
+            )
+            .await
+            .expect("webview sign in");
+
+        assert_eq!(set.spaces.token(), "aad-access");
+        let (code, _, redirect) = driver.transport().redeemed().expect("redeemed");
+        assert_eq!(code, "CODE-7");
+        assert_eq!(
+            redirect,
+            "https://login.microsoftonline.com/common/oauth2/nativeclient"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_sign_in_rejects_a_state_mismatch() {
+        let store = MemoryTokenStore::new();
+        let driver = AuthDriver::new(FakeTransport::default());
+
+        let err = driver
+            .sign_in_browser(false, "default", &store, BrowserRedirect::Loopback, |p| {
+                if let SignInProgress::AwaitingBrowser { url } = &p {
+                    crate::auth::browser::respond_like_a_browser(
+                        url,
+                        "code=CODE-9&state=NOT-THE-STATE",
+                    );
+                }
+            })
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err}").contains("state"), "got {err}");
+        assert!(!driver.transport().calls().contains(&Call::RedeemCode));
+        assert!(store.load("default").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_sign_in_surfaces_an_access_denied_redirect() {
+        let store = MemoryTokenStore::new();
+        let driver = AuthDriver::new(FakeTransport::default());
+
+        let err = driver
+            .sign_in_browser(false, "default", &store, BrowserRedirect::Loopback, |p| {
+                if let SignInProgress::AwaitingBrowser { url } = &p {
+                    crate::auth::browser::respond_like_a_browser(
+                        url,
+                        "error=access_denied&error_description=Denied+by+policy",
+                    );
+                }
+            })
+            .await
+            .unwrap_err();
+
+        let message = format!("{err}");
+        assert!(message.contains("access_denied"), "got {message}");
+        assert!(message.contains("Denied by policy"), "got {message}");
         assert!(store.load("default").unwrap().is_none());
     }
 
@@ -969,6 +1330,62 @@ mod tests {
         // The Graph scope is URL-encoded into the form.
         assert!(req.contains("graph.microsoft.com%2F.default"));
         assert!(req.contains("offline_access"));
+    }
+
+    #[tokio::test]
+    async fn http_transport_redeems_a_code_with_the_pkce_verifier() {
+        let (base, seen) = one_shot_stub(http_json(
+            "200 OK",
+            r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#,
+        ))
+        .await;
+        let transport = HttpTransport::with_login_base(base);
+        let token = transport
+            .redeem_code(
+                &OAuthParams::for_account(false),
+                "THE-CODE",
+                "THE-VERIFIER",
+                "http://localhost:49152",
+            )
+            .await
+            .expect("redeem");
+        assert_eq!(token.access_token, "AT");
+        assert_eq!(token.refresh_token.as_deref(), Some("RT"));
+
+        let req = seen.lock().unwrap().clone();
+        assert!(req.starts_with("POST /common/oauth2/v2.0/token "));
+        assert!(req.contains("grant_type=authorization_code"));
+        assert!(req.contains("code=THE-CODE"));
+        assert!(req.contains("code_verifier=THE-VERIFIER"));
+        assert!(req.contains("redirect_uri=http%3A%2F%2Flocalhost%3A49152"));
+    }
+
+    #[tokio::test]
+    async fn http_transport_redeem_error_is_coded_not_leaky() {
+        let (base, _) = one_shot_stub(http_json(
+            "400 Bad Request",
+            r#"{"error":"invalid_grant","error_description":"AADSTS70000: bad.\r\nTrace ID: x"}"#,
+        ))
+        .await;
+        let transport = HttpTransport::with_login_base(base);
+        let err = transport
+            .redeem_code(
+                &OAuthParams::for_account(false),
+                "SECRET-CODE",
+                "SECRET-VERIFIER",
+                "http://localhost:1",
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err}");
+        assert!(message.contains("invalid_grant"), "got {message}");
+        assert!(message.contains("AADSTS70000"), "got {message}");
+        assert!(!message.contains("SECRET-CODE"), "leaked the code");
+        assert!(!message.contains("SECRET-VERIFIER"), "leaked the verifier");
+        assert!(
+            !message.contains("Trace ID"),
+            "must keep only the first line"
+        );
     }
 
     #[tokio::test]

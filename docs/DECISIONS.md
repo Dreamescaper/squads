@@ -220,7 +220,8 @@ document `KeyringTokenStore` as a TODO; the `keyring` crate is **not** added yet
 
 ## ADR-009 — Device-code first; browser PKCE helpers only
 
-**Status:** accepted (M1)
+**Status:** accepted (M1) — the B-004 deferral is resolved by ADR-042; device
+code remains the default lane
 
 **Context.** M1 asks for both a device-code flow and a browser PKCE flow. The
 device-code flow is fully driveable from a headless CLI and is what the vendored
@@ -2030,3 +2031,78 @@ The vendored surfaces:
   as the vendored error unchanged.
 - No encryption change: recording/transcript names and URLs join chat content in
   the plaintext store (B-007).
+
+---
+
+## ADR-042 — Browser sign-in: embedded webview on the registered redirect (B-004)
+
+**Status:** accepted — resolves the B-004 deferral in ADR-009
+
+**Context.** ADR-009 landed the PKCE primitives but deferred the loopback
+listener because it could not be exercised here. A live sign-in then showed why
+the second lane matters: an Entra tenant refused the device-code attempt at the
+browser with `AADSTS53003` (Conditional Access blocked the flow for an
+`Unregistered` device), while the app itself had done everything right. Device
+code is also the flow tenants most often switch off wholesale.
+
+RFC 8252 §7.3's loopback redirect was the first attempt here, and the live
+tenant rejected it: the Teams first-party client (`1fec8e78-…`) is **Microsoft's
+registration**, it does not list `http://localhost`, and nobody outside Microsoft
+can add it. The browser answered
+`AADSTS50011: The redirect URI 'http://localhost:51407' … does not match the
+redirect URIs configured for the application`. So a loopback redirect is
+structurally impossible with this client id, and the usable redirect is the one
+the registration *does* have: `…/oauth2/nativeclient`. better-teams reaches that
+same conclusion and finishes the flow in an embedded webview that intercepts the
+native-client callback.
+
+**Decision.** Add a browser lane next to the device-code lane:
+
+1. **Two redirect sources.** `BrowserRedirect::Loopback` binds
+   `auth::browser::LoopbackListener` (ephemeral port on `127.0.0.1` and, best
+   effort, `::1`; serves one request until a `code`/`error` arrives, `404`s
+   anything else, five-minute deadline). `BrowserRedirect::Provided(receiver)`
+   keeps the client's **registered** redirect and takes the callback URL from the
+   caller. The UI uses `Provided`; `Loopback` remains a tested capability for a
+   registration that allows `localhost`.
+2. **PKCE.** `PkceChallenge::generate` (S256) supplies the verifier/challenge and
+   `state`; the driver refuses a redirect whose `state` does not match
+   (RFC 6749 §10.12) before redeeming anything.
+3. **Redemption.** `AuthTransport::redeem_code` posts
+   `grant_type=authorization_code` with the code, verifier and redirect to the
+   tenant token endpoint; errors reuse the secret-free `auth_http_error` path.
+   The common tail (Skype exchange → Graph/IC3/Recorder grants → persist) is
+   shared with the device-code flow in `finish_sign_in`.
+4. **Embedded webview (the UI lane).** `crates/teamtrim-app/src/webview.rs` wraps
+   `wry` and attaches a native child webview to the eframe window. The navigation
+   handler stops at `NATIVE_CLIENT_REDIRECT`, hands the callback URL to the
+   running sign-in over a session channel, and the view is dropped when the flow
+   ends. The user therefore never sees the native-client page or the system
+   browser. `Session::begin_webview_sign_in` +
+   `submit_browser_callback`/`browser_callback_sender` are the bridge; see also
+   `Session::begin_browser_sign_in` for the loopback lane.
+5. **Progress.** `AwaitingBrowser { url }` and `RedeemingCode`. The login screen
+   grows **Sign in with browser**; device code stays the default button.
+
+**Consequences.**
+
+- The lane is offline-testable end to end: the listener serves/parses/404s/times
+  out; the provided-callback lane is driven by a channel and asserts the
+  registered redirect is preserved; the flow rejects a foreign `state`, surfaces
+  an `access_denied` redirect, and redemption is pinned by a local HTTP stub
+  (code + verifier in the body, nothing in the URL).
+- **Linux is excluded on purpose.** wry's Linux backend needs webkit2gtk plus a
+  `gtk::init()`/main-loop pump alongside eframe's event loop. Rather than add
+  unverifiable system dependencies (and break the Linux CI/packaging path),
+  `wry` is a macOS/Windows dependency and `SignInWebView::open` returns an error
+  on Linux, where the login screen points at device code.
+- **The webview lane has no cancel affordance yet**, so a step it cannot finish
+  (passkey/FIDO, client certificate, or a Conditional Access refusal such as
+  `AADSTS53003`) waits out the five-minute deadline. better-teams detects those
+  codes in the page body and offers device code; that detection is a follow-up.
+- **Conditional Access still governs.** A policy requiring a compliant/joined
+  device blocks every lane — it is the tenant, not the redirect, enforcing.
+- No client secret is introduced: the client stays public and the verifier is
+  the proof (RFC 7636). The webview only ever loads the authorize URL and stops
+  at the redirect; the code is never echoed anywhere.
+

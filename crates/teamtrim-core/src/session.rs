@@ -26,9 +26,12 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 
 use tokio::sync::broadcast;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::ApiClient;
-use crate::auth::flow::{AuthDriver, AuthTransport, HttpTransport, SignInProgress};
+use crate::auth::flow::{
+    AuthDriver, AuthTransport, BrowserRedirect, HttpTransport, SignInProgress,
+};
 use crate::auth::store::{DEFAULT_PROFILE, FileTokenStore, TokenStore};
 use crate::auth::tokens::{TokenSet, now_unix};
 use crate::calendar::Calendar;
@@ -94,6 +97,27 @@ struct SignInTask {
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// Which sign-in flow a [`SignInTask`] is running.
+enum SignInLane {
+    /// RFC 8628 device code: the user types a code in any browser.
+    DeviceCode,
+    /// Authorization code over a loopback redirect (RFC 8252).
+    LoopbackBrowser,
+    /// Authorization code captured by the caller (embedded webview); the
+    /// callback URL arrives on this channel (ADR-042).
+    WebViewBrowser(tokio::sync::mpsc::UnboundedReceiver<String>),
+}
+
+impl SignInLane {
+    /// The first hint the login screen shows for this flow.
+    fn opening_hint(&self) -> &'static str {
+        match self {
+            SignInLane::DeviceCode => "Requesting device code…",
+            SignInLane::LoopbackBrowser | SignInLane::WebViewBrowser(_) => "Opening the browser…",
+        }
+    }
+}
+
 /// A signed-in (or sign-in-in-progress) client session.
 ///
 /// M1 makes the session the owner of authentication: it resolves the account
@@ -113,6 +137,9 @@ pub struct Session {
     /// and realtime messages.
     identity: Option<Identity>,
     sign_in: Option<SignInTask>,
+    /// Sender the embedded webview uses to hand the redirect URL to a running
+    /// webview sign-in (ADR-042). `None` for the other lanes.
+    browser_callback: Option<UnboundedSender<String>>,
     /// Lazily-built protocol client (M2), shared behind an `Arc` so the M5
     /// [`Messaging`] service can hold it too. Dropped whenever the token set
     /// changes so the next [`Session::api`] rebuilds it with fresh credentials.
@@ -168,6 +195,7 @@ impl Session {
             tokens: None,
             identity: None,
             sign_in: None,
+            browser_callback: None,
             api: None,
             realtime: None,
             notifier: Arc::new(LogNotifier),
@@ -712,6 +740,100 @@ impl Session {
     where
         T: AuthTransport + 'static,
     {
+        self.begin_sign_in_flow(use_personal, SignInLane::DeviceCode, driver)
+    }
+
+    /// Begin a browser (authorization-code + PKCE) sign-in against the real AAD
+    /// endpoints (B-004).
+    ///
+    /// The flow opens a loopback listener and reports
+    /// [`SignInProgress::AwaitingBrowser`] with the authorize URL; the caller
+    /// must open that URL in a browser for the flow to complete. Like
+    /// [`Session::begin_sign_in`], this needs a tokio runtime and network access.
+    ///
+    /// This lane needs the client registration to allow `http://localhost:<port>`;
+    /// the Teams first-party client does not, so the UI uses
+    /// [`Session::begin_webview_sign_in`].
+    pub fn begin_browser_sign_in(&mut self, use_personal: bool) -> Result<()> {
+        let driver = AuthDriver::new(HttpTransport::new());
+        self.begin_browser_sign_in_with_driver(use_personal, driver)
+    }
+
+    /// [`Session::begin_browser_sign_in`] with an injected driver (tests).
+    pub fn begin_browser_sign_in_with_driver<T>(
+        &mut self,
+        use_personal: bool,
+        driver: AuthDriver<T>,
+    ) -> Result<()>
+    where
+        T: AuthTransport + 'static,
+    {
+        self.begin_sign_in_flow(use_personal, SignInLane::LoopbackBrowser, driver)
+    }
+
+    /// Begin a browser sign-in whose redirect is captured by the caller (the
+    /// app's embedded webview, ADR-042).
+    ///
+    /// The flow uses the client's registered native-client redirect, reports
+    /// [`SignInProgress::AwaitingBrowser`] with the authorize URL, and waits for
+    /// [`Session::submit_browser_callback`] (or the five-minute deadline).
+    pub fn begin_webview_sign_in(&mut self, use_personal: bool) -> Result<()> {
+        let driver = AuthDriver::new(HttpTransport::new());
+        self.begin_webview_sign_in_with_driver(use_personal, driver)
+    }
+
+    /// [`Session::begin_webview_sign_in`] with an injected driver (tests).
+    pub fn begin_webview_sign_in_with_driver<T>(
+        &mut self,
+        use_personal: bool,
+        driver: AuthDriver<T>,
+    ) -> Result<()>
+    where
+        T: AuthTransport + 'static,
+    {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.browser_callback = Some(tx);
+        let result = self.begin_sign_in_flow(use_personal, SignInLane::WebViewBrowser(rx), driver);
+        if result.is_err() {
+            self.browser_callback = None;
+        }
+        result
+    }
+
+    /// A clone of the sender the embedded webview uses to hand back the
+    /// intercepted callback URL, when a webview sign-in is running.
+    pub fn browser_callback_sender(&self) -> Option<UnboundedSender<String>> {
+        self.browser_callback.clone()
+    }
+
+    /// Hand the intercepted redirect URL (or bare query) to the running webview
+    /// sign-in. Returns `false` when no webview sign-in is waiting.
+    pub fn submit_browser_callback(&self, callback: impl Into<String>) -> bool {
+        match &self.browser_callback {
+            Some(tx) => tx.send(callback.into()).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Abort a running sign-in (e.g. the embedded browser could not open) and
+    /// return to [`SessionState::SignedOut`].
+    pub fn cancel_sign_in(&mut self) {
+        if let Some(task) = self.sign_in.take() {
+            task.handle.abort();
+        }
+        self.browser_callback = None;
+        self.state = SessionState::SignedOut;
+    }
+
+    fn begin_sign_in_flow<T>(
+        &mut self,
+        use_personal: bool,
+        lane: SignInLane,
+        driver: AuthDriver<T>,
+    ) -> Result<()>
+    where
+        T: AuthTransport + 'static,
+    {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| CoreError::NotReady("begin_sign_in requires an async runtime".into()))?;
 
@@ -726,17 +848,43 @@ impl Session {
         let tx_progress = tx.clone();
 
         self.state = SessionState::SigningIn {
-            hint: "Requesting device code…".into(),
+            hint: lane.opening_hint().into(),
         };
 
         let handle = runtime.spawn(async move {
             let progress = move |p: SignInProgress| {
                 let _ = tx_progress.send(p);
             };
-            if let Err(e) = driver
-                .sign_in(use_personal, &profile, store.as_ref(), progress)
-                .await
-            {
+            let result = match lane {
+                SignInLane::DeviceCode => {
+                    driver
+                        .sign_in(use_personal, &profile, store.as_ref(), progress)
+                        .await
+                }
+                SignInLane::LoopbackBrowser => {
+                    driver
+                        .sign_in_browser(
+                            use_personal,
+                            &profile,
+                            store.as_ref(),
+                            BrowserRedirect::Loopback,
+                            progress,
+                        )
+                        .await
+                }
+                SignInLane::WebViewBrowser(callbacks) => {
+                    driver
+                        .sign_in_browser(
+                            use_personal,
+                            &profile,
+                            store.as_ref(),
+                            BrowserRedirect::Provided(callbacks),
+                            progress,
+                        )
+                        .await
+                }
+            };
+            if let Err(e) = result {
                 // Report the failure through the same channel the UI polls.
                 let _ = tx.send(SignInProgress::Failed(e.to_string()));
             }
@@ -746,23 +894,27 @@ impl Session {
         Ok(())
     }
 
-    /// Drain and apply any sign-in progress; returns the most recent event.
+    /// Drain and apply every pending sign-in progress event.
+    ///
+    /// Returns them in the order the flow emitted them, and that order matters:
+    /// the device code arrives in [`SignInProgress::AwaitingUser`] and is
+    /// immediately followed by [`SignInProgress::Polling`], so a caller that
+    /// only looked at the newest event would drop the code before showing it.
     ///
     /// Non-terminal events move the state to [`SessionState::SigningIn`]; a
     /// completed flow moves it to [`SessionState::Ready`] and stores the token
     /// set; a failure moves it to [`SessionState::Failed`].
-    pub fn poll_sign_in(&mut self) -> Option<SignInProgress> {
+    pub fn poll_sign_in(&mut self) -> Vec<SignInProgress> {
         let mut drained = Vec::new();
         if let Some(task) = self.sign_in.as_ref() {
             while let Ok(progress) = task.rx.try_recv() {
                 drained.push(progress);
             }
         }
-        let last = drained.last().cloned();
-        for progress in drained {
-            self.apply_progress(&progress);
+        for progress in &drained {
+            self.apply_progress(progress);
         }
-        last
+        drained
     }
 
     fn apply_progress(&mut self, progress: &SignInProgress) {
@@ -773,10 +925,12 @@ impl Session {
                 self.realtime = None;
                 self.state = SessionState::Ready;
                 self.sign_in = None;
+                self.browser_callback = None;
             }
             SignInProgress::Failed(message) => {
                 self.state = SessionState::Failed(message.clone());
                 self.sign_in = None;
+                self.browser_callback = None;
             }
             SignInProgress::AwaitingUser { user_code, .. } => {
                 self.state = SessionState::SigningIn {
@@ -795,6 +949,7 @@ impl Session {
         if let Some(task) = self.sign_in.take() {
             task.handle.abort();
         }
+        self.browser_callback = None;
         // Stop the realtime feed before dropping the credentials it captured.
         self.realtime = None;
         self.tokens = None;
@@ -1008,6 +1163,21 @@ mod tests {
                 })
             }
         }
+        fn redeem_code(
+            &self,
+            _p: &OAuthParams,
+            _code: &str,
+            _verifier: &str,
+            _redirect: &str,
+        ) -> impl Future<Output = Result<TokenResponse>> + Send {
+            async {
+                Ok(TokenResponse {
+                    access_token: "at".into(),
+                    refresh_token: Some("rt".into()),
+                    expires_in: Some(3600),
+                })
+            }
+        }
         fn refresh_grant(
             &self,
             _p: &OAuthParams,
@@ -1053,6 +1223,173 @@ mod tests {
         assert_eq!(tokens.ic3.token(), "t-ic3");
         assert_eq!(tokens.recorder.token(), "t-recorder");
         assert!(store.contains("default"));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn browser_sign_in_via_session_reaches_ready() {
+        let (tmp, dirs) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs, "default", store.clone()).expect("session");
+        session
+            .begin_browser_sign_in_with_driver(false, AuthDriver::new(StubTransport))
+            .expect("begin");
+
+        let mut saw_browser_prompt = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            for progress in session.poll_sign_in() {
+                if let SignInProgress::AwaitingBrowser { url } = progress {
+                    saw_browser_prompt = true;
+                    // Play the browser against the loopback listener.
+                    crate::auth::browser::respond_like_a_browser(&url, "code=C&state={state}");
+                }
+            }
+            if session.state().is_ready() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert!(saw_browser_prompt, "state = {:?}", session.state());
+        assert!(session.state().is_ready(), "state = {:?}", session.state());
+        assert!(store.contains("default"));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A transport whose first token poll never returns, so the test can look
+    /// at the queue exactly while it holds both `AwaitingUser` (the device
+    /// code) and the `Polling` event that follows it.
+    struct BlockedPollTransport {
+        polling: Arc<tokio::sync::Notify>,
+    }
+
+    impl AuthTransport for BlockedPollTransport {
+        fn request_device_code(
+            &self,
+            _p: &OAuthParams,
+        ) -> impl Future<Output = Result<DeviceCodeStart>> + Send {
+            async {
+                Ok(DeviceCodeStart {
+                    device_code: "dc".into(),
+                    user_code: "CODE-1".into(),
+                    verification_uri: "https://v".into(),
+                    expires_in: 900,
+                    interval: 60,
+                    message: String::new(),
+                })
+            }
+        }
+        fn poll_device_code(
+            &self,
+            _p: &OAuthParams,
+            _d: &str,
+        ) -> impl Future<Output = Result<PollResult>> + Send {
+            let polling = Arc::clone(&self.polling);
+            async move {
+                polling.notify_one();
+                std::future::pending::<Result<PollResult>>().await
+            }
+        }
+        fn exchange_skype(
+            &self,
+            _a: &str,
+            _p: bool,
+        ) -> impl Future<Output = Result<SkypeExchange>> + Send {
+            async { unreachable!("sign-in never gets past the poll") }
+        }
+        fn redeem_code(
+            &self,
+            _p: &OAuthParams,
+            _c: &str,
+            _v: &str,
+            _r: &str,
+        ) -> impl Future<Output = Result<TokenResponse>> + Send {
+            async { unreachable!("sign-in never gets past the poll") }
+        }
+        fn refresh_grant(
+            &self,
+            _p: &OAuthParams,
+            _r: &str,
+            _k: TokenKind,
+        ) -> impl Future<Output = Result<GrantedToken>> + Send {
+            async { unreachable!("sign-in never gets past the poll") }
+        }
+    }
+
+    #[tokio::test]
+    async fn webview_sign_in_via_session_reaches_ready() {
+        let (tmp, dirs) = dirs();
+        let store = Arc::new(MemoryTokenStore::new());
+        let mut session = Session::with_store(dirs, "default", store.clone()).expect("session");
+        session
+            .begin_webview_sign_in_with_driver(false, AuthDriver::new(StubTransport))
+            .expect("begin");
+        assert!(session.browser_callback_sender().is_some());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut submitted = false;
+        while tokio::time::Instant::now() < deadline {
+            for progress in session.poll_sign_in() {
+                if let SignInProgress::AwaitingBrowser { url } = progress {
+                    let query: std::collections::HashMap<_, _> = url::Url::parse(&url)
+                        .unwrap()
+                        .query_pairs()
+                        .into_owned()
+                        .collect();
+                    let state = query.get("state").expect("state");
+                    let callback = format!(
+                        "https://login.microsoftonline.com/common/oauth2/nativeclient?code=C&state={state}"
+                    );
+                    submitted = session.submit_browser_callback(callback);
+                }
+            }
+            if session.state().is_ready() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert!(submitted, "state = {:?}", session.state());
+        assert!(session.state().is_ready(), "state = {:?}", session.state());
+        assert!(session.browser_callback_sender().is_none());
+        assert!(store.contains("default"));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Regression: the device code used to be lost. `AwaitingUser` is followed
+    /// immediately by `Polling`, and `poll_sign_in` returned only the newest
+    /// event, so the UI never saw the code and spun forever.
+    #[tokio::test]
+    async fn poll_sign_in_delivers_the_device_code_before_polling() {
+        let (tmp, dirs) = dirs();
+        let mut session = Session::with_store(dirs, "default", Arc::new(MemoryTokenStore::new()))
+            .expect("session");
+        let polling = Arc::new(tokio::sync::Notify::new());
+        session
+            .begin_sign_in_with_driver(
+                false,
+                AuthDriver::new(BlockedPollTransport {
+                    polling: Arc::clone(&polling),
+                }),
+            )
+            .expect("begin");
+
+        // The transport is only entered after `AwaitingUser` and `Polling` were
+        // both queued, so this is the exact moment the UI would poll.
+        polling.notified().await;
+
+        let events = session.poll_sign_in();
+        assert!(
+            events.iter().any(|p| matches!(
+                p,
+                SignInProgress::AwaitingUser { user_code, .. } if user_code == "CODE-1"
+            )),
+            "the device code must not be superseded by a later event: {events:?}"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }

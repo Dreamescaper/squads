@@ -7,6 +7,8 @@
 //!   with expiry/skew predicates and redacting `Debug`.
 //! - [`pkce`] — RFC 7636 code verifier/challenge, `state`, authorize URL and
 //!   redirect parsing for the browser sign-in flow.
+//! - [`browser`] — the loopback HTTP listener that receives the browser redirect
+//!   and completes the authorization-code flow.
 //! - [`device_code`] — RFC 8628 device-code request/response and AAD error-code
 //!   mapping.
 //! - [`store`] — the [`TokenStore`] abstraction: an atomic 0600 `FileTokenStore`
@@ -23,14 +25,16 @@
 //! [`StoredToken`]: tokens::StoredToken
 //! [`TokenKind`]: tokens::TokenKind
 
+pub mod browser;
 pub mod device_code;
 pub mod flow;
 pub mod pkce;
 pub mod store;
 pub mod tokens;
 
+pub use browser::{DEFAULT_BROWSER_TIMEOUT, LoopbackListener};
 pub use device_code::{DeviceCodeStart, PollResult, TokenResponse};
-pub use flow::{AuthDriver, AuthTransport, HttpTransport, SignInProgress};
+pub use flow::{AuthDriver, AuthTransport, BrowserRedirect, HttpTransport, SignInProgress};
 pub use pkce::{PkceChallenge, RedirectOutcome};
 pub use store::{DEFAULT_PROFILE, FileTokenStore, MemoryTokenStore, TokenStore};
 pub use tokens::{StoredToken, TokenKind, TokenSet};

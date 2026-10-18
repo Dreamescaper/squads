@@ -21,6 +21,12 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# The embedded sign-in browser (ADR-042). Kept off Linux on purpose: wry's
+# Linux backend needs webkit2gtk plus a gtk main-loop pump alongside eframe's
+# event loop, so the Linux build falls back to the device-code lane.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+wry = "0.57"
+
 [dev-dependencies]
 # Headless UI testing (works without a display server). The `eframe` feature
 # enables `eframe/accesskit` so the harness can drive an `eframe::App` through

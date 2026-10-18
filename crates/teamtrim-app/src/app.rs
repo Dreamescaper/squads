@@ -130,6 +130,11 @@ pub enum Action {
         /// Sign in to a personal (consumer) account.
         use_personal: bool,
     },
+    /// Start the browser (authorization-code + PKCE) sign-in flow (B-004).
+    BeginBrowserSignIn {
+        /// Sign in to a personal (consumer) account.
+        use_personal: bool,
+    },
     /// Sign out and clear the in-memory session.
     SignOut,
     /// Switch the nav rail to a page.
@@ -406,6 +411,14 @@ pub(crate) struct LoginView {
     pub(crate) use_personal: bool,
     pub(crate) user_code: Option<String>,
     pub(crate) verification_uri: Option<String>,
+    /// The authorize URL of a running browser (PKCE) sign-in (B-004).
+    pub(crate) browser_url: Option<String>,
+    /// Whether the browser was already opened for `browser_url`, so the app does
+    /// not spawn a new tab on every frame.
+    pub(crate) browser_opened: bool,
+    /// Whether the browser lane runs in the embedded webview (ADR-042) rather
+    /// than the system browser.
+    pub(crate) browser_in_webview: bool,
     pub(crate) message: String,
     pub(crate) hint: String,
     pub(crate) error: Option<String>,
@@ -442,6 +455,8 @@ pub struct TeamTrimApp {
     signed_in: bool,
     signing_in: bool,
     login: LoginView,
+    /// The embedded browser for a webview sign-in (ADR-042); `None` otherwise.
+    sign_in_webview: Option<crate::webview::SignInWebView>,
 
     // View state
     page: Page,
@@ -666,6 +681,7 @@ impl TeamTrimApp {
             signed_in: false,
             signing_in: false,
             login: LoginView::default(),
+            sign_in_webview: None,
             page: Page::default(),
             chats: Vec::new(),
             selected_chat: None,
@@ -2308,6 +2324,14 @@ impl TeamTrimApp {
         self.toasts.push(Toast { text, error: true });
     }
 
+    /// Confirm that something was copied to the clipboard (login screen).
+    pub(crate) fn copied_feedback(&mut self, what: &str) {
+        self.toasts.push(Toast {
+            text: format!("{what} copied"),
+            error: false,
+        });
+    }
+
     fn refresh_chats(&mut self) {
         let Some(messaging) = self.messaging.clone() else {
             return;
@@ -3100,6 +3124,17 @@ impl TeamTrimApp {
                 self.login.message = message;
                 self.login.hint = "Waiting for sign-in…".into();
             }
+            SignInProgress::AwaitingBrowser { url } => {
+                // The webview lane opens the page in the embedded view (see
+                // `sync_sign_in_webview`); the loopback lane has no browser of
+                // its own, so it opens the system one.
+                if !self.login.browser_in_webview {
+                    self.ctx.open_url(egui::OpenUrl::new_tab(url.clone()));
+                    self.login.browser_opened = true;
+                }
+                self.login.browser_url = Some(url);
+                self.login.hint = "Waiting for the browser…".into();
+            }
             SignInProgress::Completed(_) => self.on_signed_in(),
             SignInProgress::Failed(message) => {
                 self.login.error = Some(message.clone());
@@ -3112,6 +3147,99 @@ impl TeamTrimApp {
             }
             other => {
                 self.login.hint = other.hint();
+            }
+        }
+    }
+
+    /// Keep the embedded sign-in browser (ADR-042) in step with the flow:
+    /// attach it once the authorize URL is known, keep it covering the window,
+    /// and drop it when the redirect arrived or the flow ended.
+    ///
+    /// Returns whether this changed something worth a repaint.
+    fn sync_sign_in_webview(&mut self, ctx: &egui::Context, frame: &eframe::Frame) -> bool {
+        let running = self.signing_in && self.login.browser_in_webview;
+        if !running {
+            // Dropping the view is what removes the native child view/window.
+            return self.sign_in_webview.take().is_some();
+        }
+        if self.sign_in_webview.is_none() {
+            let Some(url) = self.login.browser_url.clone() else {
+                return false;
+            };
+            let Some(callback) = self.session.browser_callback_sender() else {
+                return false;
+            };
+            let size = window_size(ctx);
+            return match crate::webview::SignInWebView::open(
+                frame,
+                &url,
+                size,
+                callback,
+                ctx.clone(),
+            ) {
+                Ok(view) => {
+                    self.sign_in_webview = Some(view);
+                    true
+                }
+                Err(error) => {
+                    // No embedded browser (e.g. a Linux build without
+                    // webkit2gtk): end the lane and point at device code.
+                    tracing::warn!(%error, "embedded sign-in browser failed to open");
+                    self.session.cancel_sign_in();
+                    self.signing_in = false;
+                    self.login.hint.clear();
+                    self.login.error = Some(format!(
+                        "Could not open the embedded browser ({error}). \
+                         Use \"Sign in\" (device code) instead."
+                    ));
+                    true
+                }
+            };
+        }
+        let mut done = false;
+        if let Some(view) = &self.sign_in_webview {
+            // Keep the view covering the window; on macOS wry does not resize
+            // the child view with the window.
+            let size = window_size(ctx);
+            view.resize(size);
+            done = view.is_done();
+        }
+        if done {
+            self.sign_in_webview = None;
+            return true;
+        }
+        false
+    }
+
+    /// Start one of the sign-in lanes: device code, or the browser flow.    ///
+    /// The browser lane runs in the embedded webview (`browser`), using the
+    /// client's registered native-client redirect (ADR-042).
+    fn begin_sign_in(&mut self, use_personal: bool, browser: bool) {
+        // A new attempt starts from a clean login screen (no stale code/URL).
+        self.login = LoginView {
+            use_personal,
+            browser_in_webview: browser,
+            ..LoginView::default()
+        };
+        self.login.hint = if browser {
+            "Opening the browser…".into()
+        } else {
+            "Requesting device code…".into()
+        };
+        let handle = self.runtime.handle();
+        let result = {
+            let _guard = handle.enter();
+            if browser {
+                self.session.begin_webview_sign_in(use_personal)
+            } else {
+                self.session.begin_sign_in(use_personal)
+            }
+        };
+        match result {
+            Ok(()) => self.signing_in = true,
+            Err(e) => {
+                self.login.error = Some(e.to_string());
+                self.push_error(e);
             }
         }
     }
@@ -3136,24 +3264,8 @@ impl TeamTrimApp {
 
     fn dispatch(&mut self, action: Action) {
         match action {
-            Action::BeginSignIn { use_personal } => {
-                self.login.error = None;
-                self.login.user_code = None;
-                self.login.verification_uri = None;
-                self.login.hint = "Requesting device code…".into();
-                let handle = self.runtime.handle();
-                let result = {
-                    let _guard = handle.enter();
-                    self.session.begin_sign_in(use_personal)
-                };
-                match result {
-                    Ok(()) => self.signing_in = true,
-                    Err(e) => {
-                        self.login.error = Some(e.to_string());
-                        self.push_error(e);
-                    }
-                }
-            }
+            Action::BeginSignIn { use_personal } => self.begin_sign_in(use_personal, false),
+            Action::BeginBrowserSignIn { use_personal } => self.begin_sign_in(use_personal, true),
             Action::SignOut => self.sign_out(),
             Action::SetPage(page) => {
                 self.page = page;
@@ -3487,12 +3599,25 @@ impl TeamTrimApp {
     }
 }
 
+/// The window's content size in points — what the embedded sign-in browser is
+/// sized to (ADR-042). Falls back to a sane default when the viewport rect is
+/// unknown (e.g. Wayland reports no position).
+fn window_size(ctx: &egui::Context) -> (f32, f32) {
+    ctx.input(|input| {
+        input
+            .viewport()
+            .inner_rect
+            .map(|rect| (rect.width(), rect.height()))
+            .unwrap_or((960.0, 720.0))
+    })
+}
+
 impl eframe::App for TeamTrimApp {
     /// Drain backend events and apply them. Requests a repaint only when at
     /// least one event was applied (ADR-027); while a device-code sign-in is
     /// running it polls on a short timer (the sign-in task reports over a std
     /// channel that cannot wake the UI).
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let events = self.runtime.drain();
         let mut changed = !events.is_empty();
         for event in events {
@@ -3501,13 +3626,22 @@ impl eframe::App for TeamTrimApp {
         }
 
         if self.signing_in {
-            if let Some(progress) = self.session.poll_sign_in() {
-                self.apply_event(AppEvent::SignInProgress(progress));
+            let progress = self.session.poll_sign_in();
+            if !progress.is_empty() {
+                for progress in progress {
+                    self.apply_event(AppEvent::SignInProgress(progress));
+                }
                 changed = true;
             }
             if self.signing_in {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
+        }
+
+        // The embedded browser (ADR-042) is attached to the window while the
+        // webview lane runs and dropped as soon as it is not needed.
+        if self.sync_sign_in_webview(ctx, frame) {
+            changed = true;
         }
 
         if changed {

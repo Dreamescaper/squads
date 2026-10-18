@@ -113,8 +113,9 @@ fn login_screen_renders_when_signed_out() {
             .expect("build app")
     });
 
-    // The sign-in control and the personal/work toggle are present.
+    // The sign-in controls and the personal/work toggle are present.
     harness.get_by_label("Sign in");
+    harness.get_by_label("Sign in with browser");
     harness.get_by_label("Use a personal account");
 }
 

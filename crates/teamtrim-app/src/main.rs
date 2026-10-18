@@ -30,6 +30,7 @@ mod runtime;
 mod shortcuts;
 mod theme;
 mod views;
+mod webview;
 
 #[cfg(test)]
 mod tests;

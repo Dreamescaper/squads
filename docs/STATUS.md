@@ -20,7 +20,7 @@ offline:
 | Crate | Role | Tests |
 |---|---|---|
 | `teamtrim-protocol` (vendored `ost`, lib `ost`) | protocol core (auth, api, trouter, calling) | 377 (unchanged) |
-| `teamtrim-core` | session, store, settings, realtime, services | 442 |
+| `teamtrim-core` | session, store, settings, realtime, services | 455 |
 | `teamtrim-app` (`teamtrim` binary) | egui UI | 40 |
 
 `cargo build --workspace` and `cargo build --workspace --release` both succeed.
@@ -32,7 +32,11 @@ attaches them to a GitHub Release on `v*` tags. Installers (AppImage/Flatpak/MSI
 and real signing/notarization are still manual (B-013, `PACKAGING.md` §6).
 
 **What works (verified here, offline):** workspace + CI config; the full auth
-token model and device-code flow; the session/client facade and region routing;
+token model, the device-code flow and the **browser PKCE flow** (an embedded
+webview on the registered native-client redirect, a loopback listener for
+registrations that allow it, `state` validation, code redemption and the
+login-screen lane — B-004);
+the session/client facade and region routing;
 the SQLite store with migrations v1→v12; realtime decode/fan-out/write-through;
 messaging (optimistic sends, paging, edit/delete/react/receipts); teams &
 channels; files (Graph list/upload/download/links/versions); presence and
@@ -69,11 +73,12 @@ team-settings and channel-reaction acceptance (U-003), the live
 recordings/transcripts Graph acceptance, the global channel fan-out and the
 name-only channel match (U-013), the unified presence token
 audience (B-009), desktop notifications and quiet hours (B-010), real call media
-(B-011), and the UI's actual pixels (B-012). See [`BLOCKERS.md`](BLOCKERS.md).
+(B-011), the live embedded-webview sign-in (the page must be completable without a
+passkey/certificate, and Conditional Access can still refuse it), and the UI's
+actual pixels (B-012). See [`BLOCKERS.md`](BLOCKERS.md).
 
 **Deferred:** encryption at rest (B-007), the realtime call-frame producer
-(B-008), the attachment picker UI (B-012), the browser PKCE loopback listener
-(B-004), and hardware video (D-002).
+(B-008), the attachment picker UI (B-012), and hardware video (D-002).
 
 ## Architecture decisions (ADRs)
 
@@ -120,13 +125,15 @@ Newest last; full text in [`DECISIONS.md`](DECISIONS.md).
 - **ADR-039** — Folders & pins: `chats.folder_id` + a pin-membership table (schema v11), and the Graph-vs-thread pin sources.
 - **ADR-040** — Public-team join + member admin (Graph), and the dedicated Graph channel-reaction lanes.
 - **ADR-041** — Recordings & transcripts service, a schema-v12 `(id, profile)` cache, and reuse of the M7 download path.
+- **ADR-042** — Browser sign-in on the registered redirect (resolves B-004): the embedded `wry` webview, the loopback listener, `state` validation, code redemption and the login-screen lane.
 
 ## Open blockers (summary)
 
 Standing environment limits: **B-001** (headless — no display), **B-002** (no
 live tenant), **B-003** (volatile reverse-engineered protocol).
 
-Open / deferred work: **B-004** (PKCE loopback), **B-005** (Skype exchange not
+Open / deferred work: **B-004** (resolved by ADR-042: the embedded-webview
+browser lane; only the live page and the CA policy are untested), **B-005** (Skype exchange not
 stubbable), **B-006** (mate-name path untested offline), **B-007** (store and
 media cache unencrypted), **B-008** (call frames filtered from the hub; global
 hub; reconnect token staleness), **B-009** (unified presence token unverified),
@@ -150,7 +157,7 @@ channel match).
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --workspace                 # default features, no device/network
-cargo test -p teamtrim-core               # 442
+cargo test -p teamtrim-core               # 455
 cargo test -p teamtrim-app                # 40 (headless egui_kittest)
 cargo test -p teamtrim-protocol           # 377
 cargo fmt -p teamtrim-core -p teamtrim-app -- --check
@@ -161,7 +168,8 @@ cargo build --workspace --release
 ### With a display (manual UI QA)
 
 1. `cargo run -p teamtrim-app` (binary `teamtrim`); the login screen appears.
-2. Sign in (device code) and confirm the shell, chat list and timeline render.
+2. Sign in (device code, or **Sign in with browser** for the embedded-webview
+   PKCE lane) and confirm the shell, chat list and timeline render.
 3. Exercise the M11 shortcuts: `Ctrl/Cmd+K` (quick switcher), `Ctrl/Cmd+F`
    (in-conversation search), `Ctrl/Cmd+Shift+F` (search all messages — B1),
    `Esc` (close/clear), `Ctrl/Cmd+,` (settings),

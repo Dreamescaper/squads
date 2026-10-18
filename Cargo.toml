@@ -20,8 +20,20 @@ teamtrim-core = { path = "crates/teamtrim-core" }
 # egui / eframe (immediate-mode, event-driven; glow/OpenGL backend).
 # `accesskit` is enabled so the accessibility tree is built even in the normal
 # binary (it also backs the headless `egui_kittest` UI tests).
+# `links` lets `open_url` hand a URL to the system browser (the device-code
+# verification page); without it egui_winit logs "feature \"links\" not enabled"
+# and silently does nothing. `clipboard` enables copy/paste — including the
+# "Copy code" button on the login screen and paste in the composer.
 egui = "0.37"
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit", "wayland", "x11"] }
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "accesskit",
+    "wayland",
+    "x11",
+    "links",
+    "clipboard",
+] }
 # Image loaders for inline chat media (M13). `image` pulls only pure-Rust
 # decoders (png/jpeg/gif/webp/…), so the default build needs no system library.
 egui_extras = { version = "0.37", features = ["image"] }

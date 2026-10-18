@@ -87,7 +87,7 @@ persist it securely, without letting the network leak into the UI or the tests.
 
 **Decisions.** ADR-007 (async-in-trait transport for offline tests), ADR-008
 (file store default, keyring behind a feature), ADR-009 (device-code first, PKCE
-later).
+later — the latter completed by ADR-042, B-004).
 
 **How to verify manually** (real tenant; not runnable in this headless env):
 
@@ -99,9 +99,9 @@ later).
 3. Re-run after the access tokens expire (or edit `expires_at`) and confirm only
    expired entries change.
 
-**Blockers.** B-002 (no live tenant here), B-004 (browser PKCE loopback listener
-not implemented yet), B-005 (`exchange_skype_token` uses the vendored client, so
-that one call is not unit-testable).
+**Blockers.** B-002 (no live tenant here), B-005 (`exchange_skype_token` uses
+the vendored client, so that one call is not unit-testable). B-004 was resolved
+by ADR-042 (the browser PKCE loopback lane; see the B-004 section below).
 
 ---
 
@@ -1806,3 +1806,70 @@ real `Recordings` folder/`video` facet/`.vtt` item matches the projection, and
 the global lane's channel fan-out cost — is unverified; the request shapes are
 pinned offline). B-007 (recording/transcript names and URLs join chat content in
 the unencrypted store).
+
+## B-004 — Browser PKCE sign-in over a loopback redirect
+
+**Goal.** Finish the browser lane ADR-009 deliberately deferred: a real
+authorization-code + PKCE sign-in that receives the redirect on a short-lived
+loopback server, so a tenant that blocks device code (or a user who prefers not
+to type a code) has a working path.
+
+**Landed.**
+
+- `auth::browser` (new) — `LoopbackListener`: binds an ephemeral port on
+  `127.0.0.1` and, best effort, `::1` (a browser may resolve `localhost` to
+  either, RFC 8252 §7.3); `redirect_uri()` is `http://localhost:<port>`. It
+  serves the request head with a read timeout and an 8 KiB cap, ignores
+  non-redirect requests (`/favicon.ico` → `404`) and keeps waiting, returns the
+  parsed `RedirectOutcome` (reusing `pkce::parse_redirect`), and enforces a
+  five-minute deadline (`DEFAULT_BROWSER_TIMEOUT`). The callback page never
+  echoes the code and sanitizes an AAD error code before rendering it.
+- `auth::flow` — `AuthTransport::redeem_code` (authorization-code grant with
+  `code` + `code_verifier` + `redirect_uri` in the body) and its
+  `HttpTransport` implementation using the existing secret-free
+  `auth_http_error` path; `AuthDriver::sign_in_browser` (build the authorize URL
+  → `AwaitingBrowser` → obtain the redirect → validate `state` →
+  `RedeemingCode` → redeem → shared tail). The redirect source is a
+  `BrowserRedirect`: `Loopback` binds the listener, `Provided(receiver)` keeps
+  the client's **registered** redirect and takes the callback from the caller.
+  New progress variants `AwaitingBrowser { url }` and `RedeemingCode`.
+- `session` — `begin_browser_sign_in` (loopback) and `begin_webview_sign_in`
+  (provided callback), both sharing the task-spawn path with the device-code flow
+  (`SignInLane`), plus `browser_callback_sender`, `submit_browser_callback` and
+  `cancel_sign_in`; the sender is dropped when a flow ends.
+- `crates/teamtrim-app` — a **Sign in with browser** button next to device code
+  and the embedded browser (`src/webview.rs`): a `wry` child webview on the
+  eframe window loads the authorize URL, stops at `NATIVE_CLIENT_REDIRECT`,
+  hands the callback URL to the session and is dropped when the flow ends. The
+  view is sized to the window every frame; if it cannot be created (Linux) the
+  lane is cancelled with a message pointing at device code. While the loopback
+  lane waits, the login screen shows **Open browser again**, **Copy link** and
+  the hyperlink instead.
+- `Cargo.toml` — the `eframe` features now include `links` (so `open_url`
+  actually reaches the system browser) and `clipboard` (copy/paste had been
+  compiled out entirely, which also broke the device-code screen's copy button
+  and paste in the composer). `wry` is a macOS/Windows dependency only: wry's
+  Linux backend needs webkit2gtk plus a gtk main-loop pump beside eframe's event
+  loop, so the Linux build uses device code.
+
+**Tests.** Listener serve/parse, stray-request 404, timeout; flow: complete
+loopback sign-in (verifier matches the authorize challenge, redirect_uri is the
+loopback URL, verifier/code go in the body), the provided-callback lane (the
+registered native-client redirect is preserved and no loopback is bound), `state`
+mismatch rejected before redemption, `access_denied` surfaced;
+`HttpTransport::redeem_code` request shape and secret-free error; session-level
+loopback and webview sign-ins reaching `Ready`. Counts: `teamtrim-core` 455,
+`teamtrim-app` 40.
+
+**How to verify manually** (real tenant): press **Sign in with browser**; the
+AAD page renders inside the TeamTrim window; after signing in the app continues
+to the shell. A step the webview cannot finish (passkey, certificate, or a
+Conditional Access refusal) is a known gap — it currently waits out the
+five-minute deadline (ADR-042).
+
+**Blockers.** The Teams first-party client is Microsoft's registration and does
+not list `http://localhost`, so the loopback lane is refused with `AADSTS50011`
+(observed live) — the embedded webview on the registered native-client redirect
+is the usable lane. Conditional Access still applies (the live device-code
+attempt here was refused with `AADSTS53003` for an `Unregistered` device). Both
+are tenant-side; the code paths are covered offline.
