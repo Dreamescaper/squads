@@ -170,7 +170,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/teamtrim-cli"    "$STAGE/"
           cp LICENSE NOTICE README.md                            "$STAGE/"
           mkdir -p "$STAGE/packaging"
-          cp packaging/dev.teamtrim.teamtrim.desktop packaging/dev.teamtrim.teamtrim.svg "$STAGE/packaging/"
+          cp packaging/dev.teamtrim.teamtrim.desktop "$STAGE/packaging/"
+          cp -R packaging/icons "$STAGE/packaging/"
           tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "$(basename "$STAGE")"
 
       # ---------------------------------------------------------------- macOS
@@ -187,7 +188,7 @@ jobs:
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp "$REL/teamtrim" "$APP/Contents/MacOS/teamtrim"
           chmod +x "$APP/Contents/MacOS/teamtrim"
-          cp packaging/dev.teamtrim.teamtrim.svg "$APP/Contents/Resources/"
+          cp packaging/icons/dev.teamtrim.teamtrim.icns "$APP/Contents/Resources/"
 
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
@@ -198,6 +199,7 @@ jobs:
             <key>CFBundleDisplayName</key><string>TeamTrim</string>
             <key>CFBundleIdentifier</key><string>dev.teamtrim.teamtrim</string>
             <key>CFBundleExecutable</key><string>teamtrim</string>
+            <key>CFBundleIconFile</key><string>dev.teamtrim.teamtrim</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>${VERSION}</string>
             <key>CFBundleVersion</key><string>${VERSION}</string>
@@ -314,6 +316,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/teamtrim.exe"     "$stage/"
           Copy-Item "target/${{ matrix.target }}/release/teamtrim-cli.exe" "$stage/"
+          Copy-Item "packaging/icons/dev.teamtrim.teamtrim.ico"            "$stage/teamtrim.ico"
           Copy-Item LICENSE, NOTICE, README.md                            "$stage/"
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/${{ matrix.artifact }}.zip" -Force
 

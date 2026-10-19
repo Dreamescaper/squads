@@ -1452,3 +1452,23 @@ fn recordings_panel_refresh_queues_an_action() {
         harness.state().applied_actions()
     );
 }
+
+/// The icon is `include_bytes!`d, so a broken/oversized asset is a build-time
+/// typo rather than a runtime surprise: assert it still decodes to the expected
+/// RGBA bitmap (the window icon path in `main.rs`).
+#[test]
+fn embedded_app_icon_decodes() {
+    let icon = crate::icon::app_icon().expect("embedded icon decodes");
+    assert_eq!((icon.width, icon.height), (256, 256));
+    assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    // The artwork is a rounded tile, so the corners are transparent and the
+    // centre is opaque — a decoded-but-wrong icon would fail this.
+    let alpha = |x: usize, y: usize| icon.rgba[(y * 256 + x) * 4 + 3];
+    assert_eq!(alpha(0, 0), 0, "top-left corner should be transparent");
+    assert_eq!(
+        alpha(255, 255),
+        0,
+        "bottom-right corner should be transparent"
+    );
+    assert_eq!(alpha(128, 128), 255, "centre should be opaque");
+}

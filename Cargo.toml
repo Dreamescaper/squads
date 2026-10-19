@@ -37,6 +37,9 @@ eframe = { version = "0.37", default-features = false, features = [
 # Image loaders for inline chat media (M13). `image` pulls only pure-Rust
 # decoders (png/jpeg/gif/webp/…), so the default build needs no system library.
 egui_extras = { version = "0.37", features = ["image"] }
+# Decodes the embedded app icon (PNG) for the window/taskbar. `png` is already
+# enabled transitively by `egui_extras`, so this adds no extra crates.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Async / networking
 anyhow = "1"
