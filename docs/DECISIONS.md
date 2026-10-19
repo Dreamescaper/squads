@@ -2106,3 +2106,52 @@ native-client callback.
   the proof (RFC 7636). The webview only ever loads the authorize URL and stops
   at the redirect; the code is never echoed anywhere.
 
+
+## ADR-043 — A real app icon: a committed raster set plus a window icon embedded in the binary
+
+**Status:** accepted (post-M13)
+
+**Context.** `packaging/` shipped a **placeholder** SVG (a blue tile with an "S")
+and the eframe window set no icon at all, so the titlebar/taskbar showed a
+generic placeholder and the compositor had nothing real to associate with the
+app id. There is no vector artwork for the project, and this environment has no
+display, no ImageMagick/Pillow and no icon editor — only `ffmpeg` and Python.
+
+**Decision.**
+
+1. Commit the finished artwork as **rasters** under `packaging/icons/`:
+   `dev.teamtrim.teamtrim-<size>.png` (16–1024 px, transparent corners),
+   a multi-size `.ico` (16–256 px, PNG-compressed entries) and an `.icns`
+   (`icp4`–`icp6` + `ic07`–`ic10`, i.e. 16–1024 px). The 1024 px PNG is the
+   master; the platform containers are generated from the PNGs with `ffmpeg`
+   resizes (see `packaging/README.md`). The placeholder SVG is deleted.
+2. **Embed** the 256 px PNG in the binary (`crates/teamtrim-app/assets/icon.png`,
+   `include_bytes!`) and pass it through `ViewportBuilder::with_icon`, so the
+   window/taskbar icon works for an uninstalled `cargo run` and does not depend
+   on the `hicolor` theme being populated. On Wayland the icon still comes from
+   the installed `.desktop` entry via the app id.
+3. Decode the PNG with the `image` crate (`default-features = false`,
+   `features = ["png"]`). `image` is already in the dependency graph through
+   `egui_extras`, so the offline build gains no new downloads or system
+   libraries.
+4. Package it: the Linux install copies the PNGs into
+   `hicolor/<size>x<size>/apps/`, the macOS bundle ships the `.icns` and sets
+   `CFBundleIconFile`, and the Windows zip carries `teamtrim.ico` for shortcuts.
+5. Keep the decode honest with a headless test
+   (`embedded_app_icon_decodes`): 256×256 RGBA, transparent corners, opaque
+   centre — a broken asset fails `cargo test`, not the first launch.
+
+**Consequences.**
+
+- The binary and every installer/launcher now carry the real icon, with no
+  runtime dependency on `packaging/`.
+- There is no vector source, so the largest committed copy (1024 px) is the
+  master and the PNG set is regenerated with `ffmpeg`; the `.ico`/`.icns` are
+  thin containers over those PNGs rather than separately drawn assets.
+- The PNGs (≈1.2 MB) and the `.icns`/`.ico` (≈1.3 MB) are committed binaries; a
+  future vector master would shrink this, but nothing here can trace one.
+- The Windows `.exe` still has **no embedded icon resource** (that needs a build
+  script plus a Windows resource compiler, B-013); the `.ico` is for shortcuts
+  and installers.
+- Sizes are generated with a plain Lanczos downscale: legible at 16–32 px, but
+  hand-tuned small-size artwork would still beat it if one is ever drawn.

@@ -68,15 +68,19 @@ sudo apt-get install -y \
 install -Dm755 target/release/teamtrim "$HOME/.local/bin/teamtrim"
 install -Dm644 packaging/dev.teamtrim.teamtrim.desktop \
   "$HOME/.local/share/applications/dev.teamtrim.teamtrim.desktop"
-install -Dm644 packaging/dev.teamtrim.teamtrim.svg \
-  "$HOME/.local/share/icons/hicolor/scalable/apps/dev.teamtrim.teamtrim.svg"
+for size in 16 24 32 48 64 128 256 512 1024; do
+  install -Dm644 "packaging/icons/dev.teamtrim.teamtrim-$size.png" \
+    "$HOME/.local/share/icons/hicolor/${size}x${size}/apps/dev.teamtrim.teamtrim.png"
+done
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 ```
 
 `StartupWMClass=dev.teamtrim.teamtrim` in the `.desktop` file matches
 `ViewportBuilder::with_app_id("dev.teamtrim.teamtrim")` in
 `crates/teamtrim-app/src/main.rs`, so the compositor finds the icon and groups the
-window. For a system-wide install use `/usr/local/...` and
+window; `Icon=dev.teamtrim.teamtrim` resolves to the installed `hicolor` PNGs.
+The binary also embeds the 256 px icon for the window/taskbar, so an uninstalled
+`cargo run` is not icon-less. For a system-wide install use `/usr/local/...` and
 `/usr/share/applications` instead of the `$HOME/.local` paths.
 
 ### 2.3 AppImage (sketch)
@@ -84,7 +88,8 @@ window. For a system-wide install use `/usr/local/...` and
 No AppImage recipe is committed. The usual route:
 
 1. `cargo build --release`.
-2. Build an AppDir containing `usr/bin/teamtrim`, the `.desktop` file and the icon.
+2. Build an AppDir containing `usr/bin/teamtrim`, the `.desktop` file and the
+   icon PNGs.
 3. Run [`linuxdeploy`](https://github.com/linuxdeploy/linuxdeploy) over it.
 
 AppImages must bundle or rely on `libssl`, `libxkbcommon`, the Wayland/X11
@@ -129,7 +134,7 @@ TeamTrim.app/
     ├── MacOS/
     │   └── teamtrim                 # the lipo'd binary, chmod +x
     └── Resources/
-        └── dev.teamtrim.teamtrim.icns # generate from the SVG (e.g. `iconutil`)
+        └── dev.teamtrim.teamtrim.icns # committed icon, named by CFBundleIconFile
 ```
 
 `Info.plist` notes (minimum keys):
@@ -139,6 +144,7 @@ TeamTrim.app/
 | `CFBundleName` / `CFBundleDisplayName` | `TeamTrim` |
 | `CFBundleIdentifier` | `dev.teamtrim.teamtrim` (matches the app id) |
 | `CFBundleExecutable` | `teamtrim` |
+| `CFBundleIconFile` | `dev.teamtrim.teamtrim` (the `.icns` in `Resources/`, extension optional) |
 | `CFBundlePackageType` | `APPL` |
 | `CFBundleShortVersionString` / `CFBundleVersion` | `0.1.0` / build number |
 | `LSMinimumSystemVersion` | `11.0` |
@@ -160,6 +166,11 @@ cargo build --release            # -> target\release\teamtrim.exe
 - **Zip** — the simplest honest artifact: `teamtrim.exe`, `LICENSE`, `NOTICE`, and
   `vcruntime140.dll` (or build with `RUSTFLAGS=-C target-feature=+crt-static` to
   avoid the redistributable). No installer scripts are committed.
+- **Icon** — `packaging/icons/dev.teamtrim.teamtrim.ico` is the multi-size icon
+  for shortcuts and installer-generated entries. The `.exe` itself does **not**
+  embed an icon resource yet: that needs a Windows resource compiler at build
+  time (`winresource`/`embed-resource` in a build script), which is not wired up
+  (B-013).
 - **MSI** — [`cargo-wix`](https://github.com/volks73/cargo-wix) can scaffold and
   build one: `cargo install cargo-wix`, `cargo wix init`, `cargo wix`. It uses
   the WiX Toolset and produces `target\wix\*.msi`. Inno Setup is an equivalent
@@ -197,10 +208,10 @@ downloadable archive per platform on **native runners** (no cross-compilation):
 
 | Runner | Target | Artifact (Actions) | Contents |
 |---|---|---|---|
-| `ubuntu-latest` | `x86_64-unknown-linux-gnu` | `teamtrim-linux-x86_64` | `teamtrim-<version>-linux-x86_64.tar.gz` — `teamtrim`, `teamtrim-cli`, `LICENSE`, `NOTICE`, `README.md`, `packaging/` (`.desktop` + icon) |
-| `macos-14` | `aarch64-apple-darwin` | `teamtrim-macos-arm64` | `teamtrim-macos-arm64.zip` (`TeamTrim.app`, ad-hoc signed) + `teamtrim-macos-arm64-cli.zip` (`teamtrim-cli` + docs) |
+| `ubuntu-latest` | `x86_64-unknown-linux-gnu` | `teamtrim-linux-x86_64` | `teamtrim-<version>-linux-x86_64.tar.gz` — `teamtrim`, `teamtrim-cli`, `LICENSE`, `NOTICE`, `README.md`, `packaging/` (`.desktop` + `icons/`) |
+| `macos-14` | `aarch64-apple-darwin` | `teamtrim-macos-arm64` | `teamtrim-macos-arm64.zip` (`TeamTrim.app` with the `.icns`, ad-hoc signed) + `teamtrim-macos-arm64-cli.zip` (`teamtrim-cli` + docs) |
 | `macos-14` | `x86_64-apple-darwin` | `teamtrim-macos-x86_64` | same layout as `arm64` (the Intel slice is cross-built on the arm64 runner, since the `macos-13` image is retired) |
-| `windows-latest` | `x86_64-pc-windows-msvc` | `teamtrim-windows-x86_64` | `teamtrim-windows-x86_64.zip` — `teamtrim.exe`, `teamtrim-cli.exe`, `LICENSE`, `NOTICE`, `README.md` |
+| `windows-latest` | `x86_64-pc-windows-msvc` | `teamtrim-windows-x86_64` | `teamtrim-windows-x86_64.zip` — `teamtrim.exe`, `teamtrim-cli.exe`, `teamtrim.ico`, `LICENSE`, `NOTICE`, `README.md` |
 
 **Triggers**
 

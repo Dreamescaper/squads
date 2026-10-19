@@ -26,6 +26,7 @@
 //! gratuitously.
 
 mod app;
+mod icon;
 mod runtime;
 mod shortcuts;
 mod theme;
@@ -54,12 +55,19 @@ fn main() -> eframe::Result<()> {
         Settings::default()
     });
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("TeamTrim")
+        .with_app_id("dev.teamtrim.teamtrim")
+        .with_inner_size([settings.window.width, settings.window.height])
+        .with_min_inner_size([640.0, 440.0]);
+    // Embedded artwork, so the window/taskbar icon exists even when the app was
+    // not installed from `packaging/`.
+    if let Some(icon) = icon::app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("TeamTrim")
-            .with_app_id("dev.teamtrim.teamtrim")
-            .with_inner_size([settings.window.width, settings.window.height])
-            .with_min_inner_size([640.0, 440.0]),
+        viewport,
         ..Default::default()
     };
 

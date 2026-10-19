@@ -21,7 +21,7 @@ offline:
 |---|---|---|
 | `teamtrim-protocol` (vendored `ost`, lib `ost`) | protocol core (auth, api, trouter, calling) | 377 (unchanged) |
 | `teamtrim-core` | session, store, settings, realtime, services | 455 |
-| `teamtrim-app` (`teamtrim` binary) | egui UI | 40 |
+| `teamtrim-app` (`teamtrim` binary) | egui UI | 41 |
 
 `cargo build --workspace` and `cargo build --workspace --release` both succeed.
 
@@ -126,6 +126,7 @@ Newest last; full text in [`DECISIONS.md`](DECISIONS.md).
 - **ADR-040** — Public-team join + member admin (Graph), and the dedicated Graph channel-reaction lanes.
 - **ADR-041** — Recordings & transcripts service, a schema-v12 `(id, profile)` cache, and reuse of the M7 download path.
 - **ADR-042** — Browser sign-in on the registered redirect (resolves B-004): the embedded `wry` webview, the loopback listener, `state` validation, code redemption and the login-screen lane.
+- **ADR-043** — A real app icon: a committed PNG/ICO/ICNS set plus a window icon embedded in the binary.
 
 ## Open blockers (summary)
 
@@ -206,4 +207,6 @@ cargo build --workspace --release
 ### Release/packaging
 
 See [`PACKAGING.md`](PACKAGING.md) for the Linux install, macOS `.app` layout and
-Windows notes.
+Windows notes. The app icon is committed as PNG/ICO/ICNS under
+[`packaging/icons/`](../packaging/icons/) and the 256 px copy is embedded in the
+binary, so the window/taskbar icon does not depend on the install.
